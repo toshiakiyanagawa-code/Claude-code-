@@ -116,12 +116,13 @@
     (seg.words || []).forEach((w) => {
       const span = document.createElement('span');
       span.className = 'word';
-      const wordIdx = idx;  // capture per-iteration value — `idx` is a closure ref
+      const wordIdx = idx;  // capture per-iteration value
       span.dataset.idx = String(wordIdx);
       span.textContent = w.text;
       const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
       words.push(word);
-      span.addEventListener('click', (ev) => onWordClick(wordIdx, ev));
+      span.addEventListener('mousedown', (ev) => onWordMouseDown(wordIdx, ev));
+      span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
       div.appendChild(span);
       idx += 1;
     });
@@ -129,20 +130,73 @@
   });
 
   // ------- selection + clicks -------
-  function onWordClick(i, ev) {
+  // Drag-to-select model:
+  //   mousedown on a word → start a tentative selection at that anchor
+  //   mouseenter on another word while still held → extend selection (drag)
+  //   mouseup → if we never crossed words, treat as a plain click (seek+play);
+  //             if we did cross, finalize the drag selection
+  // Shift+mousedown still extends from the existing anchor (W3 behavior).
+  let dragAnchor = null;  // word idx where mouse went down; null when idle
+  let dragMoved = false;  // did we enter at least one other word before mouseup
+  let dragStartT = 0;
+
+  function onWordMouseDown(i, ev) {
+    if (ev.button !== undefined && ev.button !== 0) return;  // left button only
     if (ev.shiftKey && state.selection) {
       state.selection = { anchor: state.selection.anchor, extent: i };
       renderSelection();
+      ev.preventDefault();
       return;
     }
-    // single click: seek + reset selection anchor to this word
+    dragAnchor = i;
+    dragMoved = false;
+    dragStartT = performance.now();
     state.selection = { anchor: i, extent: i };
     renderSelection();
-    $player.currentTime = words[i].start;
-    const p = $player.play();
-    if (p && typeof p.catch === 'function') p.catch(() => {});
-    logKPI('ui.click.word', { word_idx: i, t: words[i].start });
+    ev.preventDefault();
   }
+
+  function onWordMouseEnter(i) {
+    if (dragAnchor === null) return;
+    if (i !== dragAnchor) dragMoved = true;
+    if (!state.selection || state.selection.extent !== i) {
+      state.selection = { anchor: dragAnchor, extent: i };
+      renderSelection();
+    }
+  }
+
+  function finishDrag(ev) {
+    if (dragAnchor === null) return;
+    const wasDrag = dragMoved;
+    const startIdx = dragAnchor;
+    dragAnchor = null;
+    dragMoved = false;
+
+    if (!wasDrag) {
+      // Plain click: seek + play. Selection collapses to this one word so D
+      // can still delete a single word if the user wants.
+      const w = words[startIdx];
+      $player.currentTime = w.start;
+      const p = $player.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+    } else {
+      const r = selectionRange();
+      if (r) {
+        logKPI('ui.drag.select', {
+          ws: r.ws, we: r.we, start: r.start, end: r.end,
+          duration: r.end - r.start, latency_ms: performance.now() - dragStartT,
+        });
+      }
+    }
+  }
+
+  // mouseup fires on document so we still finalize even if the user releases
+  // outside the transcript (e.g. on the audio player or scrollbar).
+  document.addEventListener('mouseup', finishDrag);
+  // Drag can be aborted by leaving the window mid-drag; treat it the same as
+  // releasing in place so we don't leave dragAnchor sticky.
+  document.addEventListener('mouseleave', finishDrag);
 
   function selectionRange() {
     if (!state.selection) return null;
