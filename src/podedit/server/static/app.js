@@ -862,6 +862,7 @@
     const prevEdited = state.timeline.length ? sourceToEdited($player.currentTime) : null;
     recomputeMergedDeletes();
     rebuildTimeline();
+    rebuildTranscriptDOM();
     syncTimelineUI();
     if (prevEdited != null) {
       const newSource = editedToSource(prevEdited);
@@ -879,6 +880,58 @@
     }
     renderPasteAnchor();
     updateStats();
+  }
+
+  function rebuildTranscriptDOM() {
+    // Walk the timeline in EDITED order and move existing word spans into
+    // .segment paragraphs in that order. Words deleted entirely (i.e. they
+    // sit in no timeline segment) live in a trailing .segment-deleted block
+    // so the user can still see them and undo. The word DOM elements are the
+    // same objects — they keep their listeners, .selected/.deleted classes
+    // get re-applied below. This is what makes a Move op visually rearrange
+    // the transcript, not just rewrite the underlying ops list.
+    $tx.innerHTML = '';
+
+    // Per timeline segment, split words back into runs by their original
+    // ASR segIdx so familiar paragraph boundaries survive delete-only edits.
+    // After a Move op the moved range becomes its own .segment block, which
+    // is what the user sees as "the text landed here".
+    const placed = new Set();
+    for (const tlSeg of state.timeline) {
+      const wordsInSeg = words
+        .filter((w) => w.start >= tlSeg.sourceStart - 1e-3 && w.end <= tlSeg.sourceEnd + 1e-3)
+        .sort((a, b) => a.start - b.start);
+      let currentDiv = null;
+      let lastSegIdx = -1;
+      for (const w of wordsInSeg) {
+        if (currentDiv == null || w.segIdx !== lastSegIdx) {
+          currentDiv = document.createElement('div');
+          currentDiv.className = 'segment';
+          const time = document.createElement('span');
+          time.className = 'seg-time';
+          time.textContent = fmt(w.start);
+          currentDiv.appendChild(time);
+          $tx.appendChild(currentDiv);
+          lastSegIdx = w.segIdx;
+        }
+        currentDiv.appendChild(w.el);
+        placed.add(w.idx);
+      }
+    }
+
+    // Stash any word the timeline doesn't currently cover in a final
+    // strikethrough block so the user can still spot/undo deleted material.
+    const orphans = words.filter((w) => !placed.has(w.idx));
+    if (orphans.length > 0) {
+      const div = document.createElement('div');
+      div.className = 'segment segment-deleted';
+      const label = document.createElement('span');
+      label.className = 'seg-time';
+      label.textContent = 'cut';
+      div.appendChild(label);
+      for (const w of orphans) div.appendChild(w.el);
+      $tx.appendChild(div);
+    }
   }
 
   function refreshButtons() {
