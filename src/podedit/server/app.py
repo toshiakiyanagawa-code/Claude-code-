@@ -856,6 +856,32 @@ def create_app(config: ServeConfig) -> FastAPI:
         if raw_beam < 1 or raw_beam > 5:
             raise HTTPException(status_code=400, detail="beam_size must be in [1, 5]")
         beam_size = raw_beam
+        # W9 accuracy options. Both are optional strings. Bound the length so
+        # a hand-crafted POST can't ship megabytes of "biasing" payload and
+        # OOM the decoder context. faster-whisper docs note the model uses
+        # the first ~200 tokens of initial_prompt; 2000 chars is well above
+        # that. hotwords is similarly capped — it's meant for a small vocab.
+        #
+        # Contract: we distinguish "field absent" from "field present empty
+        # string". Absent => let the JobManager pick its default JA podcast
+        # prompt. Empty string => caller explicitly wants raw decoding (no
+        # biasing), useful for ablation. For hotwords there's no useful
+        # default, so empty/absent both collapse to None.
+        if "initial_prompt" in body:
+            raw_prompt = body["initial_prompt"]
+            if not isinstance(raw_prompt, str):
+                raise HTTPException(status_code=400, detail="initial_prompt must be a string")
+            if len(raw_prompt) > 2000:
+                raise HTTPException(status_code=400, detail="initial_prompt too long (max 2000 chars)")
+            initial_prompt = raw_prompt  # may be "" — caller asked for no biasing
+        else:
+            initial_prompt = None  # JobManager applies its default
+        raw_hotwords = body.get("hotwords", "")
+        if not isinstance(raw_hotwords, str):
+            raise HTTPException(status_code=400, detail="hotwords must be a string")
+        if len(raw_hotwords) > 2000:
+            raise HTTPException(status_code=400, detail="hotwords too long (max 2000 chars)")
+        hotwords = raw_hotwords or None
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
         candidate_audio = state.library_dir / name
@@ -876,6 +902,8 @@ def create_app(config: ServeConfig) -> FastAPI:
                 transcript_path=transcript_path,
                 model=model,
                 beam_size=beam_size,
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
             )
         except RuntimeError as e:
             # Another job is in flight.
@@ -883,6 +911,12 @@ def create_app(config: ServeConfig) -> FastAPI:
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.transcribe.started",
             "name": name, "model": model, "beam_size": beam_size,
+            # Length only (not the prompt body) — we don't want big prompts
+            # spilling into kpi.jsonl on every job.
+            # Length only (not the prompt body) so we don't leak custom prompt
+            # text into KPI logs. -1 if the field wasn't supplied (uses default).
+            "initial_prompt_len": len(initial_prompt) if initial_prompt is not None else -1,
+            "hotwords_len": len(raw_hotwords),
             "job_id": job["job_id"],
         })
         return JSONResponse(job, headers={"Cache-Control": "no-store"})

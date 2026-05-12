@@ -1768,10 +1768,13 @@
       return;
     }
     if (e.key === ' ' || e.code === 'Space') {
-      // Toggle playback; don't swallow Space when a real form input is focused
-      // (currently only the scrubber range, where Space has no useful default).
+      // Toggle playback; don't swallow Space when a real form input is focused.
+      // SELECT included so Space on the preset / export-format dropdowns opens
+      // the menu instead of toggling playback. The scrubber <input range> is
+      // the only INPUT we intentionally keep playback-bound on.
       const t = document.activeElement;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t !== $scrubber) return;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')
+          && t !== $scrubber) return;
       e.preventDefault();
       if ($player.paused) {
         const p = $player.play();
@@ -2021,19 +2024,67 @@
     const model = job.model ? ` · ${job.model}` : '';
     return `transcribing… ${coveredStr}${totalStr} covered · elapsed ${mm}:${ss}${rtf}${model}`;
   }
+  // ----- transcribe quality preset (W9) -----
+  // Mapping from preset name to the (model, beam_size) tuple the server
+  // accepts. Kept in JS so we don't need a round-trip to discover the
+  // available options. ``balanced`` is the default — meaningful accuracy
+  // win over tiny while still finishing a 30-min file in well under
+  // 30 min on a 2-vCPU Codespace.
+  const TRANSCRIBE_PRESETS = {
+    fast:     { model: 'tiny',  beam_size: 1, label: 'tiny · greedy' },
+    balanced: { model: 'small', beam_size: 1, label: 'small · greedy' },
+    quality:  { model: 'small', beam_size: 5, label: 'small · beam=5' },
+  };
+  const TRANSCRIBE_PRESET_KEY = 'podedit.transcribePreset';
+  const $transcribePreset = $('transcribe-preset');
+  const $transcribePresetHint = $('transcribe-preset-hint');
+  function currentTranscribePreset() {
+    const v = $transcribePreset ? $transcribePreset.value : 'balanced';
+    return TRANSCRIBE_PRESETS[v] ? v : 'balanced';
+  }
+  function updatePresetHint() {
+    if (!$transcribePresetHint) return;
+    const cur = TRANSCRIBE_PRESETS[currentTranscribePreset()];
+    $transcribePresetHint.textContent = `${cur.label} + JA podcast prompt`;
+  }
+  if ($transcribePreset) {
+    // Restore last choice; ignore unknown values (e.g. preset renamed).
+    try {
+      const saved = localStorage.getItem(TRANSCRIBE_PRESET_KEY);
+      if (saved && TRANSCRIBE_PRESETS[saved]) $transcribePreset.value = saved;
+    } catch (_) { /* localStorage unavailable */ }
+    updatePresetHint();
+    $transcribePreset.addEventListener('change', () => {
+      try { localStorage.setItem(TRANSCRIBE_PRESET_KEY, $transcribePreset.value); }
+      catch (_) { /* non-fatal */ }
+      updatePresetHint();
+    });
+  }
   async function startTranscribe(name) {
+    const preset = TRANSCRIBE_PRESETS[currentTranscribePreset()];
     try {
       const r = await fetch('/api/library/transcribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({
+          name,
+          model: preset.model,
+          beam_size: preset.beam_size,
+          // initial_prompt / hotwords intentionally omitted: server falls
+          // back to its DEFAULT_JA_PODCAST_PROMPT, which is the right
+          // default for this MVP's target content. Custom prompts can be
+          // added via a future settings UI.
+        }),
       });
       if (!r.ok) {
         const text = await r.text();
         throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
       }
       transcribeJob = await r.json();
-      logKPI('ui.library.transcribe.started', { name, model: transcribeJob.model });
+      logKPI('ui.library.transcribe.started', {
+        name, model: transcribeJob.model, beam_size: preset.beam_size,
+        preset: currentTranscribePreset(),
+      });
       // Re-render with the new running state, then start polling.
       if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
       schedulePoll();

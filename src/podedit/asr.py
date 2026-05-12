@@ -34,6 +34,14 @@ class ASRConfig:
     # tends to reduce cross-segment repetition more than it helps quality.
     temperature: tuple[float, ...] | float = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     condition_on_previous_text: bool = True
+    # Accuracy levers (W9). Both bias the decoder toward domain vocab with
+    # small runtime overhead relative to ASR.
+    # ``initial_prompt`` is conditioning text (e.g. "日本語のポッドキャスト
+    # 会話") that improves rare-word recognition; ``hotwords`` is
+    # faster-whisper's alternative API with stronger biasing for a small
+    # fixed vocabulary (proper nouns, jargon). Either or both may be set.
+    initial_prompt: str | None = None
+    hotwords: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +100,10 @@ def transcribe(
         # Speed knobs — see ASRConfig docstring for the trade-offs.
         temperature=cfg.temperature,
         condition_on_previous_text=cfg.condition_on_previous_text,
+        # Accuracy knobs (W9). Pass only if set so we don't override faster-
+        # whisper's defaults when callers don't care.
+        initial_prompt=cfg.initial_prompt if cfg.initial_prompt is not None else None,
+        hotwords=cfg.hotwords or None,
     )
 
     # Probe the derived 16k mono once for the asr_audio AudioRef.
@@ -113,6 +125,8 @@ def transcribe(
             vad_filter=cfg.vad_filter,
             temperature=cfg.temperature,
             condition_on_previous_text=cfg.condition_on_previous_text,
+            initial_prompt=cfg.initial_prompt,
+            hotwords=cfg.hotwords,
         ),
         created_at=now_iso(),
     )

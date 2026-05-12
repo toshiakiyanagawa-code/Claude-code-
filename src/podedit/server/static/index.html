@@ -56,11 +56,23 @@
       <button id="btn-library-close" class="modal-close" title="Close (Esc)">×</button>
     </div>
     <div class="modal-body">
+      <div class="library-preset-row">
+        <label for="transcribe-preset">Transcribe quality:</label>
+        <select id="transcribe-preset" aria-label="Transcribe preset">
+          <option value="fast">Fast (tiny · ~3 min)</option>
+          <option value="balanced" selected>Balanced (small · ~12-15 min)</option>
+          <option value="quality">Quality (small/beam=5 · ~25-30 min)</option>
+        </select>
+        <span class="library-preset-hint" id="transcribe-preset-hint">
+          small model + greedy decode + JA podcast prompt
+        </span>
+      </div>
       <div id="library-status" class="status">Loading library…</div>
       <ul id="library-list" class="library-list"></ul>
       <div class="library-hint">
-        Scanned from <code id="library-dir-hint">—</code>. Files without a
-        transcript need <code>podedit transcribe</code> first.
+        Scanned from <code id="library-dir-hint">—</code>. The Transcribe
+        button on each entry uses the preset above. CLI <code>podedit transcribe</code>
+        also works and produces a transcript here that the picker will show.
       </div>
     </div>
   </div>

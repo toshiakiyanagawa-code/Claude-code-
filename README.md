@@ -19,7 +19,9 @@ Local-first podcast editor for Japanese podcasts. Edit audio by editing its tran
     library dir and lets you switch the active episode without restarting the server.
   - **Transcribe** button on any library entry that doesn't have a transcript yet —
     runs faster-whisper in the background, shows live RTF and elapsed time, and
-    the file becomes selectable once it finishes.
+    the file becomes selectable once it finishes. A **quality preset** dropdown
+    at the top of the Open dialog picks between Fast / Balanced / Quality (see
+    table below); the choice persists across sessions.
   - Sessions autosave to JSON; KPI events stream to a JSONL log; both are
     keyed to the audio stem so multiple episodes coexist in one work dir.
 
@@ -42,13 +44,21 @@ Local-first podcast editor for Japanese podcasts. Edit audio by editing its tran
   CUDA. On a 2-vCPU Codespace (no GPU), measured pure-decode RTF on a 60s JA
   podcast slice with `tiny`:
 
-  | mode                                            | wall  | RTF   |
-  |-------------------------------------------------|------:|------:|
-  | legacy CLI (beam=5, ladder, cond=True)          | 8.35s | 0.139 |
-  | **in-UI fast (beam=1, ladder, cond=False)**     | 4.68s | 0.078 |
+  | preset (in-UI)                                  |  RTF  | 30-min wall | notes |
+  |-------------------------------------------------|------:|------------:|-------|
+  | **Fast** (tiny / beam=1)                        | 0.114 | ~3.4 min    | baseline; many JA mis-recognitions |
+  | **Balanced** (small / beam=1) — default         | 0.407 | ~12 min     | recognizes "クロード", "認知的", proper nouns |
+  | **Quality** (small / beam=5)                    | 0.564 | ~17 min     | crisper names ("スタンフォード"); marginal gain over Balanced |
+  | _ablate_ — small / beam=1, no prompt            | 0.385 | ~12 min     | "クロード" regresses to "黒だとか"; prompt earns its keep |
 
-  Projects to **~3 minutes total wall** for a 30-minute episode under in-UI
-  fast mode (ffmpeg decode + model load + ASR + VAD).
+  All in-UI presets are biased by a built-in JA podcast prompt
+  (`日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。`).
+  The CLI keeps the legacy defaults (`beam=5`, full temperature ladder,
+  `condition_on_previous_text=True`, no prompt biasing) — measured at RTF
+  ≈ 0.139 with `tiny`. API callers can override the in-UI defaults per job
+  (`POST /api/library/transcribe` accepts optional `model`, `beam_size`,
+  `initial_prompt`, `hotwords`; explicit empty string for `initial_prompt`
+  disables biasing for ablation).
 
 ## Setup
 
@@ -243,6 +253,7 @@ Codespaces-forwarded ports where edge caches can sit between you and the dev ser
 - **W7.7 ✅** In-UI Transcribe button — background ASR jobs with live progress
 - **W7.8 ✅** ASR speed — beam=1 greedy + WhisperModel cache, 1.65x faster on CPU
 - **W8 ✅** MVP completion — in-UI Export (wav/mp3), reproducibility docs, friction polish
+- **W9 ✅** ASR accuracy — small-model quality preset + JA podcast prompt biasing; tri-state API
 
 Differentiating bet: **Japanese conversation quality** (aizuchi vs filler distinction,
 prosody-aware cuts). Voice cloning is staged for v1.0.

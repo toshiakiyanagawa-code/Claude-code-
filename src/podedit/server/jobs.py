@@ -117,6 +117,13 @@ class TranscriptionJobManager:
         with self._lock:
             return self._current is not None and self._current.status == "running"
 
+    # A small library of bias prompts so the UI's quality preset can pick
+    # one without the user typing Japanese into the modal. Generic enough
+    # to avoid over-biasing toward a single topic; podcast-shaped so the
+    # decoder favors conversational form (です/ます, aizuchi) over news-
+    # script form. Empty string means "let faster-whisper default win".
+    DEFAULT_JA_PODCAST_PROMPT = "日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。"
+
     def start(
         self,
         *,
@@ -126,6 +133,8 @@ class TranscriptionJobManager:
         model: str = "tiny",
         language: str = "ja",
         beam_size: int = 1,
+        initial_prompt: str | None = None,
+        hotwords: str | None = None,
     ) -> dict:
         """Start a new transcription job. Raises RuntimeError if one is in flight.
 
@@ -133,6 +142,16 @@ class TranscriptionJobManager:
         single biggest speed knob on CPU. The CLI keeps its higher-default of
         5 for batch / non-interactive use where quality matters more than
         latency. See ASRConfig docstring for the speed-vs-WER trade-off.
+
+        ``initial_prompt`` / ``hotwords`` (W9): bias the decoder toward
+        podcast Japanese / specific vocabulary. Tri-state semantics for
+        ``initial_prompt``:
+          * ``None``         → fall back to ``DEFAULT_JA_PODCAST_PROMPT``.
+          * ``""``           → explicit "no biasing" (faster-whisper raw
+                                decoding). Useful for ablation tests.
+          * any other string → use as the prompt verbatim.
+        ``hotwords`` is simpler — there's no useful default, so empty
+        strings collapse to ``None`` (= no biasing).
         """
         with self._lock:
             if self._current is not None and self._current.status in ("queued", "running"):
@@ -150,10 +169,18 @@ class TranscriptionJobManager:
             )
             self._current = job
 
+        # Preserve tri-state for prompt (see docstring). For hotwords, collapse
+        # empty / whitespace to None since there's no default to suppress.
+        if isinstance(initial_prompt, str):
+            prompt = initial_prompt  # may be "" — that's a meaningful "no biasing" signal
+        else:
+            prompt = None
+        hw = hotwords.strip() if isinstance(hotwords, str) and hotwords.strip() else None
+
         # Spawn worker outside the lock so the start() call returns fast.
         t = threading.Thread(
             target=self._run_job,
-            args=(job, audio_path, transcript_path, model, language, beam_size),
+            args=(job, audio_path, transcript_path, model, language, beam_size, prompt, hw),
             daemon=True,
             name=f"podedit-transcribe-{job.job_id}",
         )
@@ -205,6 +232,8 @@ class TranscriptionJobManager:
         model: str,
         language: str,
         beam_size: int,
+        initial_prompt: str | None,
+        hotwords: str | None,
     ) -> None:
         try:
             self._set(job, status="running", started_at=time.time())
@@ -249,6 +278,15 @@ class TranscriptionJobManager:
             #     The ladder is only entered for segments that fail
             #     compression-ratio/logprob thresholds, so steady-state
             #     throughput is unchanged.
+            # Tri-state prompt resolution (see start() docstring):
+            #   None  → default JA podcast prompt (cheap quality bump)
+            #   ""    → caller explicitly asked for raw decoding; honor it
+            #   "..." → caller-supplied prompt, use verbatim
+            if initial_prompt is None:
+                effective_prompt = self.DEFAULT_JA_PODCAST_PROMPT
+            else:
+                effective_prompt = initial_prompt  # may be ""
+
             cfg = ASRConfig(
                 model=model, language=language,
                 beam_size=beam_size,
@@ -257,8 +295,17 @@ class TranscriptionJobManager:
                 condition_on_previous_text=False,
                 # Use the dataclass default (full ladder) — explicit for clarity.
                 temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+                initial_prompt=effective_prompt,
+                hotwords=hotwords,
             )
-            self._append_log(job, f"asr start (beam={beam_size}, cond=False, temp ladder)")
+            if initial_prompt is None:
+                prompt_tag = "default-prompt"
+            elif initial_prompt == "":
+                prompt_tag = "no-prompt"
+            else:
+                prompt_tag = f"user-prompt ({len(initial_prompt)} chars)"
+            hw_tag = f", hw={len(hotwords)} chars" if hotwords else ""
+            self._append_log(job, f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag})")
             tx, gen = transcribe(info, asr_wav, cfg, model_handle=whisper_model)
 
             for seg in gen:

@@ -45,6 +45,9 @@ class ModelConfig:
     # missing fields aren't a runtime hazard.
     temperature: tuple[float, ...] | float = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     condition_on_previous_text: bool = True
+    # W9 accuracy levers. None means "faster-whisper default" (no biasing).
+    initial_prompt: str | None = None
+    hotwords: str | None = None
 
 
 @dataclass(slots=True)
