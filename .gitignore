@@ -1,0 +1,22 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Test/sample audio and derived artifacts
+samples/
+*.transcript.json
+*.16k.wav
+benchmarks.jsonl
+
+# Local editor / OS
+.DS_Store
+.vscode/
+.idea/
