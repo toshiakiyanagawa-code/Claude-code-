@@ -1,4 +1,4 @@
-"""podedit CLI — `transcribe` (W1), `cut` and `render` (W2)."""
+"""podedit CLI — `transcribe` (W1), `cut`/`render` (W2), `serve` (W3)."""
 from __future__ import annotations
 
 import json
@@ -328,6 +328,28 @@ def render_cmd(
         f"{result.duration_in - result.duration_out:.1f}s cut, "
         f"{len(result.keeps)} keep ranges)"
     )
+
+
+@cli.command("serve")
+@click.option("--audio", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True,
+              help="Source audio to stream to the UI")
+@click.option("--transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True,
+              help="Transcript JSON to render")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8765, show_default=True, type=int)
+def serve_cmd(audio: Path, transcript: Path, host: str, port: int) -> None:
+    """Start the local web UI on http://host:port."""
+    import uvicorn
+
+    from .server.app import ServeConfig, create_app
+
+    app = create_app(ServeConfig(audio_path=audio, transcript_path=transcript))
+    console.print(
+        f"[green]podedit UI[/green] serving "
+        f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
+        f"at [link]http://{host}:{port}[/link]"
+    )
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>podedit</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --text: #e6e9ef;
+    --muted: #8a93a4;
+    --accent: #62aeff;
+    --active-bg: #314c75;
+    --hover-bg: #1f2330;
+    --border: #232735;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN",
+                 "Hiragino Sans", Meiryo, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel); position: sticky; top: 0; z-index: 10;
+  }
+  .title-row { display: flex; align-items: baseline; gap: 12px; }
+  h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  audio { width: 100%; margin-top: 10px; }
+  main {
+    padding: 16px 20px; max-width: 920px; width: 100%; margin: 0 auto;
+    line-height: 2; flex: 1; overflow-y: auto;
+  }
+  .segment { margin-bottom: 14px; padding: 8px 10px; border-radius: 6px; }
+  .seg-time {
+    color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+    margin-right: 8px; user-select: none;
+  }
+  .word {
+    cursor: pointer; padding: 1px 2px; border-radius: 3px;
+    transition: background-color 80ms ease;
+  }
+  .word:hover { background: var(--hover-bg); }
+  .word.active { background: var(--active-bg); color: white; }
+  .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
+  .error { color: #ff7a7a; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title-row">
+    <h1 id="audio-name">Loading…</h1>
+    <div class="meta" id="audio-meta"></div>
+  </div>
+  <audio id="player" controls preload="metadata"></audio>
+</header>
+<main id="transcript"><div class="status">Loading transcript…</div></main>
+
+<script>
+(async function () {
+  const $player = document.getElementById('player');
+  const $name = document.getElementById('audio-name');
+  const $meta = document.getElementById('audio-meta');
+  const $tx = document.getElementById('transcript');
+
+  const fmt = (s) => {
+    if (s == null || isNaN(s)) return '–';
+    const m = Math.floor(s / 60);
+    const r = (s - m * 60);
+    return `${m}:${r.toFixed(2).padStart(5, '0')}`;
+  };
+
+  let info, tx;
+  try {
+    [info, tx] = await Promise.all([
+      fetch('/api/audio/info').then(r => r.json()),
+      fetch('/api/transcript').then(r => r.json()),
+    ]);
+  } catch (e) {
+    $tx.innerHTML = `<div class="status error">Failed to load: ${e}</div>`;
+    return;
+  }
+
+  $name.textContent = info.name;
+  $meta.textContent = [
+    fmt(info.duration_sec),
+    info.sample_rate && `${info.sample_rate}Hz`,
+    info.channels && `${info.channels}ch`,
+    info.codec,
+    tx.model_config && `· model: ${tx.model_config.model}`,
+  ].filter(Boolean).join(' · ');
+  $player.src = info.url;
+
+  // Render transcript: one block per segment, words as clickable spans.
+  $tx.innerHTML = '';
+  const allWords = [];
+  for (const seg of tx.segments) {
+    const div = document.createElement('div');
+    div.className = 'segment';
+    const time = document.createElement('span');
+    time.className = 'seg-time';
+    time.textContent = fmt(seg.start);
+    div.appendChild(time);
+    for (const w of (seg.words || [])) {
+      const span = document.createElement('span');
+      span.className = 'word';
+      span.dataset.start = w.start;
+      span.dataset.end = w.end;
+      span.textContent = w.text;
+      span.addEventListener('click', () => {
+        $player.currentTime = w.start;
+        $player.play();
+      });
+      div.appendChild(span);
+      allWords.push({ el: span, start: w.start, end: w.end });
+    }
+    $tx.appendChild(div);
+  }
+
+  // Binary-search active word; only mutate DOM when active changes to avoid jank.
+  let activeIdx = -1;
+  function findActive(t) {
+    let lo = 0, hi = allWords.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const w = allWords[mid];
+      if (t < w.start) hi = mid - 1;
+      else if (t >= w.end) lo = mid + 1;
+      else { ans = mid; break; }
+    }
+    return ans;
+  }
+  function tick() {
+    const idx = findActive($player.currentTime);
+    if (idx !== activeIdx) {
+      if (activeIdx >= 0) allWords[activeIdx].el.classList.remove('active');
+      if (idx >= 0) {
+        allWords[idx].el.classList.add('active');
+        allWords[idx].el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+      activeIdx = idx;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
