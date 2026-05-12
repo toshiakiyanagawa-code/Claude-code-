@@ -20,12 +20,14 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 body {
   font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN",
                "Hiragino Sans", Meiryo, sans-serif;
+  font-size: 14px;
   display: flex; flex-direction: column;
 }
 
 header {
   padding: 12px 20px; border-bottom: 1px solid var(--border);
   background: var(--panel); position: sticky; top: 0; z-index: 10;
+  font-size: 13px;
 }
 .title-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 h1 { font-size: 14px; font-weight: 600; margin: 0; }
@@ -220,10 +222,10 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 
 main {
-  padding: 16px 20px; max-width: 920px; width: 100%; margin: 0 auto;
-  line-height: 2; flex: 1; overflow-y: auto;
+  padding: 12px 16px; max-width: 920px; width: 100%; margin: 0 auto;
+  line-height: 1.4; flex: 1; overflow-y: auto;
 }
-.segment { margin-bottom: 14px; padding: 8px 10px; border-radius: 6px; }
+.segment { margin-bottom: 7px; padding: 4px 8px; border-radius: 6px; }
 .segment-deleted {
   border-left: 2px solid rgba(255, 80, 80, 0.45);
   background: rgba(255, 80, 80, 0.05);
@@ -240,12 +242,13 @@ main {
 }
 .word {
   cursor: pointer;
-  padding: 4px 4px;       /* generous vertical pad → easier to hit between lines */
-  margin: 0 1px;          /* tiny gap so adjacent hit areas don't visually merge */
+  padding: 2px 3px;       /* enough vertical pad to keep drag-select forgiving */
+  margin: 0;
   border-radius: 3px;
   transition: background-color 80ms ease;
   user-select: none;
   display: inline-block;
+  font-size: inherit;
 }
 .word:hover { background: var(--hover-bg); }
 .word.selected { background: var(--selected-bg); }

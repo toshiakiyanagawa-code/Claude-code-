@@ -27,6 +27,7 @@
   const $btnAudition = $('btn-audition');
   const $btnExport = $('btn-export');
   const $exportFormat = $('export-format');
+  const $btnCopyTranscript = $('btn-copy-transcript');
   const $btnOpen = $('btn-open');
   const $libraryModal = $('library-modal');
   const $libraryList = $('library-list');
@@ -894,6 +895,11 @@
     $btnClear.disabled = !r;
   }
 
+  function setSelection(anchor, extent) {
+    state.selection = { anchor, extent };
+    renderSelection();
+  }
+
   function renderPasteAnchor() {
     for (const w of words) w.el.classList.toggle('paste-anchor', state.pasteAnchor === w.idx);
     const canPaste = !!state.clipboard && state.pasteAnchor != null;
@@ -916,6 +922,31 @@
   function clearSelection() {
     state.selection = null;
     renderSelection();
+  }
+
+  function extendSelectionByKeyboard(dir) {
+    if (dir !== -1 && dir !== 1) return;
+    let anchor;
+    let extent;
+    const hadSelection = !!state.selection;
+    if (hadSelection) {
+      anchor = state.selection.anchor;
+      extent = state.selection.extent;
+    } else {
+      if (activeIdx < 0) return;
+      anchor = activeIdx;
+      extent = activeIdx;
+    }
+
+    const next = Math.max(0, Math.min(words.length - 1, extent + dir));
+    const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+    const candidateTLSeg = wordTimelineSegmentIndex(words[next]);
+    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+      if (!hadSelection) setSelection(anchor, anchor);
+      return;
+    }
+    setSelection(anchor, next);
+    logKPI('ui.keyboard.select', { anchor, extent: next, direction: dir });
   }
 
   // ------- ops -------
@@ -1570,6 +1601,53 @@
   }
   $btnExport.addEventListener('click', exportEditedAudio);
 
+  async function writeClipboardText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+
+  let copyStatusSeq = 0;
+  async function copyEditedTranscript() {
+    const paragraphs = [];
+    for (const segment of $tx.querySelectorAll('.segment')) {
+      if (segment.classList.contains('segment-deleted')) continue;
+      const text = Array.from(segment.querySelectorAll('.word'))
+        .filter((el) => !el.classList.contains('deleted'))
+        .map((el) => el.textContent || '')
+        .join('');
+      if (text) paragraphs.push(text);
+    }
+    const text = paragraphs.join('\n\n').trimEnd();
+    await writeClipboardText(text);
+    const copiedSeq = ++copyStatusSeq;
+    $saveStatus.textContent = 'copied';
+    setTimeout(() => {
+      if (copyStatusSeq === copiedSeq) setSaveStatus(state.saveStatus);
+    }, 1500);
+    logKPI('ui.transcript.copied', { chars: text.length });
+  }
+
+  $btnCopyTranscript.addEventListener('click', () => {
+    copyEditedTranscript().catch((e) => {
+      setSaveStatus('error:' + e.message);
+    });
+  });
+
   // Persist the export format choice across sessions — small but the modal
   // selector is the only stateful input in the toolbar, so saving it costs us
   // nothing and matches "the UI remembers your settings" expectations.
@@ -1703,6 +1781,13 @@
     // otherwise lose characters mid-conversion.
     if (e.isComposing || e.keyCode === 229) return;
     const mod = e.metaKey || e.ctrlKey;
+    if (e.shiftKey && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      e.preventDefault();
+      extendSelectionByKeyboard(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
     if (mod && (e.key === 'z' || e.key === 'Z')) {
       e.preventDefault();
       if (e.shiftKey) redo(); else undo();
@@ -1769,6 +1854,16 @@
       if (mod) return;  // don't grab Ctrl+E / Cmd+E
       e.preventDefault();
       exportEditedAudio();
+      return;
+    }
+    if (e.key === 't' || e.key === 'T') {
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (mod) return;
+      e.preventDefault();
+      copyEditedTranscript().catch((err) => {
+        setSaveStatus('error:' + err.message);
+      });
       return;
     }
     if (e.key === ' ' || e.code === 'Space') {
