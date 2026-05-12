@@ -209,6 +209,30 @@
   // releasing in place so we don't leave dragAnchor sticky.
   document.addEventListener('mouseleave', finishDrag);
 
+  // Backstop for sensitivity: track mouse position during drag and resolve
+  // the word directly under the cursor each rAF. mouseenter alone misses
+  // words when the user drags fast across line breaks or through inter-word
+  // gaps. Throttled to rAF so we don't thrash DOM hit testing.
+  let pendingDragMove = null;  // {x, y} latest mouse position; processed on rAF
+  document.addEventListener('mousemove', (e) => {
+    if (dragAnchor === null) return;
+    pendingDragMove = { x: e.clientX, y: e.clientY };
+  });
+  function dragMoveTick() {
+    if (pendingDragMove && dragAnchor !== null) {
+      let el = document.elementFromPoint(pendingDragMove.x, pendingDragMove.y);
+      // Walk up in case the hit target is a text node wrapper.
+      while (el && !el.classList?.contains('word')) el = el.parentElement;
+      if (el && el.classList.contains('word')) {
+        const i = parseInt(el.dataset.idx, 10);
+        if (!Number.isNaN(i)) onWordMouseEnter(i);
+      }
+      pendingDragMove = null;
+    }
+    requestAnimationFrame(dragMoveTick);
+  }
+  requestAnimationFrame(dragMoveTick);
+
   function selectionRange() {
     if (!state.selection) return null;
     const a = Math.min(state.selection.anchor, state.selection.extent);

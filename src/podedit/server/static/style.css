@@ -66,9 +66,13 @@ main {
   margin-right: 8px; user-select: none;
 }
 .word {
-  cursor: pointer; padding: 1px 2px; border-radius: 3px;
+  cursor: pointer;
+  padding: 4px 4px;       /* generous vertical pad → easier to hit between lines */
+  margin: 0 1px;          /* tiny gap so adjacent hit areas don't visually merge */
+  border-radius: 3px;
   transition: background-color 80ms ease;
   user-select: none;
+  display: inline-block;
 }
 .word:hover { background: var(--hover-bg); }
 .word.selected { background: var(--selected-bg); }
