@@ -32,6 +32,10 @@
   const $libraryList = $('library-list');
   const $libraryStatus = $('library-status');
   const $libraryDirHint = $('library-dir-hint');
+  const $libraryCurrentPath = $('library-current-path');
+  const $libraryPathForm = $('library-path-form');
+  const $libraryPathInput = $('library-path-input');
+  const $libraryBreadcrumbs = $('library-breadcrumbs');
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
@@ -1803,6 +1807,50 @@
   let librarySwitching = false;
   let libraryReturnFocus = null;
   let libraryLoadSeq = 0;
+  let libraryBrowsePath = null;
+  let libraryBrowseMode = false;
+
+  async function fetchFsBrowse(path, seq) {
+    const suffix = path ? `?path=${encodeURIComponent(path)}` : '';
+    const url = `/api/fs/browse${suffix}`;
+    setLibraryStatus('Fetching directory…', path || 'default library path');
+    writeLibraryDiag('fs-browse-start', { seq, url, path });
+    const r = await fetch(url, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}: ${bodyPreview(text)}`);
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error(`JSON parse failed: ${e.message}; body starts ${bodyPreview(text)}`);
+    }
+  }
+
+  async function fetchCurrentLibraryListing(seq) {
+    if (libraryBrowseMode) return fetchFsBrowse(libraryBrowsePath, seq);
+    return fetchLibraryWithDiagnostics(seq);
+  }
+
+  async function navigateLibraryTo(path) {
+    if (!libraryOpen) return;
+    const seq = ++libraryLoadSeq;
+    try {
+      const data = await fetchFsBrowse(path, seq);
+      if (!libraryOpen || seq !== libraryLoadSeq) return;
+      libraryBrowseMode = true;
+      libraryBrowsePath = data && data.path ? data.path : path;
+      lastTranscribedLibrary = data;
+      populateLibrary(data);
+      const entries = Array.isArray(data && data.entries) ? data.entries : [];
+      setLibraryStatus('Directory loaded.', `entries=${entries.length} path=${libraryBrowsePath || '—'}`);
+    } catch (e) {
+      if (!libraryOpen || seq !== libraryLoadSeq) return;
+      setLibraryError(e);
+    }
+  }
+
   function showLibraryModal() {
     try {
       if (libraryOpen) return;
@@ -1813,6 +1861,11 @@
       $libraryModal.hidden = false;
       $libraryList.innerHTML = '';
       $libraryDirHint.textContent = 'checking...';
+      if ($libraryCurrentPath) $libraryCurrentPath.textContent = 'checking...';
+      if ($libraryPathInput) $libraryPathInput.value = '';
+      if ($libraryBreadcrumbs) $libraryBreadcrumbs.innerHTML = '';
+      libraryBrowsePath = null;
+      libraryBrowseMode = false;
       setLibraryStatus('step 0: modal opened', `seq=${seq}`);
       writeLibraryDiag('modal-open', { seq });
       console.log('[podedit] library modal opened', { seq });
@@ -1924,15 +1977,21 @@
   function populateLibrary(data) {
     const entries = Array.isArray(data && data.entries) ? data.entries : [];
     const libraryDir = data && data.library_dir ? data.library_dir : '—';
+    const currentPath = data && data.path ? data.path : libraryDir;
+    const parentPath = data && data.parent ? data.parent : null;
     const active = data && data.active ? data.active : '';
-    setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `library_dir=${libraryDir}`);
-    console.log('[podedit] populateLibrary start', { entries: entries.length, libraryDir, active });
+    const activePath = data && data.active_path ? data.active_path : '';
+    setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `path=${currentPath}`);
+    console.log('[podedit] populateLibrary start', { entries: entries.length, libraryDir, currentPath, active });
     $libraryDirHint.textContent = libraryDir;
+    if ($libraryCurrentPath) $libraryCurrentPath.textContent = currentPath;
+    if ($libraryPathInput) $libraryPathInput.value = currentPath;
+    renderLibraryBreadcrumbs(currentPath);
     $libraryList.innerHTML = '';
-    if (!entries.length) {
-      $libraryStatus.textContent = `No audio files found in ${libraryDir}.`;
+    if (!entries.length && !parentPath) {
+      $libraryStatus.textContent = `No audio files found in ${currentPath}.`;
       $libraryStatus.hidden = false;
-      console.log('[podedit] populateLibrary empty', { libraryDir });
+      console.log('[podedit] populateLibrary empty', { currentPath });
       return;
     }
     $libraryStatus.hidden = true;
@@ -1941,10 +2000,40 @@
     const runningName = transcribeJob
       && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')
       ? transcribeJob.name : null;
+    const runningPath = transcribeJob
+      && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')
+      ? transcribeJob.audio_path : null;
+    if (parentPath) {
+      const li = document.createElement('li');
+      li.className = 'selectable library-nav-entry';
+      const name = document.createElement('span');
+      name.className = 'library-name';
+      name.textContent = '..';
+      const meta = document.createElement('span');
+      meta.className = 'library-meta';
+      meta.textContent = 'parent directory';
+      li.append(name, meta);
+      li.addEventListener('click', () => navigateLibraryTo(parentPath));
+      $libraryList.appendChild(li);
+    }
     for (const e of entries) {
       const li = document.createElement('li');
-      const isActive = e.name === active;
-      const isTranscribing = e.name === runningName;
+      if (e.kind === 'dir') {
+        li.className = 'selectable library-dir-entry';
+        const name = document.createElement('span');
+        name.className = 'library-name';
+        name.textContent = e.name;
+        const meta = document.createElement('span');
+        meta.className = 'library-meta';
+        meta.textContent = 'directory';
+        li.append(name, meta);
+        li.addEventListener('click', () => navigateLibraryTo(e.path));
+        $libraryList.appendChild(li);
+        continue;
+      }
+      const entryPath = e.path || e.audio_path || '';
+      const isActive = entryPath ? entryPath === activePath : e.name === active;
+      const isTranscribing = runningPath ? entryPath === runningPath : e.name === runningName;
       // While a transcription is in progress for this entry we render a
       // dedicated "transcribing…" row rather than the normal selectable /
       // Transcribe button — we don't want the user clicking Transcribe twice.
@@ -1987,7 +2076,7 @@
         // against future regressions).
         btn.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          startTranscribe(e.name);
+          startTranscribe(e);
         });
         // If any other job is already running, disable so the user can't
         // queue a second one. The 409 from the server would catch this
@@ -1999,9 +2088,33 @@
         li.append(btn);
       }
       if (selectable) {
-        li.addEventListener('click', () => selectLibraryEntry(e.name));
+        li.addEventListener('click', () => selectLibraryEntry(e));
       }
       $libraryList.appendChild(li);
+    }
+  }
+
+  function renderLibraryBreadcrumbs(path) {
+    if (!$libraryBreadcrumbs) return;
+    $libraryBreadcrumbs.innerHTML = '';
+    if (!path || path === '—') return;
+    const root = document.createElement('button');
+    root.type = 'button';
+    root.textContent = '/';
+    root.addEventListener('click', () => navigateLibraryTo('/'));
+    $libraryBreadcrumbs.appendChild(root);
+    let acc = '';
+    for (const part of path.split('/').filter(Boolean)) {
+      acc = `${acc}/${part}`;
+      const sep = document.createElement('span');
+      sep.textContent = '/';
+      sep.className = 'library-breadcrumb-sep';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = part;
+      const target = acc;
+      btn.addEventListener('click', () => navigateLibraryTo(target));
+      $libraryBreadcrumbs.append(sep, btn);
     }
   }
   // ----- transcribe-from-modal (W7.7) -----
@@ -2060,21 +2173,25 @@
       updatePresetHint();
     });
   }
-  async function startTranscribe(name) {
+  async function startTranscribe(entry) {
     const preset = TRANSCRIBE_PRESETS[currentTranscribePreset()];
+    const name = entry && entry.name ? entry.name : String(entry || '');
+    const path = entry && (entry.path || entry.audio_path) ? (entry.path || entry.audio_path) : null;
     try {
+      const payload = {
+        model: preset.model,
+        beam_size: preset.beam_size,
+        // initial_prompt / hotwords intentionally omitted: server falls
+        // back to its DEFAULT_JA_PODCAST_PROMPT, which is the right
+        // default for this MVP's target content. Custom prompts can be
+        // added via a future settings UI.
+      };
+      if (path) payload.path = path;
+      else payload.name = name;
       const r = await fetch('/api/library/transcribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          model: preset.model,
-          beam_size: preset.beam_size,
-          // initial_prompt / hotwords intentionally omitted: server falls
-          // back to its DEFAULT_JA_PODCAST_PROMPT, which is the right
-          // default for this MVP's target content. Custom prompts can be
-          // added via a future settings UI.
-        }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const text = await r.text();
@@ -2082,7 +2199,7 @@
       }
       transcribeJob = await r.json();
       logKPI('ui.library.transcribe.started', {
-        name, model: transcribeJob.model, beam_size: preset.beam_size,
+        name, path, model: transcribeJob.model, beam_size: preset.beam_size,
         preset: currentTranscribePreset(),
       });
       // Re-render with the new running state, then start polling.
@@ -2135,7 +2252,7 @@
           if (libraryOpen) {
             const seq = ++libraryLoadSeq;
             try {
-              const refreshed = await fetchLibraryWithDiagnostics(seq);
+              const refreshed = await fetchCurrentLibraryListing(seq);
               // The user could have closed the modal during the refresh
               // await; if so, drop the result so we don't repopulate a
               // hidden modal with stale state.
@@ -2171,22 +2288,25 @@
       transcribePollInFlight = false;
     }
   }
-  async function selectLibraryEntry(name) {
+  async function selectLibraryEntry(entry) {
     if (librarySwitching) return;
+    const name = entry && entry.name ? entry.name : String(entry || '');
+    const path = entry && (entry.path || entry.audio_path) ? (entry.path || entry.audio_path) : null;
     librarySwitching = true;
     $libraryStatus.textContent = `Switching to ${name}…`;
     $libraryStatus.hidden = false;
     try {
+      const payload = path ? { path } : { name };
       const r = await fetch('/api/library/select', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const text = await r.text();
         throw new Error(`HTTP ${r.status} ${text.slice(0, 200)}`);
       }
-      logKPI('ui.library.selected', { name });
+      logKPI('ui.library.selected', { name, path });
       // The page reload picks up the new transcript / waveform / audio.
       // beforeunload above will warn if there's unsaved work.
       window.location.reload();
@@ -2197,6 +2317,13 @@
   }
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
+  if ($libraryPathForm) {
+    $libraryPathForm.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const path = $libraryPathInput ? $libraryPathInput.value.trim() : '';
+      if (path) navigateLibraryTo(path);
+    });
+  }
   $libraryModal.addEventListener('click', (ev) => {
     // click on the dim backdrop closes; clicks inside the panel don't bubble
     if (ev.target === $libraryModal) hideLibraryModal();

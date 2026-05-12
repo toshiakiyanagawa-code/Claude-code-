@@ -162,11 +162,41 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 .library-preset-row select:hover { border-color: var(--accent); }
 .library-preset-hint { font-size: 11px; color: var(--muted); flex: 1; }
+.library-path-form {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 8px;
+}
+.library-path-form label { font-size: 12px; color: var(--muted); }
+.library-path-form input {
+  flex: 1; min-width: 0;
+  background: #10131a; color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px; font-size: 12px;
+  font-family: ui-monospace, monospace;
+}
+.library-path-form button,
+.library-breadcrumbs button {
+  background: #232735; color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit;
+}
+.library-path-form button { padding: 6px 10px; }
+.library-path-form button:hover,
+.library-breadcrumbs button:hover { border-color: var(--accent); background: #2b303f; }
+.library-breadcrumbs {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  margin: 0 0 10px; color: var(--muted); font-size: 11px;
+}
+.library-breadcrumbs button {
+  padding: 2px 6px; max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-breadcrumb-sep { color: var(--muted); }
 .library-hint { font-size: 11px; color: var(--muted); margin-top: 12px; }
 .library-hint code {
   background: #1a1d28; padding: 1px 4px; border-radius: 3px;
   font-family: ui-monospace, monospace;
 }
+.library-dir-entry .library-name::before { content: "dir "; color: var(--accent); }
+.library-nav-entry .library-name { color: var(--accent); }
 /* W7.7: Transcribe action button on entries without a transcript. */
 .library-action {
   margin-left: 10px;

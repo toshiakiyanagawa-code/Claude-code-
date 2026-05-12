@@ -46,7 +46,7 @@ class NoCacheStaticFiles(StaticFiles):
 
 from ..audio import probe as audio_probe
 from ..edit import EditSession, compile_timeline, sha256_of_file
-from ..library import scan_library
+from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
 from ..waveform import WaveformError, get_or_compute_waveform
@@ -774,37 +774,90 @@ def create_app(config: ServeConfig) -> FastAPI:
     # served without restarting the server. The browser is expected to do a
     # full page reload after a successful POST so every cached resource
     # (transcript, waveform, audio) is re-fetched against the new state.
+    def _resolve_browse_path(raw_path: str | None) -> Path:
+        if raw_path is None or raw_path == "":
+            candidate = state.library_dir
+        else:
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = state.library_dir / candidate
+        try:
+            return candidate.resolve()
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(status_code=404, detail=f"path not found: {candidate}") from e
+
     @app.get("/api/library")
     def library() -> JSONResponse:
         entries = scan_library(state.library_dir, state.work_dir)
         active_name = state.audio_path.name
         return JSONResponse({
             "library_dir": str(state.library_dir),
+            "path": str(state.library_dir),
+            "parent": None,
             "work_dir": str(state.work_dir),
             "active": active_name,
+            "active_path": str(state.audio_path.resolve()),
             "entries": [e.to_dict() for e in entries],
         }, headers={"Cache-Control": "no-store"})
 
-    @app.post("/api/library/select")
-    def library_select(body: dict) -> dict:
-        from ..library import SUPPORTED_AUDIO_SUFFIXES
+    @app.get("/api/fs/browse")
+    def fs_browse(path: str | None = None) -> JSONResponse:
+        # Single-user local dev tool. The Codespace forwarded URL is gated by the
+        # user's GitHub auth and the server runs as the same user — so we trust
+        # any path the process can read. If you fork this for multi-user use,
+        # reintroduce a containment check.
+        candidate_dir = _resolve_browse_path(path)
+        if not candidate_dir.exists() or not candidate_dir.is_dir():
+            raise HTTPException(status_code=404, detail=f"directory not found: {candidate_dir}")
+        try:
+            payload = list_directory(candidate_dir, state.work_dir)
+        except PermissionError as e:
+            raise HTTPException(status_code=403, detail=f"permission denied: {candidate_dir}") from e
+        payload["library_dir"] = str(state.library_dir)
+        payload["work_dir"] = str(state.work_dir)
+        payload["active"] = state.audio_path.name
+        payload["active_path"] = str(state.audio_path.resolve())
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
-        name = (body or {}).get("name")
-        if not name or "/" in name or "\\" in name or name.startswith("."):
-            raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
-        candidate_audio = state.library_dir / name
+    def _audio_from_library_request(body: dict, *, require_string_name: bool = False) -> tuple[Path, str]:
+        body = body or {}
+        raw_path = body.get("path")
+        if raw_path is not None:
+            if not isinstance(raw_path, str):
+                raise HTTPException(status_code=400, detail="path must be a string")
+            candidate_audio = _resolve_browse_path(raw_path)
+            if candidate_audio.name.startswith("."):
+                raise HTTPException(status_code=400, detail="hidden audio files are not supported")
+            label = str(candidate_audio)
+        else:
+            name = body.get("name")
+            if require_string_name and not isinstance(name, str):
+                raise HTTPException(status_code=400, detail="name must be a string")
+            if not name or not isinstance(name, str) or "/" in name or "\\" in name or name.startswith("."):
+                raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
+            candidate_audio = (state.library_dir / name).resolve()
+            label = name
         # Defense in depth: even if scan_library skipped the file (wrong suffix
         # / directory / dotfile / faststart derivative), reject it here too so
         # a hand-crafted POST can't switch the server onto something weird.
         if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
             raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
+        if candidate_audio.name.endswith(".faststart" + candidate_audio.suffix):
+            raise HTTPException(status_code=400, detail="faststart derivatives are not selectable")
         if not candidate_audio.exists() or not candidate_audio.is_file():
-            raise HTTPException(status_code=404, detail=f"{name!r} not found in library")
+            raise HTTPException(status_code=404, detail=f"{label!r} not found")
+        if not os.access(candidate_audio, os.R_OK):
+            raise HTTPException(status_code=403, detail=f"permission denied: {label!r}")
+        return candidate_audio, label
+
+    @app.post("/api/library/select")
+    def library_select(body: dict) -> dict:
+        candidate_audio, label = _audio_from_library_request(body)
         candidate_transcript = state.work_dir / f"{candidate_audio.stem}.transcript.json"
         if not candidate_transcript.exists():
             raise HTTPException(
                 status_code=409,
-                detail=f"no transcript found for {name!r}; run `podedit transcribe` first",
+                detail=f"no transcript found for {label!r}; run `podedit transcribe` first",
             )
         try:
             state.load_active(candidate_audio, candidate_transcript)
@@ -812,11 +865,11 @@ def create_app(config: ServeConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e)) from e
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.library.selected",
-            "name": name, "audio_path": str(state.audio_path),
+            "name": candidate_audio.name, "audio_path": str(state.audio_path),
         })
         return {
             "ok": True,
-            "active": name,
+            "active": candidate_audio.name,
             "audio_path": str(state.audio_path),
             "transcript_path": str(state.transcript_path),
             "session_path": str(state.session_path),
@@ -829,15 +882,7 @@ def create_app(config: ServeConfig) -> FastAPI:
     # request and starts the job. The UI polls /status.
     @app.post("/api/library/transcribe")
     def library_transcribe(body: dict) -> JSONResponse:
-        from ..library import SUPPORTED_AUDIO_SUFFIXES
-
         body = body or {}
-        # Type-check before string ops so a hand-crafted POST with non-string
-        # values (e.g. {"name": 42}) returns a 400 rather than a 500 from
-        # `int.startswith(...)`.
-        name = body.get("name")
-        if not isinstance(name, str):
-            raise HTTPException(status_code=400, detail="name must be a string")
         raw_model = body.get("model", "tiny")
         if not isinstance(raw_model, str):
             raise HTTPException(status_code=400, detail="model must be a string")
@@ -882,18 +927,13 @@ def create_app(config: ServeConfig) -> FastAPI:
         if len(raw_hotwords) > 2000:
             raise HTTPException(status_code=400, detail="hotwords too long (max 2000 chars)")
         hotwords = raw_hotwords or None
-        if not name or "/" in name or "\\" in name or name.startswith("."):
-            raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
-        candidate_audio = state.library_dir / name
-        if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
-            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
-        if not candidate_audio.exists() or not candidate_audio.is_file():
-            raise HTTPException(status_code=404, detail=f"{name!r} not found in library")
+        candidate_audio, label = _audio_from_library_request(body, require_string_name=("path" not in body))
+        name = candidate_audio.name
         transcript_path = state.work_dir / f"{candidate_audio.stem}.transcript.json"
         if transcript_path.exists():
             raise HTTPException(
                 status_code=409,
-                detail=f"transcript already exists for {name!r}",
+                detail=f"transcript already exists for {label!r}",
             )
         try:
             job = transcription_jobs.start(

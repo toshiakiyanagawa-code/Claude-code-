@@ -68,9 +68,16 @@
         </span>
       </div>
       <div id="library-status" class="status">Loading library…</div>
+      <form id="library-path-form" class="library-path-form">
+        <label for="library-path-input">Path</label>
+        <input id="library-path-input" type="text" autocomplete="off" spellcheck="false" />
+        <button id="library-path-go" type="submit">Go</button>
+      </form>
+      <div id="library-breadcrumbs" class="library-breadcrumbs" aria-label="Current path"></div>
       <ul id="library-list" class="library-list"></ul>
       <div class="library-hint">
-        Scanned from <code id="library-dir-hint">—</code>. The Transcribe
+        Scanned from <code id="library-dir-hint">—</code>. Current path
+        <code id="library-current-path">—</code>. The Transcribe
         button on each entry uses the preset above. CLI <code>podedit transcribe</code>
         also works and produces a transcript here that the picker will show.
       </div>
