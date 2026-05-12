@@ -14,6 +14,7 @@
   const $kpiOps = $('kpi-ops');
   const $kpiCut = $('kpi-cut');
   const $kpiElapsed = $('kpi-elapsed');
+  const $skipPill = $('skip-pill');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -370,19 +371,32 @@
       el.scrollIntoView({ block: 'center', behavior: 'auto' });
     }
   }
+  let lastSkipAt = 0;
   function tick() {
     // Preview-skip: walk the merged (sorted, non-overlapping) delete ranges
     // and jump over any that the playhead lands inside. mergedDeletes is
     // sorted so a single linear scan suffices, but recompute `t` after each
     // jump in case the new position lands inside the next range.
     let t = $player.currentTime;
+    let didSkip = false;
     for (const [s, e] of state.mergedDeletes) {
       if (t >= s && t < e) {
-        $player.currentTime = e;
-        t = e;
+        // Nudge slightly past the boundary so floating-point drift can't park
+        // us inside the same range on the very next frame.
+        $player.currentTime = e + 0.001;
+        t = e + 0.001;
+        didSkip = true;
       } else if (t < s) {
         break;  // ranges are sorted; remaining ones are further ahead
       }
+    }
+    if (didSkip) {
+      lastSkipAt = performance.now();
+      $skipPill.classList.add('active');
+      $skipPill.textContent = 'SKIP';
+    } else if ($skipPill.classList.contains('active') && performance.now() - lastSkipAt > 250) {
+      $skipPill.classList.remove('active');
+      $skipPill.textContent = 'no cut';
     }
 
     const idx = findActive($player.currentTime);
