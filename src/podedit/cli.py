@@ -42,6 +42,8 @@ def cli() -> None:
               help="VAD filter. Disable if Japanese aizuchi/laughter are being dropped.")
 @click.option("--bench-log", type=click.Path(path_type=Path), default=Path("benchmarks.jsonl"),
               show_default=True, help="Append run metrics here")
+@click.option("--no-checksum", is_flag=True, default=False,
+              help="Skip source SHA-256. Faster; disables tamper detection downstream.")
 def transcribe_cmd(
     audio: Path,
     out_path: Path | None,
@@ -53,6 +55,7 @@ def transcribe_cmd(
     beam_size: int,
     vad: bool,
     bench_log: Path,
+    no_checksum: bool,
 ) -> None:
     """Transcribe AUDIO and write a JSON transcript."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -119,6 +122,9 @@ def transcribe_cmd(
         except Exception as e:  # surface a friendlier line, then re-raise so bench logs error
             console.print(f"[red]ASR failed:[/red] {type(e).__name__}: {e}")
             raise
+        if not no_checksum:
+            tx.source_audio.sha256 = sha256_of_file(audio)
+            rec_asr["extra"]["source_sha256"] = tx.source_audio.sha256
         rec_asr["extra"]["segments"] = len(tx.segments)
         rec_asr["extra"]["word_count"] = sum(len(s.words) for s in tx.segments)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,9 +347,14 @@ def serve_cmd(audio: Path, transcript: Path, host: str, port: int) -> None:
     """Start the local web UI on http://host:port."""
     import uvicorn
 
-    from .server.app import ServeConfig, create_app
+    from .server.app import AudioTranscriptMismatch, ServeConfig, create_app
 
-    app = create_app(ServeConfig(audio_path=audio, transcript_path=transcript))
+    try:
+        app = create_app(ServeConfig(audio_path=audio, transcript_path=transcript))
+    except AudioTranscriptMismatch as e:
+        _fatal(str(e))
+    except FileNotFoundError as e:
+        _fatal(str(e))
     console.print(
         f"[green]podedit UI[/green] serving "
         f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "

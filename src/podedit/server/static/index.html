@@ -73,14 +73,17 @@
     return `${m}:${r.toFixed(2).padStart(5, '0')}`;
   };
 
+  async function fetchJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+    return r.json();
+  }
+
   let info, tx;
   try {
-    [info, tx] = await Promise.all([
-      fetch('/api/audio/info').then(r => r.json()),
-      fetch('/api/transcript').then(r => r.json()),
-    ]);
+    [info, tx] = await Promise.all([fetchJSON('/api/audio/info'), fetchJSON('/api/transcript')]);
   } catch (e) {
-    $tx.innerHTML = `<div class="status error">Failed to load: ${e}</div>`;
+    $tx.innerHTML = `<div class="status error">Failed to load: ${e.message}</div>`;
     return;
   }
 
@@ -112,7 +115,9 @@
       span.textContent = w.text;
       span.addEventListener('click', () => {
         $player.currentTime = w.start;
-        $player.play();
+        // play() returns a Promise that some browsers reject silently — swallow it.
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
       });
       div.appendChild(span);
       allWords.push({ el: span, start: w.start, end: w.end });
@@ -133,13 +138,23 @@
     }
     return ans;
   }
+  // Only scroll when the active word would otherwise be off-screen, and use
+  // 'auto' (instant) — `smooth` chained at multiple-Hz becomes janky.
+  function scrollIfOffscreen(el) {
+    const r = el.getBoundingClientRect();
+    const margin = 80;
+    if (r.top < margin || r.bottom > window.innerHeight - margin) {
+      el.scrollIntoView({ block: 'center', behavior: 'auto' });
+    }
+  }
+
   function tick() {
     const idx = findActive($player.currentTime);
     if (idx !== activeIdx) {
       if (activeIdx >= 0) allWords[activeIdx].el.classList.remove('active');
       if (idx >= 0) {
         allWords[idx].el.classList.add('active');
-        allWords[idx].el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        scrollIfOffscreen(allWords[idx].el);
       }
       activeIdx = idx;
     }
