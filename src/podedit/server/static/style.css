@@ -178,7 +178,9 @@ main {
 }
 .drop-caret {
   position: fixed;
-  z-index: 999;
+  /* Must stay above .move-ghost (z-index: 1000), otherwise the now-larger
+     full-clone ghost can occlude the caret as the pointer moves over it. */
+  z-index: 1001;
   width: 2px;
   min-height: 14px;
   border-radius: 1px;
