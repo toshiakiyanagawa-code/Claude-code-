@@ -275,66 +275,69 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.put("/api/session")
     def put_session(body: dict) -> dict:
-        # Mutations go through state.session via the lock; no nonlocal needed.
+        # Shape-validate the payload outside the lock — it's CPU-only.
         try:
             new_session = EditSession.from_dict(body)
         except (KeyError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"invalid session: {e}") from e
-
-        # The incoming session must belong to the audio we're currently serving.
-        # Skipping these checks would let a stray PUT (different episode / wrong
-        # timeline_basis / out-of-range ops) silently overwrite the file on disk.
         if new_session.timeline_basis != "source_audio_seconds":
             raise HTTPException(
                 status_code=400,
                 detail=f"timeline_basis must be 'source_audio_seconds', got {new_session.timeline_basis!r}",
             )
-        expected_src = state.transcript_data.get("source_audio") or {}
-        expected_sha = expected_src.get("sha256")
-        actual_sha = new_session.source_audio.sha256
-        if expected_sha and actual_sha and expected_sha != actual_sha:
-            raise HTTPException(
-                status_code=400,
-                detail=f"session source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
-            )
-        expected_duration = expected_src.get("duration_sec")
-        if expected_duration is not None:
-            if abs(new_session.source_audio.duration_sec - float(expected_duration)) > DURATION_TOLERANCE_SEC:
+
+        # The remaining validation depends on which file is currently active.
+        # If we let library/select race in between, autosaved ops for ep1 could
+        # be saved to ep2's session_path. Hold the lock from the moment we
+        # decide which transcript/session_path applies all the way through
+        # the atomic write.
+        with state.session_lock:
+            transcript_data = state.transcript_data
+            target_session_path = state.session_path
+            expected_src = transcript_data.get("source_audio") or {}
+            expected_sha = expected_src.get("sha256")
+            actual_sha = new_session.source_audio.sha256
+            if expected_sha and actual_sha and expected_sha != actual_sha:
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        f"session source duration {new_session.source_audio.duration_sec:.2f}s "
-                        f"doesn't match served audio {float(expected_duration):.2f}s"
-                    ),
+                    detail=f"session source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
                 )
-            for op in new_session.ops:
-                if op.op == "delete":
-                    src_start, src_end = op.start, op.end
-                elif op.op == "move":
-                    src_start, src_end = op.src_start, op.src_end
-                    if op.target_edited_t < 0:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"op {op.op_id} target_edited_t must be >= 0",
-                        )
-                else:
-                    raise HTTPException(status_code=400, detail=f"unsupported op {op.op!r}")
-                if src_start < 0 or src_end > float(expected_duration) + 1e-3 or src_end <= src_start:
+            expected_duration = expected_src.get("duration_sec")
+            if expected_duration is not None:
+                if abs(new_session.source_audio.duration_sec - float(expected_duration)) > DURATION_TOLERANCE_SEC:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"op {op.op_id} range {src_start}-{src_end} falls outside "
-                            f"[0, {float(expected_duration):.2f}]"
+                            f"session source duration {new_session.source_audio.duration_sec:.2f}s "
+                            f"doesn't match served audio {float(expected_duration):.2f}s"
                         ),
                     )
-
-        with state.session_lock:
+                for op in new_session.ops:
+                    if op.op == "delete":
+                        src_start, src_end = op.start, op.end
+                    elif op.op == "move":
+                        src_start, src_end = op.src_start, op.src_end
+                        if op.target_edited_t < 0:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"op {op.op_id} target_edited_t must be >= 0",
+                            )
+                    else:
+                        raise HTTPException(status_code=400, detail=f"unsupported op {op.op!r}")
+                    if src_start < 0 or src_end > float(expected_duration) + 1e-3 or src_end <= src_start:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"op {op.op_id} range {src_start}-{src_end} falls outside "
+                                f"[0, {float(expected_duration):.2f}]"
+                            ),
+                        )
             state.session = new_session
             _atomic_write_text(
-                state.session_path,
+                target_session_path,
                 json.dumps(state.session.to_dict(), ensure_ascii=False, indent=2),
             )
-        return {"saved_at": time.time(), "path": str(state.session_path), "ops": len(state.session.ops)}
+            return {"saved_at": time.time(), "path": str(target_session_path), "ops": len(state.session.ops)}
 
     @app.post("/api/kpi/event")
     def post_kpi(event: dict) -> dict:
@@ -356,10 +359,18 @@ def create_app(config: ServeConfig) -> FastAPI:
             lufs_target = float(lufs_target)
         true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
 
+        # Snapshot every piece of active state the render depends on inside one
+        # lock acquisition. If library/select races in mid-render, the render
+        # still writes to the snapshot's preview path, references the snapshot's
+        # audio file, and logs the snapshot's KPI path — never a mix.
         with state.session_lock:
             ops_for_render = list(state.session.ops)
             ops_blob = state.session.to_dict().get("ops", [])
             source_duration = state.session.source_audio.duration_sec
+            snap_audio_path = state.audio_path
+            snap_work_dir = state.work_dir
+            snap_kpi_log = state.kpi_log_path
+            snap_audio_stem = state.audio_path.stem
 
         # Cache key covers every parameter that can change the bytes on disk.
         # Including RENDERER_VERSION means a code change automatically
@@ -375,16 +386,16 @@ def create_app(config: ServeConfig) -> FastAPI:
             sort_keys=True,
         ).encode()
         cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
-        preview_path = state.work_dir / f"{state.audio_path.stem}.preview.{cache_key}.wav"
+        preview_path = snap_work_dir / f"{snap_audio_stem}.preview.{cache_key}.wav"
 
         cached = preview_path.exists()
         if not cached:
-            _gc_previews(state.work_dir, state.audio_path.stem, keep=preview_path)
+            _gc_previews(snap_work_dir, snap_audio_stem, keep=preview_path)
             t0 = time.time()
             try:
                 segments = compile_timeline(source_duration, ops_for_render)
                 result = render_segments(
-                    state.audio_path,
+                    snap_audio_path,
                     segments=segments,
                     output=preview_path,
                     source_duration=source_duration,
@@ -395,7 +406,7 @@ def create_app(config: ServeConfig) -> FastAPI:
                 )
             except RenderError as e:
                 raise HTTPException(status_code=500, detail=str(e)) from e
-            _append_jsonl(state.kpi_log_path, {
+            _append_jsonl(snap_kpi_log, {
                 "server_ts": time.time(), "type": "server.preview.rendered",
                 "cache_key": cache_key, "wall_sec": time.time() - t0,
                 "duration_in": result.duration_in, "duration_out": result.duration_out,
@@ -474,11 +485,18 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.post("/api/library/select")
     def library_select(body: dict) -> dict:
+        from ..library import SUPPORTED_AUDIO_SUFFIXES
+
         name = (body or {}).get("name")
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
         candidate_audio = state.library_dir / name
-        if not candidate_audio.exists():
+        # Defense in depth: even if scan_library skipped the file (wrong suffix
+        # / directory / dotfile / faststart derivative), reject it here too so
+        # a hand-crafted POST can't switch the server onto something weird.
+        if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
+        if not candidate_audio.exists() or not candidate_audio.is_file():
             raise HTTPException(status_code=404, detail=f"{name!r} not found in library")
         candidate_transcript = state.work_dir / f"{candidate_audio.stem}.transcript.json"
         if not candidate_transcript.exists():

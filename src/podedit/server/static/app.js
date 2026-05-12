@@ -1508,13 +1508,17 @@
   // unsaved-work warning for free.
   let libraryOpen = false;
   let librarySwitching = false;
+  let libraryReturnFocus = null;
   function showLibraryModal() {
     if (libraryOpen) return;
     libraryOpen = true;
+    libraryReturnFocus = document.activeElement;
     $libraryModal.hidden = false;
     $libraryList.innerHTML = '';
     $libraryStatus.textContent = 'Loading library…';
     $libraryStatus.hidden = false;
+    // Move keyboard focus into the dialog so Esc works without an extra click.
+    $btnLibraryClose.focus();
     fetchJSON('/api/library')
       .then((data) => populateLibrary(data))
       .catch((e) => {
@@ -1525,6 +1529,12 @@
     if (!libraryOpen) return;
     libraryOpen = false;
     $libraryModal.hidden = true;
+    // Restore focus to whatever element triggered the open, so screen readers
+    // and keyboard users don't lose their place.
+    if (libraryReturnFocus && typeof libraryReturnFocus.focus === 'function') {
+      libraryReturnFocus.focus();
+    }
+    libraryReturnFocus = null;
   }
   function populateLibrary(data) {
     $libraryStatus.hidden = true;
