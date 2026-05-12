@@ -2,22 +2,35 @@
 
 Local-first podcast editor for Japanese podcasts. Edit audio by editing its transcript.
 
-**Status: W4 complete — full transcript-driven editor in the browser.**
-W5 (PCM crossfade / de-click / server-side preview render) is next.
+**Status: MVP complete — transcribe, edit, audition, render — all in the browser or from the CLI.**
 
 ## What works today
 
-- `podedit transcribe` — Japanese ASR via faster-whisper, word-level timestamps,
-  bench-logged (RTF, peak RSS, success/error) to `benchmarks.jsonl`.
-- `podedit cut` — apply delete ranges directly via CLI, write a wav, save an
-  `EditSession` JSON.
-- `podedit render` — replay a saved `EditSession` against its source; verifies
-  the source SHA-256 before rendering.
-- `podedit serve` — local web UI: scroll the transcript, drag to select words,
-  press <kbd>D</kbd> to delete, <kbd>⌘Z</kbd> to undo. The scrubber and time
-  displays reflect the **edited** timeline (deletions remove their span from
-  the visible duration); audio playback skips deleted ranges automatically.
-  Sessions autosave; KPI events stream to a JSONL log.
+- **In-browser editor** (`podedit serve`)
+  - Click a word to seek; drag across words to select; <kbd>D</kbd> to cut;
+    <kbd>⌘X</kbd>/<kbd>⌘V</kbd> to move material; <kbd>⌘Z</kbd>/<kbd>⌘⇧Z</kbd> for undo/redo.
+  - Drag a selected range to a new spot to **move** it (the transcript rebuilds
+    in edited order, audio follows).
+  - **Audition** button renders a sample-precise preview with crossfades + de-click
+    + two-pass loudnorm (-16 LUFS, -1 dBTP) and streams it back to the player.
+  - **Export** button (or <kbd>E</kbd>) downloads the same render as wav or mp3 —
+    no CLI round-trip needed for the common case.
+  - **Open dialog** (toolbar **Open** / <kbd>O</kbd>) lists every audio file in the
+    library dir and lets you switch the active episode without restarting the server.
+  - **Transcribe** button on any library entry that doesn't have a transcript yet —
+    runs faster-whisper in the background, shows live RTF and elapsed time, and
+    the file becomes selectable once it finishes.
+  - Sessions autosave to JSON; KPI events stream to a JSONL log; both are
+    keyed to the audio stem so multiple episodes coexist in one work dir.
+
+- **CLI** (`podedit transcribe|cut|render|serve`)
+  - `transcribe` — Japanese ASR via faster-whisper with word-level timestamps;
+    appends RTF / peak-RSS / success metrics to `benchmarks.jsonl`.
+  - `cut` / `render` — apply delete/move ops from CLI or replay an autosaved
+    `EditSession`; verifies the source SHA-256 before rendering.
+  - Renderer is sample-precise PCM with **content-aware variable crossfades**
+    (zero-cross snap, click detection, per-seam fade lengths) and two-pass
+    EBU R128 loudnorm. Exports to wav, mp3, or flac.
 
 ## Requirements
 
@@ -25,9 +38,17 @@ W5 (PCM crossfade / de-click / server-side preview render) is next.
 - Python 3.12
 - ffmpeg / ffprobe on `PATH`
 - ~3 GB disk if you fetch `large-v3` (smaller models work fine on CPU)
-- GPU optional. CPU works for small/medium models; expect RTF > 1 on `large-v3`
-  without CUDA. Measured on a 2-vCPU Codespace: `tiny` 0.21x RTF, `base` 0.24x,
-  `small` 0.65x.
+- GPU optional. CPU works for all models; expect RTF > 1 on `large-v3` without
+  CUDA. On a 2-vCPU Codespace (no GPU), measured pure-decode RTF on a 60s JA
+  podcast slice with `tiny`:
+
+  | mode                                            | wall  | RTF   |
+  |-------------------------------------------------|------:|------:|
+  | legacy CLI (beam=5, ladder, cond=True)          | 8.35s | 0.139 |
+  | **in-UI fast (beam=1, ladder, cond=False)**     | 4.68s | 0.078 |
+
+  Projects to **~3 minutes total wall** for a 30-minute episode under in-UI
+  fast mode (ffmpeg decode + model load + ASR + VAD).
 
 ## Setup
 
@@ -38,21 +59,40 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync
 ```
 
-## Usage
+## Quickstart
+
+```bash
+# 1. Transcribe one episode from the CLI so the server has something to load.
+uv run podedit transcribe samples/episode1.m4a --model tiny
+
+# 2. Start the local UI on the audio folder. The Open dialog will list every
+#    audio file in --library-dir; files without a transcript get an in-modal
+#    Transcribe button.
+uv run podedit serve \
+  --audio samples/episode1.m4a \
+  --transcript .podedit/work/episode1.transcript.json \
+  --library-dir samples \
+  --work-dir .podedit/work
+
+# 3. Edit in the browser at http://127.0.0.1:8765 (or your Codespace forwarded
+#    port). Sessions autosave to .podedit/work/<stem>.session.json.
+
+# 4. When you're done editing, press E in the browser to export wav or mp3
+#    directly (recommended). For batch/CI workflows, you can also render from
+#    the CLI against the autosaved session:
+uv run podedit render .podedit/work/episode1.session.json -o final.mp3
+```
+
+## Usage details
 
 ### Transcribe (W1)
 
 ```bash
-# Writes <stem>.transcript.json under .podedit/work/ by default.
-uv run podedit transcribe path/to/episode.mp3 --model small
-
-# Pick a model: tiny | base | small | medium | large-v3 | large-v3-turbo
-uv run podedit transcribe path/to/episode.mp3 --model large-v3-turbo
-
-# Disable VAD if Japanese aizuchi / laughter are being dropped.
+uv run podedit transcribe path/to/episode.mp3 --model tiny
+# Models: tiny | base | small | medium | large-v3 | large-v3-turbo
+# Disable VAD if Japanese aizuchi / laughter are being dropped:
 uv run podedit transcribe path/to/episode.mp3 --model small --no-vad
-
-# Skip the source SHA-256 (faster, but downstream tools can't verify the file).
+# Skip the source SHA-256 (faster, but downstream tools can't verify the file):
 uv run podedit transcribe path/to/episode.mp3 --no-checksum
 ```
 
@@ -65,9 +105,14 @@ Each run appends a record to `benchmarks.jsonl`:
           "total_wall_sec":394.1,"transcript_bytes":1319102}}
 ```
 
+The CLI uses **legacy defaults** (beam=5, temperature fallback ladder,
+`condition_on_previous_text=True`) — same behavior as before W7.8. The in-UI
+worker opts into **fast mode** (beam=1, ladder kept for safety,
+`condition_on_previous_text=False`) for interactive responsiveness.
+
 ### Cut (W2)
 
-Apply one or more delete ranges directly via CLI:
+Apply delete ranges directly via CLI:
 
 ```bash
 uv run podedit cut path/to/episode.m4a \
@@ -79,21 +124,27 @@ uv run podedit cut path/to/episode.m4a \
 ```
 
 Ranges accept seconds, `M:SS`, or `H:MM:SS`. The `EditSession` JSON records the
-source audio (with SHA-256) and the ops list. W2 cuts are hard splices (no
-crossfade); proper sample-precise PCM with de-click arrives in W5.
+source audio (with SHA-256) and the ops list.
 
-### Render a saved session (W2 follow-up)
+### Render a saved session (W2 + W5–W7)
 
 ```bash
 uv run podedit render out.session.json -o out.wav
 # Verifies source SHA-256 by default. Use --source-override PATH if the file
 # has moved; --no-check-checksum to render anyway.
+# Output format is inferred from the extension: .wav / .mp3 / .flac.
 ```
 
 The render command is what the UI's autosaved session feeds into, so anything
-you edit in the browser can be replayed deterministically from the CLI.
+you edit in the browser can be replayed deterministically from the CLI. The
+renderer:
+- decodes PCM and produces sample-precise splices (no atrim drift, W5)
+- detects seams that would otherwise click and applies a variable-length
+  equal-power crossfade (zero-cross snap, click detection, W6)
+- two-pass loudnorm to -16 LUFS / -1 dBTP true peak (EBU R128, W7)
+- handles both delete and move ops via `compile_timeline` (W7.5)
 
-### Edit in the browser (W3 + W4)
+### Edit in the browser (W3–W8)
 
 ```bash
 uv run podedit serve \
@@ -106,14 +157,20 @@ Then open `http://127.0.0.1:8765` (or the Codespaces forwarded URL).
 
 **Controls**:
 - Click a word → seek and play from there.
-- Drag across words → select a range.
-- Shift+click → extend an existing selection.
+- Drag across words → select a range. <kbd>Shift</kbd>+click → extend.
 - <kbd>D</kbd> / <kbd>Delete</kbd> / <kbd>Backspace</kbd> → delete the selection.
+- <kbd>⌘X</kbd> → cut selection to clipboard; <kbd>⌘V</kbd> → paste after the
+  marked anchor word. (You can also **drag a selected range** onto another
+  word to move it.)
 - <kbd>⌘Z</kbd> / <kbd>Ctrl+Z</kbd> → undo; add <kbd>Shift</kbd> for redo.
 - <kbd>Space</kbd> → play/pause. <kbd>Esc</kbd> → clear selection.
+- <kbd>O</kbd> → Open dialog (switch episodes, transcribe new ones).
+- <kbd>E</kbd> → Export the current edit as wav or mp3 (format selector in toolbar).
+- **Audition** button → render a sample-precise preview of the current edit.
 
 The duration and current-time shown above the transcript reflect the **edited**
 timeline. Delete the first 5 seconds and `0:00` becomes the first kept word.
+Move a range to a new position and the transcript visually reflows.
 
 ## How the audio actually plays past cuts
 
@@ -132,29 +189,60 @@ sits at the tail of the file (otherwise the browser can't seek reliably).
 ```
 src/podedit/
 ├── audio.py            # ffmpeg I/O + 16kHz mono resample + duration probe
-├── asr.py              # faster-whisper wrapper: word timestamps, VAD, device resolution
+├── asr.py              # faster-whisper wrapper: word timestamps, VAD, device, fast knobs
 ├── schema.py           # Transcript / Segment / Word; timestamps anchored to ORIGINAL audio
-├── edit.py             # EditSession + DeleteOp + keep_ranges_from_deletes + sha256 helper
-├── render.py           # ffmpeg atrim+concat renderer (W2; W5 swaps in PCM)
+├── edit.py             # EditSession + DeleteOp + MoveOp + compile_timeline + sha256 helper
+├── render.py           # PCM render via ffmpeg pipeline; seam-aware crossfades; loudnorm
+├── library.py          # scan_library — list audio + transcript/session status for UI picker
 ├── bench.py            # wall time + peak RSS context manager, JSONL append
+├── seam_eval.py        # offline eval harness for crossfade variants
 ├── server/
-│   ├── app.py          # FastAPI app: /api/{transcript,audio,session,kpi/event}, validation
+│   ├── app.py          # FastAPI app: /api/{transcript,audio,session,kpi,library,waveform,…}
+│   ├── jobs.py         # TranscriptionJobManager — background ASR for the in-UI button
 │   └── static/         # index.html + style.css + app.js (vanilla; React deferred)
-└── cli.py              # `podedit` entry point: transcribe / cut / render / serve
+└── cli.py              # `podedit` entry point: transcribe / cut / render / serve / eval
 
-tests/test_edit.py      # 17 tests: keep_ranges_from_deletes + EditSession round-trip
+tests/                  # 57 tests: edit / render / timeline / seam_eval / waveform
 ```
 
-## Roadmap (MVP, 8-9 weeks)
+### Server endpoints
+
+| Method | Path | What |
+|---|---|---|
+| `GET` | `/api/transcript` | Current transcript JSON |
+| `GET` | `/api/audio/info` | Audio metadata + cache-busting URL for `/api/audio` |
+| `GET` | `/api/audio` | Raw audio stream (range-supported) |
+| `GET` | `/api/session` | Current EditSession |
+| `PUT` | `/api/session` | Save EditSession (validates shape, atomic write) |
+| `POST` | `/api/preview/render` | Render audition wav, cached by ops-hash, per-key locked |
+| `GET` | `/api/preview-audio/{cache_key}` | Stream the rendered preview wav (inline) |
+| `GET` | `/api/export/{cache_key}?fmt={wav,mp3}` | Download attachment; mp3 lazy transcode |
+| `GET` | `/api/waveform?points=N` | Pre-decoded envelope, cached on disk |
+| `GET` | `/api/library` | Library entries + active file |
+| `POST` | `/api/library/select` | Switch active (audio, transcript, session) triple |
+| `POST` | `/api/library/transcribe` | Kick off an ASR job, returns job snapshot |
+| `GET` | `/api/library/transcribe/status` | Poll current/last job state |
+| `POST` | `/api/kpi/event` | Client KPI append (keepalive-safe) |
+
+All static assets are served with `Cache-Control: no-store`, and the endpoints that
+benefit most from freshness (library, transcribe status, audio file) explicitly opt
+in too — so a hard refresh reliably pulls the latest UI bundle, important on
+Codespaces-forwarded ports where edge caches can sit between you and the dev server.
+
+## Roadmap
 
 - **W1 ✅** Foundation — ASR PoC + bench harness
 - **W2 ✅** Edit minimum — `EditSession`, ffmpeg renderer, `cut`/`render` CLI
 - **W3 ✅** Local web UI — FastAPI + plain HTML/JS, click-to-seek
 - **W4 ✅** Delete ops + preview-skip + Undo/Redo + autosave + KPI + virtual timeline
-- **W5** PCM render + fixed crossfade + wav export + server-side preview render
-- **W6** Variable crossfade + zero-cross + de-click + cut evaluation set
-- **W7** mp3 export + LUFS/true peak + waveform cache + stabilization
-- **W8** Real-episode KPI run + friction fixes + reproducibility docs
+- **W5 ✅** PCM render via ffmpeg pipeline + fixed 10ms crossfade + server-side audition
+- **W6 ✅** Variable crossfade + zero-cross snap + click detection + cut evaluation set
+- **W7 ✅** mp3/flac export + two-pass LUFS/true peak + waveform cache + stabilization
+- **W7.5 ✅** Move ops — drag-to-move, transcript DOM reorder, selection clamping
+- **W7.6 ✅** In-app file picker — switch episodes without restarting the server
+- **W7.7 ✅** In-UI Transcribe button — background ASR jobs with live progress
+- **W7.8 ✅** ASR speed — beam=1 greedy + WhisperModel cache, 1.65x faster on CPU
+- **W8 ✅** MVP completion — in-UI Export (wav/mp3), reproducibility docs, friction polish
 
 Differentiating bet: **Japanese conversation quality** (aizuchi vs filler distinction,
 prosody-aware cuts). Voice cloning is staged for v1.0.
@@ -163,14 +251,25 @@ prosody-aware cuts). Voice cloning is staged for v1.0.
 
 | Commit | Week | What |
 |---|---|---|
+| _pending_ | W7.7-7.8+W8 | In-UI Transcribe button, ASR fast mode, in-UI Export (wav/mp3), README refresh |
+| 32e48c6 | W7.6 | Fix: "Loading library…" stuck — defense against silent fetch failures |
+| cb384af | W7.6 | Follow-up: address Codex review on the file-picker refactor |
+| 5a5fa23 | W7.6 | In-app file picker — switch audio without restarting the server |
+| c5b4701 | W7.5+ | Drag-to-move follow-up: address Codex review on the DOM-reorder fix |
+| 1756b6b | W7.5+ | Drag-to-move: rebuild transcript DOM in edited order so moves are visible |
+| be38ed3 | W7.5+ | Drag-to-move follow-up: keep drop-caret above the larger ghost |
+| b7a2775 | W7.5+ | Drag-to-move: clone the actual selected text into the ghost |
+| 3003f0e | W7.5+ | Drag-to-move — grab the selected text and drop it elsewhere |
+| a6966d8 | W7.5 | Move ops — drag a range and paste it elsewhere |
+| 04a3983 | W7 | Follow-up: address Codex review |
+| 9af80ec | W7 | mp3/flac export, two-pass loudnorm, waveform cache, stabilization |
+| d5a75e6 | W6 | Follow-up: address Codex review (detect_clicks signed-diff + 3 polish) |
+| 77b7677 | W6 | Seam analysis — zero-cross snap + content-aware variable crossfade |
+| 9387e73 | W5 | Follow-up: address Codex review feedback |
+| 11e3d97 | W5 | PCM render via ffmpeg + server-side preview audition |
+| 383b076 | W4 | Refresh README for W4 completion |
 | f8c4419 | W4 | Pause at edited end when the tail is deleted |
 | 6287425 | W4 | Virtual timeline — edited duration + scrubber + custom player |
-| 84ab5f3 | W4 | Improve drag-select sensitivity |
-| befc8e1 | W4 | Harden preview-skip — pause/seek/play + cache-bust + diagnostics |
-| f726c82 | W4 | Faststart-remux m4a so preview-skip seeks actually take effect |
-| 6ce910a | W4 | Make deletions unmissable + preview-skip indicator |
-| 94fd512 | W4 | Switch to drag-to-select; preserve click=seek |
-| 2ee6a05 | W4 | Hotfix: word click handler captured idx by reference |
 | 80910e3 | W4 | Preview-skip fix, server-side session validation, autosave race |
 | ee42649 | W4 | Select/delete/undo/redo, autosave, preview-skip, KPI scaffolding |
 | fa70b09 | W3 | Validate audio/transcript at serve, harden UI, optional SHA-256 |

@@ -24,3 +24,7 @@ benchmarks.jsonl
 .DS_Store
 .vscode/
 .idea/
+
+# Per-user Claude Code permission settings (shared .claude/settings.json,
+# if any, stays tracked — by convention .local is personal-only).
+.claude/settings.local.json

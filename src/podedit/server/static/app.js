@@ -25,6 +25,8 @@
   const $timeDuration = $('time-duration');
   const $scrubber = $('scrubber');
   const $btnAudition = $('btn-audition');
+  const $btnExport = $('btn-export');
+  const $exportFormat = $('export-format');
   const $btnOpen = $('btn-open');
   const $libraryModal = $('library-modal');
   const $libraryList = $('library-list');
@@ -59,17 +61,163 @@
   async function fetchJSONWithTimeout(url, init, timeoutMs) {
     if (typeof AbortController === 'undefined') return fetchJSON(url, init);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => {
+      console.log('[podedit] fetchJSONWithTimeout abort timeout fired', { url, timeoutMs });
+      controller.abort();
+    }, timeoutMs);
     try {
       const mergedInit = { ...(init || {}), signal: controller.signal };
+      console.log('[podedit] fetchJSONWithTimeout fetching', { url, timeoutMs });
       return await fetchJSON(url, mergedInit);
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        throw new Error(`${url} timed out after ${Math.round(timeoutMs / 1000)}s`);
+        const timeoutError = new Error(`${url} timed out after ${Math.round(timeoutMs / 1000)}s`);
+        timeoutError.name = 'AbortError';
+        throw timeoutError;
       }
       throw e;
     } finally {
       clearTimeout(timeout);
+      console.log('[podedit] fetchJSONWithTimeout finished/cleaned up', { url, timeoutMs });
+    }
+  }
+  const LIBRARY_DIAG_KEY = 'podedit.libraryDiagnostics';
+  function libraryErrorText(e) {
+    const name = e && e.name ? e.name : 'Error';
+    const message = e && e.message ? e.message : String(e);
+    const stack = e && e.stack ? String(e.stack).split('\n')[0] : 'no stack';
+    return `${name}: ${message} @ ${stack}`;
+  }
+  function summarizeError(e) {
+    return libraryErrorText(e);
+  }
+  function writeLibraryDiag(event, extra) {
+    try {
+      const prev = JSON.parse(localStorage.getItem(LIBRARY_DIAG_KEY) || '[]');
+      const items = Array.isArray(prev) ? prev : [];
+      items.push({
+        ts: new Date().toISOString(),
+        event,
+        href: window.location.href,
+        userAgent: navigator.userAgent,
+        ...extra,
+      });
+      localStorage.setItem(LIBRARY_DIAG_KEY, JSON.stringify(items.slice(-30)));
+    } catch (_) {
+      // Diagnostics must never break the user-visible modal path.
+    }
+  }
+  function setLibraryStatus(message, extra) {
+    const text = extra ? `${message}\n${extra}` : message;
+    $libraryStatus.textContent = text;
+    $libraryStatus.hidden = false;
+    writeLibraryDiag('status', { message: text });
+  }
+  function setLibraryError(e) {
+    const text = libraryErrorText(e);
+    $libraryStatus.hidden = false;
+    $libraryStatus.textContent = text;
+    writeLibraryDiag('error-status', { error: text });
+  }
+  function bodyPreview(text) {
+    return String(text || '').slice(0, 200)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/\r/g, '\\r')
+      .replace(/\n/g, '\\n')
+      .replace(/\t/g, '\\t');
+  }
+  async function fetchLibraryWithDiagnostics(seq) {
+    const url = '/api/library';
+    const startedAt = performance.now();
+    const active = () => libraryOpen && seq === libraryLoadSeq;
+    const setActiveLibraryStatus = (message, extra) => {
+      if (active()) setLibraryStatus(message, extra);
+      else writeLibraryDiag('stale-status-skipped', { seq, message, extra });
+    };
+    setActiveLibraryStatus('step 1: fetching /api/library (timeout 10s)…');
+    writeLibraryDiag('fetch-start', { seq, url });
+    console.log('[podedit] library step 1: fetching /api/library (timeout 10s)…', { seq, url });
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeout = controller
+      ? setTimeout(() => {
+          console.log('[podedit] library fetch abort timeout fired', { seq, url });
+          writeLibraryDiag('fetch-abort-timeout-fired', { seq, url, timeoutMs: 10000 });
+          controller.abort();
+        }, 10000)
+      : null;
+    try {
+      const init = {
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      };
+      if (controller) init.signal = controller.signal;
+      const r = await fetch(url, init);
+      const contentType = r.headers.get('content-type') || '(none)';
+      setActiveLibraryStatus(
+        `step 2: response status=${r.status} content-type=${contentType} size=reading...`,
+        `ok=${r.ok} redirected=${r.redirected} type=${r.type} url=${r.url}`,
+      );
+      const text = await r.text();
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      const size = text.length;
+      setActiveLibraryStatus(
+        `step 2: response status=${r.status} content-type=${contentType} size=${size}`,
+        `ok=${r.ok} redirected=${r.redirected} type=${r.type} elapsed=${elapsedMs}ms url=${r.url}`,
+      );
+      console.log('[podedit] library step 2: response', {
+        seq,
+        status: r.status,
+        ok: r.ok,
+        redirected: r.redirected,
+        type: r.type,
+        contentType,
+        size,
+        url: r.url,
+        elapsedMs,
+      });
+      writeLibraryDiag('fetch-response', {
+        seq,
+        status: r.status,
+        ok: r.ok,
+        redirected: r.redirected,
+        type: r.type,
+        contentType,
+        url: r.url,
+        elapsedMs,
+        size,
+      });
+      if (!/application\/json/i.test(contentType)) {
+        throw new Error(`Expected JSON but got content-type=${contentType}; body starts ${bodyPreview(text)}`);
+      }
+      setActiveLibraryStatus('step 3: parsing JSON…');
+      console.log('[podedit] library step 3: parsing JSON', { seq, size });
+      writeLibraryDiag('fetch-body', { seq, bodyBytes: text.length, preview: text.slice(0, 240) });
+      if (!r.ok) {
+        throw new Error(`${url} -> HTTP ${r.status}: body starts ${bodyPreview(text)}`);
+      }
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        const parseError = new Error(
+          `JSON parse failed: ${e.message}; content-type=${contentType}; body starts ${bodyPreview(text)}`,
+        );
+        parseError.name = e && e.name ? e.name : 'SyntaxError';
+        throw parseError;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        const abortError = new Error(`${url} aborted by 10s timeout`);
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+      throw e;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      console.log('[podedit] library fetch finished/cleaned up', { seq, url });
     }
   }
   function logKPI(type, extra) {
@@ -1061,6 +1209,16 @@
       logKPI('ui.session.save_error', { error: e.message });
     }
   }
+  // Force any pending autosave debounce to fire NOW and await it. Used before
+  // Audition / Export so the server's /api/preview/render snapshots the
+  // latest ops, not a 300ms-stale view that's still sitting in the timer.
+  // Safe to call when nothing is dirty — it returns immediately.
+  async function flushSave() {
+    if (!state.saveDirty && !state.saveTimer) return;
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    await doSave();
+  }
 
   // ------- preview-skip + highlight -------
   let activeIdx = -1;
@@ -1280,6 +1438,9 @@
     $btnAudition.disabled = true;
     const t0 = performance.now();
     try {
+      // Flush any pending autosave so the server's /api/preview/render
+      // snapshots the latest ops, not a 300ms-debounce-stale view.
+      await flushSave();
       const r = await fetch('/api/preview/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1315,6 +1476,108 @@
   }
 
   $btnAudition.addEventListener('click', renderAndAudition);
+
+  // ------- export (W8) -------
+  // Streams the same audio the audition player would receive, but framed as
+  // an attachment download — server adds Content-Disposition + a friendly
+  // filename, and (for mp3) transcodes the cached wav via libmp3lame V2.
+  //
+  // We always trigger a fresh render before downloading so the bytes match
+  // the current state.ops. If a render is already current (state.previewCacheKey
+  // matches the current ops_hash via cache_key reuse on the server), the
+  // server short-circuits with `cached: true` and we pay just the round trip.
+  async function exportEditedAudio() {
+    if (state.editedDuration <= 0) {
+      setModePill('error', 'empty');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 1500);
+      return;
+    }
+    const fmt = $exportFormat.value === 'wav' ? 'wav' : 'mp3';
+    const mySeq = ++state.renderSeq;
+    const prevLabel = $btnExport.textContent;
+    $btnExport.disabled = true;
+    $btnExport.textContent = fmt === 'mp3' ? 'rendering + mp3…' : 'rendering…';
+    const t0 = performance.now();
+    try {
+      // Flush any pending autosave so the server's /api/preview/render
+      // snapshots the latest ops, not a 300ms-debounce-stale view. Without
+      // this, "edit → press Export immediately" downloads the previous state.
+      await flushSave();
+      // Always re-render: cheap if cached on the server; safe if we're stale.
+      const r = await fetch('/api/preview/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) throw new Error(`render HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      const reply = await r.json();
+      // If the user edited mid-export, the cache_key would still be valid
+      // (it hashes ops) but we'd be downloading a stale render. Bail.
+      if (mySeq !== state.renderSeq) {
+        logKPI('ui.export.discarded_stale', { my_seq: mySeq, current_seq: state.renderSeq });
+        return;
+      }
+      const cacheKey = reply.cache_key;
+      $btnExport.textContent = fmt === 'mp3' ? 'transcoding…' : 'downloading…';
+      const url = `/api/export/${encodeURIComponent(cacheKey)}?fmt=${encodeURIComponent(fmt)}`;
+      // HEAD precheck so a transcode failure (e.g. ffmpeg timeout, 500) is
+      // surfaced to the user before we kick off the browser's download flow.
+      // Without this, an anchor click on a 500 would just show the browser's
+      // generic error page and leave the toolbar quietly re-enabled.
+      const head = await fetch(url, { method: 'HEAD' });
+      if (!head.ok) {
+        // Try to extract a server-side detail from a follow-up GET body
+        // (HEAD doesn't include the JSON detail). Best-effort only.
+        let detail = `HTTP ${head.status}`;
+        try {
+          const probe = await fetch(url);
+          const txt = await probe.text();
+          detail = `${head.status}: ${txt.slice(0, 200)}`;
+        } catch (_) { /* ignore — surface the HEAD status */ }
+        throw new Error(`export ${detail}`);
+      }
+      // Navigate via a hidden anchor so the browser's download manager
+      // handles the file save. fetch() would buffer the whole blob.
+      const a = document.createElement('a');
+      a.href = url;
+      a.rel = 'noopener';
+      // download attribute hints filename but server's Content-Disposition wins.
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      logKPI('ui.export.requested', {
+        fmt,
+        cache_key: cacheKey,
+        latency_ms: performance.now() - t0,
+        render_cached: reply.cached,
+      });
+    } catch (e) {
+      if (mySeq !== state.renderSeq) return;
+      setModePill('error', 'export error');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 2500);
+      logKPI('ui.export.error', { error: e.message });
+    } finally {
+      $btnExport.disabled = false;
+      $btnExport.textContent = prevLabel;
+    }
+  }
+  $btnExport.addEventListener('click', exportEditedAudio);
+
+  // Persist the export format choice across sessions — small but the modal
+  // selector is the only stateful input in the toolbar, so saving it costs us
+  // nothing and matches "the UI remembers your settings" expectations.
+  const EXPORT_FMT_KEY = 'podedit.exportFormat';
+  try {
+    const saved = localStorage.getItem(EXPORT_FMT_KEY);
+    if (saved === 'mp3' || saved === 'wav') $exportFormat.value = saved;
+  } catch (_) { /* localStorage disabled or full — fall through to default */ }
+  $exportFormat.addEventListener('change', () => {
+    try { localStorage.setItem(EXPORT_FMT_KEY, $exportFormat.value); }
+    catch (_) { /* non-fatal */ }
+  });
 
   // ------- waveform (W7) -------
   // Render the envelope above the scrubber. Playhead + delete-range shading
@@ -1493,6 +1756,17 @@
       showLibraryModal();
       return;
     }
+    if (e.key === 'e' || e.key === 'E') {
+      // Plain 'e' exports the current edit. Skip if focus is on a form input
+      // (currently the export-format <select> or future inputs) so the user
+      // can still type/keystroke-navigate within them.
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (mod) return;  // don't grab Ctrl+E / Cmd+E
+      e.preventDefault();
+      exportEditedAudio();
+      return;
+    }
     if (e.key === ' ' || e.code === 'Space') {
       // Toggle playback; don't swallow Space when a real form input is focused
       // (currently only the scrubber range, where Space has no useful default).
@@ -1527,32 +1801,116 @@
   let libraryReturnFocus = null;
   let libraryLoadSeq = 0;
   function showLibraryModal() {
-    if (libraryOpen) return;
-    libraryOpen = true;
-    const seq = ++libraryLoadSeq;
-    libraryReturnFocus = document.activeElement;
-    $libraryModal.hidden = false;
-    $libraryList.innerHTML = '';
-    $libraryStatus.textContent = 'Loading library…';
-    $libraryStatus.hidden = false;
-    // Move keyboard focus into the dialog so Esc works without an extra click.
-    $btnLibraryClose.focus();
-    fetchJSONWithTimeout('/api/library', { cache: 'no-store' }, 10000)
-      .then((data) => {
+    try {
+      if (libraryOpen) return;
+      libraryOpen = true;
+      const seq = ++libraryLoadSeq;
+      const startedAt = performance.now();
+      libraryReturnFocus = document.activeElement;
+      $libraryModal.hidden = false;
+      $libraryList.innerHTML = '';
+      $libraryDirHint.textContent = 'checking...';
+      setLibraryStatus('step 0: modal opened', `seq=${seq}`);
+      writeLibraryDiag('modal-open', { seq });
+      console.log('[podedit] library modal opened', { seq });
+      // Move keyboard focus into the dialog so Esc works without an extra click.
+      $btnLibraryClose.focus();
+      const heartbeat = setInterval(() => {
+        if (!libraryOpen || seq !== libraryLoadSeq) {
+          clearInterval(heartbeat);
+          return;
+        }
+        const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
+        setLibraryStatus('step 1: fetching /api/library (timeout 10s)…', `elapsed=${elapsedSec}s seq=${seq}`);
+      }, 1000);
+      const watchdog = setTimeout(() => {
         if (!libraryOpen || seq !== libraryLoadSeq) return;
-        populateLibrary(data);
-      })
-      .catch((e) => {
-        if (!libraryOpen || seq !== libraryLoadSeq) return;
-        $libraryStatus.textContent = `Failed to load library: ${e.message}`;
-        $libraryStatus.hidden = false;
-      });
+        setLibraryStatus(
+          'diagnostic timeout: library fetch has not completed',
+          'Fetch is still pending after 11s. Check localStorage["podedit.libraryDiagnostics"] for the last recorded step.',
+        );
+        writeLibraryDiag('watchdog-timeout', { seq });
+      }, 11000);
+      (async () => {
+        try {
+          const data = await fetchLibraryWithDiagnostics(seq);
+          if (!libraryOpen || seq !== libraryLoadSeq) {
+            writeLibraryDiag('stale-response-ignored', { seq, currentSeq: libraryLoadSeq });
+            return;
+          }
+          // Cache so the polling code can re-render with fresh progress
+          // labels without re-fetching the library every 2 seconds.
+          lastTranscribedLibrary = data;
+          const entries = Array.isArray(data && data.entries) ? data.entries : [];
+          const libraryDir = data && data.library_dir ? data.library_dir : '—';
+          setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `library_dir=${libraryDir}`);
+          console.log('[podedit] library step 4: rendering entries', { seq, entries: entries.length, libraryDir });
+          // If a transcription is already running (kicked off in a previous
+          // modal-open or before a page reload), pick up its state before we
+          // render so the running row shows the live progress label.
+          try {
+            const sr = await fetch('/api/library/transcribe/status', { cache: 'no-store' });
+            if (sr.ok) {
+              const sdata = await sr.json();
+              transcribeJob = sdata.job || null;
+              // queued and running both represent an in-flight job — the
+              // queued window is short but real, so reattach polling for both.
+              if (transcribeJob && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')) {
+                schedulePoll();
+              }
+            }
+          } catch (_) {
+            // Status poll is best-effort — the main library list still renders.
+          }
+          populateLibrary(data);
+          setLibraryStatus('Library loaded.', `entries=${entries.length} library_dir=${libraryDir}`);
+          writeLibraryDiag('render-complete', { seq, entries: entries.length, libraryDir });
+        } catch (e) {
+          if (!libraryOpen || seq !== libraryLoadSeq) {
+            writeLibraryDiag('stale-error-ignored', { seq, error: summarizeError(e) });
+            return;
+          }
+          const summary = summarizeError(e);
+          setLibraryError(e);
+          console.log('[podedit] library load failed', { seq, error: summary, raw: e });
+          writeLibraryDiag('error', { seq, error: summary });
+        } finally {
+          clearInterval(heartbeat);
+          clearTimeout(watchdog);
+        }
+      })();
+    } catch (e) {
+      const summary = summarizeError(e);
+      try {
+        setLibraryError(e);
+      } catch (_) {
+        // If even status rendering failed, localStorage is the last fallback.
+      }
+      console.log('[podedit] library modal sync failure', { error: summary, raw: e });
+      writeLibraryDiag('sync-error', { error: summary });
+    }
   }
+  window.addEventListener('error', (ev) => {
+    if (!libraryOpen) return;
+    const error = ev.error || new Error(ev.message || 'Unhandled window error');
+    setLibraryError(error);
+    console.log('[podedit] library visible window error', { error: summarizeError(error), raw: error });
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    if (!libraryOpen) return;
+    const reason = ev.reason || new Error('Unhandled promise rejection');
+    setLibraryError(reason);
+    console.log('[podedit] library visible unhandled rejection', { error: summarizeError(reason), raw: reason });
+  });
   function hideLibraryModal() {
     if (!libraryOpen) return;
     libraryOpen = false;
     libraryLoadSeq += 1;
     $libraryModal.hidden = true;
+    // No UI to update once the modal is closed — stop the polling tick so we
+    // don't burn battery. The worker thread keeps transcribing regardless;
+    // we'll re-attach to its state on the next modal open.
+    stopPoll();
     // Restore focus to whatever element triggered the open, so screen readers
     // and keyboard users don't lose their place.
     if (libraryReturnFocus && typeof libraryReturnFocus.focus === 'function') {
@@ -1564,21 +1922,34 @@
     const entries = Array.isArray(data && data.entries) ? data.entries : [];
     const libraryDir = data && data.library_dir ? data.library_dir : '—';
     const active = data && data.active ? data.active : '';
+    setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `library_dir=${libraryDir}`);
+    console.log('[podedit] populateLibrary start', { entries: entries.length, libraryDir, active });
     $libraryDirHint.textContent = libraryDir;
     $libraryList.innerHTML = '';
     if (!entries.length) {
       $libraryStatus.textContent = `No audio files found in ${libraryDir}.`;
       $libraryStatus.hidden = false;
+      console.log('[podedit] populateLibrary empty', { libraryDir });
       return;
     }
     $libraryStatus.hidden = true;
+    // Treat both 'queued' (transient) and 'running' as in-flight so the
+    // entry's row shows the progress label rather than a Transcribe button.
+    const runningName = transcribeJob
+      && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')
+      ? transcribeJob.name : null;
     for (const e of entries) {
       const li = document.createElement('li');
       const isActive = e.name === active;
-      const selectable = e.has_transcript && !isActive;
+      const isTranscribing = e.name === runningName;
+      // While a transcription is in progress for this entry we render a
+      // dedicated "transcribing…" row rather than the normal selectable /
+      // Transcribe button — we don't want the user clicking Transcribe twice.
+      const selectable = e.has_transcript && !isActive && !isTranscribing;
       li.className = [
         selectable ? 'selectable' : 'disabled',
         isActive ? 'active' : '',
+        isTranscribing ? 'transcribing' : '',
       ].filter(Boolean).join(' ');
       const name = document.createElement('span');
       name.className = 'library-name';
@@ -1595,10 +1966,158 @@
       const activeBadge = isActive ? '<span class="badge ok">active</span>' : '';
       meta.innerHTML = `${dur}${tBadge}${sBadge}${activeBadge}`;
       li.append(name, meta);
+      // Per-entry action button area: Transcribe for entries without a
+      // transcript, a live progress label for the entry being transcribed.
+      if (isTranscribing) {
+        const progress = document.createElement('span');
+        progress.className = 'library-progress';
+        progress.dataset.role = 'progress';
+        progress.textContent = formatTranscribeProgress(transcribeJob);
+        li.append(progress);
+      } else if (!e.has_transcript) {
+        const btn = document.createElement('button');
+        btn.className = 'library-action library-transcribe-btn';
+        btn.type = 'button';
+        btn.textContent = 'Transcribe';
+        // Stop click from bubbling to the row's selectable handler (which
+        // we wouldn't have attached here anyway, but it's cheap insurance
+        // against future regressions).
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          startTranscribe(e.name);
+        });
+        // If any other job is already running, disable so the user can't
+        // queue a second one. The 409 from the server would catch this
+        // too, but it's nicer UX to grey out preemptively.
+        if (transcribeJob && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')) {
+          btn.disabled = true;
+          btn.title = 'Another transcription is in progress';
+        }
+        li.append(btn);
+      }
       if (selectable) {
         li.addEventListener('click', () => selectLibraryEntry(e.name));
       }
       $libraryList.appendChild(li);
+    }
+  }
+  // ----- transcribe-from-modal (W7.7) -----
+  // Stores the most-recent /api/library/transcribe/status job so populateLibrary
+  // can render the running row distinctly. null = no job seen this session.
+  let transcribeJob = null;
+  let transcribePollTimer = null;
+  let transcribePollInFlight = false;  // setInterval can overlap if a tick is slower than the 2s period — guard it
+  let lastTranscribedLibrary = null;  // cached library payload so we can re-render with new progress
+  function formatTranscribeProgress(job) {
+    if (!job) return 'transcribing…';
+    const covered = job.progress_audio_sec || 0;
+    const total = job.duration_sec || 0;
+    const coveredStr = `${covered.toFixed(0)}s`;
+    const totalStr = total ? ` / ${Math.round(total)}s` : '';
+    const elapsed = job.elapsed_sec || 0;
+    const mm = Math.floor(elapsed / 60);
+    const ss = Math.floor(elapsed % 60).toString().padStart(2, '0');
+    const rtf = job.rtf ? ` · ${job.rtf.toFixed(1)}x RTF` : '';
+    const model = job.model ? ` · ${job.model}` : '';
+    return `transcribing… ${coveredStr}${totalStr} covered · elapsed ${mm}:${ss}${rtf}${model}`;
+  }
+  async function startTranscribe(name) {
+    try {
+      const r = await fetch('/api/library/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      }
+      transcribeJob = await r.json();
+      logKPI('ui.library.transcribe.started', { name, model: transcribeJob.model });
+      // Re-render with the new running state, then start polling.
+      if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
+      schedulePoll();
+    } catch (e) {
+      setLibraryStatus(`Could not start transcribe: ${e.message}`);
+    }
+  }
+  function schedulePoll() {
+    if (transcribePollTimer) return;
+    transcribePollTimer = setInterval(pollTranscribeStatus, 2000);
+    // Also fire one immediately so the UI doesn't show stale progress
+    // for two whole seconds after kickoff.
+    pollTranscribeStatus();
+  }
+  function stopPoll() {
+    if (!transcribePollTimer) return;
+    clearInterval(transcribePollTimer);
+    transcribePollTimer = null;
+  }
+  async function pollTranscribeStatus() {
+    // setInterval can re-fire while a previous tick's fetch is still in
+    // flight (slow network / paused tab). Without a guard, two concurrent
+    // ticks observing the same `done` status would each re-fetch the library
+    // and double-log KPI/finished events. Skip overlapping ticks.
+    if (transcribePollInFlight) return;
+    transcribePollInFlight = true;
+    try {
+      const r = await fetch('/api/library/transcribe/status', { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      transcribeJob = data.job || null;
+      // Update the inline progress label on the running entry without a
+      // full re-render — cheaper, and avoids losing scroll/focus state.
+      const progressEl = $libraryList.querySelector('li.transcribing [data-role="progress"]');
+      if (progressEl && transcribeJob) {
+        progressEl.textContent = formatTranscribeProgress(transcribeJob);
+      }
+      if (!transcribeJob || transcribeJob.status === 'done' || transcribeJob.status === 'error') {
+        stopPoll();
+        if (transcribeJob && transcribeJob.status === 'done') {
+          logKPI('ui.library.transcribe.finished', {
+            name: transcribeJob.name,
+            elapsed_sec: transcribeJob.elapsed_sec,
+            rtf: transcribeJob.rtf,
+          });
+          // Re-fetch the library so the just-transcribed entry flips to
+          // has_transcript:true and becomes selectable.
+          if (libraryOpen) {
+            const seq = ++libraryLoadSeq;
+            try {
+              const refreshed = await fetchLibraryWithDiagnostics(seq);
+              // The user could have closed the modal during the refresh
+              // await; if so, drop the result so we don't repopulate a
+              // hidden modal with stale state.
+              if (!libraryOpen || seq !== libraryLoadSeq) return;
+              lastTranscribedLibrary = refreshed;
+              populateLibrary(refreshed);
+              setLibraryStatus(
+                `Transcribed ${transcribeJob.name}.`,
+                `${transcribeJob.segments} segments in ${transcribeJob.elapsed_sec.toFixed(0)}s`,
+              );
+            } catch (err) {
+              if (libraryOpen) setLibraryError(err);
+            }
+          }
+        } else if (transcribeJob && transcribeJob.status === 'error') {
+          setLibraryStatus(
+            `Transcribe failed: ${transcribeJob.name}`,
+            transcribeJob.error || 'no error detail',
+          );
+          logKPI('ui.library.transcribe.failed', {
+            name: transcribeJob.name,
+            error: transcribeJob.error,
+          });
+          // Re-render so the Transcribe button comes back enabled.
+          if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
+        }
+      }
+    } catch (e) {
+      console.log('[podedit] transcribe status poll failed', { error: String(e) });
+      // Don't kill the poll on a single transient error — the worker still
+      // owns the actual job. We'll try again on the next tick.
+    } finally {
+      transcribePollInFlight = false;
     }
   }
   async function selectLibraryEntry(name) {

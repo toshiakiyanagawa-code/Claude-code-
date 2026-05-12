@@ -35,6 +35,16 @@ class ModelConfig:
     compute_type: str
     beam_size: int
     vad_filter: bool
+    # New in W7.8: provenance for the speed knobs. ``temperature`` is the
+    # *effective* value(s) passed to faster-whisper — a single float means no
+    # fallback ladder was used; a tuple records the ladder steps. We store as
+    # tuple[float,...] in dataclasses but JSON-encoders flatten to a list,
+    # which is fine for read-back. ``condition_on_previous_text`` is just the
+    # bool that was active. Old transcripts pre-W7.8 deserialize via the
+    # JSON-as-raw-dict path in the server, never through this dataclass, so
+    # missing fields aren't a runtime hazard.
+    temperature: tuple[float, ...] | float = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    condition_on_previous_text: bool = True
 
 
 @dataclass(slots=True)

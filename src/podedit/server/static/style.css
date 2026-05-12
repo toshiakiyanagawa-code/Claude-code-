@@ -80,6 +80,12 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 12px;
   font-family: inherit;
 }
+.toolbar select {
+  background: #232735; color: var(--text); border: 1px solid var(--border);
+  padding: 4px 6px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  font-family: inherit;
+}
+.toolbar select:hover { border-color: var(--accent); }
 .toolbar button:hover:not(:disabled) { background: #2b303f; }
 .toolbar button:disabled { opacity: 0.35; cursor: not-allowed; }
 .toolbar .spacer { flex: 1; }
@@ -102,6 +108,10 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   display: flex; align-items: center; justify-content: center;
   padding: 20px;
 }
+/* `display: flex` above wins over the HTML `hidden` attribute's UA-default
+   `display: none`, so we must re-assert hidden explicitly. Without this the
+   modal is visible on first paint, occluding the toolbar's Open button. */
+.modal-backdrop[hidden] { display: none; }
 .modal {
   background: var(--panel); color: var(--text);
   border: 1px solid var(--border); border-radius: 8px;
@@ -142,6 +152,27 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 .library-hint code {
   background: #1a1d28; padding: 1px 4px; border-radius: 3px;
   font-family: ui-monospace, monospace;
+}
+/* W7.7: Transcribe action button on entries without a transcript. */
+.library-action {
+  margin-left: 10px;
+  background: #232735; color: var(--text); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  font-family: inherit;
+}
+.library-action:hover:not(:disabled) { background: #2b303f; border-color: var(--accent); }
+.library-action:disabled { opacity: 0.4; cursor: not-allowed; }
+.library-list li.transcribing {
+  background: rgba(247, 196, 106, 0.07);
+  border-color: rgba(247, 196, 106, 0.35);
+  cursor: default;
+}
+.library-progress {
+  margin-left: 10px;
+  font-size: 11px;
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 main {

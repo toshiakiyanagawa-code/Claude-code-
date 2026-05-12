@@ -24,6 +24,16 @@ class ASRConfig:
     compute_type: str = "auto"  # auto -> int8 on cpu, float16 on cuda
     beam_size: int = 5
     vad_filter: bool = True
+    # Decoding options. faster-whisper's `temperature` accepts either a scalar
+    # (no fallback) or a sequence (try each on bad segments — high compression
+    # ratio, low avg logprob, or no_speech failures). We default to the full
+    # ladder for safety; the in-UI worker can override to a shorter ladder for
+    # extra speed at controlled risk. ``condition_on_previous_text=True`` is
+    # also the faster-whisper default — the CLI keeps it. The in-UI worker
+    # explicitly flips it off, because for podcast Japanese with VAD on it
+    # tends to reduce cross-segment repetition more than it helps quality.
+    temperature: tuple[float, ...] | float = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    condition_on_previous_text: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,17 +60,27 @@ def transcribe(
     source_audio: AudioInfo,
     asr_audio_path: Path,
     cfg: ASRConfig,
+    *,
+    model_handle: "WhisperModel | None" = None,
 ) -> tuple[Transcript, Iterator[Segment]]:
     """Run ASR. Returns the Transcript shell and a generator yielding per-segment progress.
 
     The caller drives the generator; segments are appended to ``Transcript.segments``
     as they arrive (streaming, bounded memory for long episodes). Timestamps are
     anchored to ``source_audio`` (the original, not the 16k mono derived).
+
+    ``model_handle`` lets callers reuse a previously-instantiated WhisperModel
+    across multiple ``transcribe()`` calls — saves the 3-10s model-load cost
+    that would otherwise be paid once per job. The in-UI job manager uses
+    this; the CLI passes None and pays load every run.
     """
     from faster_whisper import WhisperModel
 
     resolved = resolve_device(cfg)
-    model = WhisperModel(cfg.model, device=resolved.device, compute_type=resolved.compute_type)
+    if model_handle is None:
+        model = WhisperModel(cfg.model, device=resolved.device, compute_type=resolved.compute_type)
+    else:
+        model = model_handle
 
     segments_iter, info = model.transcribe(
         str(asr_audio_path),
@@ -69,6 +89,9 @@ def transcribe(
         word_timestamps=True,
         vad_filter=cfg.vad_filter,
         vad_parameters={"min_silence_duration_ms": 500},
+        # Speed knobs — see ASRConfig docstring for the trade-offs.
+        temperature=cfg.temperature,
+        condition_on_previous_text=cfg.condition_on_previous_text,
     )
 
     # Probe the derived 16k mono once for the asr_audio AudioRef.
@@ -88,6 +111,8 @@ def transcribe(
             compute_type=resolved.compute_type,
             beam_size=cfg.beam_size,
             vad_filter=cfg.vad_filter,
+            temperature=cfg.temperature,
+            condition_on_previous_text=cfg.condition_on_previous_text,
         ),
         created_at=now_iso(),
     )

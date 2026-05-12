@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -23,6 +24,25 @@ from threading import Lock
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
+from starlette.types import Scope
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that disables browser caching.
+
+    Why: podedit is a local dev tool; users edit app.js / index.html and then
+    hard-refresh expecting to see the change. Default StaticFiles only sends
+    Last-Modified, which on Codespace forwarded ports plays badly with edge
+    caches and produces "stuck on old JS" symptoms (the W7.6 library modal
+    bug). For a localhost tool, always-fresh is the right tradeoff.
+    """
+    async def get_response(self, path: str, scope: Scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
 from ..audio import probe as audio_probe
 from ..edit import EditSession, compile_timeline, sha256_of_file
@@ -30,6 +50,7 @@ from ..library import scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
 from ..waveform import WaveformError, get_or_compute_waveform
+from .jobs import TranscriptionJobManager
 
 # Garbage collection knobs for the preview cache. Previews are ~340 MB / 30 min,
 # so a small file count keeps the workdir from blowing up on the user's host.
@@ -210,6 +231,32 @@ def _ensure_faststart(src: Path, dst: Path) -> Path:
     return dst
 
 
+def _pin_inode_via_hardlink(source: Path, *, dir: Path, prefix: str, suffix: str) -> Path:
+    """Create a transient hardlink to ``source`` in ``dir`` so the inode is
+    pinned for the duration of an outgoing stream / ffmpeg run.
+
+    Codex W8 follow-up: without this, a concurrent ``_gc_previews`` pass can
+    unlink the canonical cache file between our existence check and the actual
+    open (FileResponse opens after the route returns; ffmpeg opens after we
+    spawn it). Since hardlinks share the same inode on POSIX, the bytes
+    survive even when the canonical name is gone. Caller must unlink the
+    returned path (FileResponse via BackgroundTask, ffmpeg via try/finally).
+
+    A theoretical TOCTOU between the unlink-then-link exists: another mkstemp
+    could pick the same 8-random-char name in the microsecond gap. Probability
+    is effectively zero (62^8 namespace ≈ 2.18e14) and failure would be a
+    FileExistsError that surfaces as a clean OSError, not corruption.
+    """
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=str(dir))
+    os.close(fd)
+    # mkstemp leaves an empty file at the path; remove it so os.link can
+    # publish the hardlink at the same name. The tiny race window between
+    # unlink and link is acceptable (see docstring).
+    os.unlink(name)
+    os.link(str(source), name)
+    return Path(name)
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Atomic file replace: write to a sibling tempfile and rename.
 
@@ -232,6 +279,49 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def create_app(config: ServeConfig) -> FastAPI:
     state = ServeState(config)
     state.load_active(config.audio_path, config.transcript_path)
+    transcription_jobs = TranscriptionJobManager(work_dir=state.work_dir)
+    # Opportunistic startup cleanup of W8 transient hardlinks. BackgroundTask
+    # usually deletes these on response end, but if the process died mid-
+    # response or the client aborted, dotfile orphans accumulate. We only
+    # remove ones older than ``_STARTUP_CLEANUP_AGE_SEC`` so that if a second
+    # podedit process shares this work_dir (rare but possible), we don't yank
+    # the live transient links the other process has just created and is
+    # streaming through. (Codex W8 final review flagged this multi-process
+    # race.) A fresh orphan from a still-running sibling will be cleaned by
+    # the next process restart, by which point it's old enough.
+    _STARTUP_CLEANUP_AGE_SEC = 600  # 10 minutes — far longer than any realistic stream
+    now_ts = time.time()
+    for orphan in state.work_dir.glob(".*"):
+        # Match dotfile prefixes the hardlink helper uses, plus the mp3
+        # transcode tempfile pattern (`.<basename>.<rand>.inprogress.mp3`)
+        # so a crashed ffmpeg run leaves no residue.
+        matches_helper_prefix = any(
+            orphan.name.startswith(p) for p in (".export-", ".audition-", ".mp3src-")
+        )
+        if not (matches_helper_prefix or orphan.name.endswith(".inprogress.mp3")):
+            continue
+        try:
+            if now_ts - orphan.stat().st_mtime < _STARTUP_CLEANUP_AGE_SEC:
+                continue
+            orphan.unlink()
+        except OSError:
+            pass
+    # Per-cache-key render lock. Without it, two concurrent /api/preview/render
+    # calls for the same key (e.g. Export + Audition fired in parallel from
+    # multiple tabs) both miss `preview_path.exists()` and both run ffmpeg
+    # with -y against the same wav, corrupting the file while either side
+    # reads it. Codex flagged this in the W8 review. ``_render_locks_mu``
+    # protects the dict itself; the per-key Lock is the actual gate.
+    _render_locks: dict[str, Lock] = {}
+    _render_locks_mu = Lock()
+
+    def _lock_for(cache_key: str) -> Lock:
+        with _render_locks_mu:
+            lk = _render_locks.get(cache_key)
+            if lk is None:
+                lk = Lock()
+                _render_locks[cache_key] = lk
+            return lk
     # ``state.session_path`` and friends may differ from ``config.*`` after
     # load_active() because we always derive them from the work_dir + audio
     # stem now. The bootstrap config still pins down library_dir / work_dir.
@@ -374,9 +464,13 @@ def create_app(config: ServeConfig) -> FastAPI:
 
         # Cache key covers every parameter that can change the bytes on disk.
         # Including RENDERER_VERSION means a code change automatically
-        # invalidates previously-rendered previews.
+        # invalidates previously-rendered previews. Including ``source_name``
+        # disambiguates files with the same stem in the library (Codex W8
+        # review caught ``episode.wav`` and ``episode.mp3`` colliding on
+        # ``episode.preview.<key>.wav`` if their ops happened to match).
         cache_key_blob = json.dumps(
             {
+                "source_name": snap_audio_path.name,
                 "ops": ops_blob,
                 "crossfade_ms": crossfade_ms,
                 "lufs_target": lufs_target,
@@ -388,37 +482,44 @@ def create_app(config: ServeConfig) -> FastAPI:
         cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
         preview_path = snap_work_dir / f"{snap_audio_stem}.preview.{cache_key}.wav"
 
+        # Serialize concurrent renders of the same cache key. The second caller
+        # that arrives during a render will block here, then observe the file
+        # already exists and return cached=True. This prevents the wav-cache
+        # corruption Codex flagged in the W8 review.
         cached = preview_path.exists()
-        if not cached:
-            _gc_previews(snap_work_dir, snap_audio_stem, keep=preview_path)
-            t0 = time.time()
-            try:
-                segments = compile_timeline(source_duration, ops_for_render)
-                result = render_segments(
-                    snap_audio_path,
-                    segments=segments,
-                    output=preview_path,
-                    source_duration=source_duration,
-                    move_count=sum(1 for op in ops_for_render if op.op == "move"),
-                    crossfade_ms=crossfade_ms,
-                    lufs_target=lufs_target,
-                    true_peak_ceiling_dbtp=true_peak,
-                )
-            except RenderError as e:
-                raise HTTPException(status_code=500, detail=str(e)) from e
-            _append_jsonl(snap_kpi_log, {
-                "server_ts": time.time(), "type": "server.preview.rendered",
-                "cache_key": cache_key, "wall_sec": time.time() - t0,
-                "duration_in": result.duration_in, "duration_out": result.duration_out,
-                "n_keeps": len(result.keeps),
-                "segments_count": result.segments_count,
-                "move_count": result.move_count,
-                "crossfade_ms_requested": result.crossfade_ms_requested,
-                "crossfade_ms_applied": result.crossfade_ms,
-                "lufs_target": lufs_target, "lufs_out": result.lufs_out,
-                "true_peak_dbtp": result.true_peak_dbtp,
-                "renderer_version": result.renderer_version,
-            })
+        with _lock_for(cache_key):
+            # Re-check inside the lock — the first caller may have just finished.
+            cached = preview_path.exists()
+            if not cached:
+                _gc_previews(snap_work_dir, snap_audio_stem, keep=preview_path)
+                t0 = time.time()
+                try:
+                    segments = compile_timeline(source_duration, ops_for_render)
+                    result = render_segments(
+                        snap_audio_path,
+                        segments=segments,
+                        output=preview_path,
+                        source_duration=source_duration,
+                        move_count=sum(1 for op in ops_for_render if op.op == "move"),
+                        crossfade_ms=crossfade_ms,
+                        lufs_target=lufs_target,
+                        true_peak_ceiling_dbtp=true_peak,
+                    )
+                except RenderError as e:
+                    raise HTTPException(status_code=500, detail=str(e)) from e
+                _append_jsonl(snap_kpi_log, {
+                    "server_ts": time.time(), "type": "server.preview.rendered",
+                    "cache_key": cache_key, "wall_sec": time.time() - t0,
+                    "duration_in": result.duration_in, "duration_out": result.duration_out,
+                    "n_keeps": len(result.keeps),
+                    "segments_count": result.segments_count,
+                    "move_count": result.move_count,
+                    "crossfade_ms_requested": result.crossfade_ms_requested,
+                    "crossfade_ms_applied": result.crossfade_ms,
+                    "lufs_target": lufs_target, "lufs_out": result.lufs_out,
+                    "true_peak_dbtp": result.true_peak_dbtp,
+                    "renderer_version": result.renderer_version,
+                })
 
         st = preview_path.stat()
         tag = f"{int(st.st_mtime)}-{st.st_size}"
@@ -447,11 +548,212 @@ def create_app(config: ServeConfig) -> FastAPI:
     def preview_audio(cache_key: str) -> FileResponse:
         if not _CACHE_KEY_RE.match(cache_key):
             raise HTTPException(status_code=400, detail="invalid cache key")
-        p = state.work_dir / f"{state.audio_path.stem}.preview.{cache_key}.wav"
+        # Snapshot active state under the lock so a racing library/select
+        # can't swap stem/work_dir while we resolve the path.
+        with state.session_lock:
+            snap_work_dir = state.work_dir
+            snap_stem = state.audio_path.stem
+        p = snap_work_dir / f"{snap_stem}.preview.{cache_key}.wav"
         if not p.exists():
             raise HTTPException(status_code=404, detail="preview not rendered; POST /api/preview/render first")
-        return FileResponse(p, media_type="audio/wav", filename=p.name,
-                            headers={"Cache-Control": "no-store"})
+        # Same GC-race protection as /api/export: pin the inode via hardlink
+        # so a concurrent _gc_previews can't unlink before Starlette opens.
+        try:
+            link = _pin_inode_via_hardlink(
+                p, dir=snap_work_dir,
+                prefix=f".audition-{cache_key}-", suffix=".wav",
+            )
+        except OSError:
+            raise HTTPException(status_code=404, detail="preview disappeared")
+
+        def _cleanup(path: Path = link) -> None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+        return FileResponse(
+            link, media_type="audio/wav", filename=p.name,
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(_cleanup),
+        )
+
+    # ------- export (W8) -------
+    # Same bytes the audition player streams, but framed as a download. wav is
+    # served straight from the preview cache (already 2-pass loudnorm'd, true-
+    # peak-limited, sample-precise). mp3 is transcoded once via ffmpeg LAME and
+    # cached as ``<stem>.preview.<key>.mp3`` so re-downloads are free.
+    @app.get("/api/export/{cache_key}")
+    def export_audio(cache_key: str, fmt: str = "wav") -> FileResponse:
+        if not _CACHE_KEY_RE.match(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache key")
+        if fmt not in ("wav", "mp3"):
+            raise HTTPException(status_code=400, detail="fmt must be 'wav' or 'mp3'")
+        # Snapshot the active state under the session lock so a concurrent
+        # /api/library/select can't swap the audio stem / work_dir / kpi log
+        # mid-export. Codex flagged this in the W8 review.
+        with state.session_lock:
+            snap_work_dir = state.work_dir
+            snap_stem = state.audio_path.stem
+            snap_kpi_log = state.kpi_log_path
+        wav_path = snap_work_dir / f"{snap_stem}.preview.{cache_key}.wav"
+        if not wav_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="render not found; POST /api/preview/render first",
+            )
+
+        if fmt == "wav":
+            served_path = wav_path
+            media_type = "audio/wav"
+            download_name = f"{snap_stem}.edited.wav"
+        else:  # mp3
+            mp3_path = snap_work_dir / f"{snap_stem}.preview.{cache_key}.mp3"
+            if not mp3_path.exists():
+                if shutil.which("ffmpeg") is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="ffmpeg not found on PATH; cannot transcode to mp3",
+                    )
+                # libmp3lame V2 (~190 kbps VBR, good quality at ~14 MB / 30 min).
+                # Concurrency: two requests for the same cache_key could race
+                # on a shared ".inprogress" name and corrupt each other's mp3.
+                # We use a unique mkstemp() tmp per request, then publish via
+                # ``os.link`` (no-clobber atomic): if another concurrent request
+                # already produced the final mp3, link() fails and we just serve
+                # what's there. timeout=600s caps a wedged ffmpeg so a worker
+                # thread can't be held forever. The tmp filename starts with
+                # ``.`` so scan_library skips it even when work_dir==library_dir.
+                #
+                # We also hardlink-pin the *source* wav before ffmpeg opens it:
+                # a concurrent _gc_previews could otherwise unlink the wav
+                # between our existence check above and ffmpeg's open(). Codex
+                # flagged this in the W8 final review.
+                try:
+                    wav_pinned = _pin_inode_via_hardlink(
+                        wav_path, dir=snap_work_dir,
+                        prefix=f".mp3src-{cache_key}-", suffix=".wav",
+                    )
+                except OSError:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="render disappeared before mp3 transcode",
+                    )
+                fd, tmp_str = tempfile.mkstemp(
+                    prefix=f".{mp3_path.name}.",
+                    suffix=".inprogress.mp3",
+                    dir=str(mp3_path.parent),
+                )
+                os.close(fd)  # ffmpeg reopens the path itself
+                tmp = Path(tmp_str)
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-i", str(wav_pinned),
+                            "-codec:a", "libmp3lame", "-q:a", "2",
+                            # ffmpeg infers format from extension, but our tmp
+                            # ends in .inprogress.mp3 — force the muxer to be
+                            # explicit (and robust if mkstemp ever changes).
+                            "-f", "mp3",
+                            str(tmp),
+                        ],
+                        check=True, capture_output=True, text=True,
+                        timeout=600,
+                    )
+                    try:
+                        os.link(tmp, mp3_path)
+                    except FileExistsError:
+                        # Lost the race — that's fine, serve the winner's file.
+                        pass
+                except subprocess.TimeoutExpired as e:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"mp3 transcode timed out after {e.timeout}s",
+                    ) from e
+                except subprocess.CalledProcessError as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"mp3 transcode failed: {e.stderr.strip()[:240]}",
+                    ) from e
+                finally:
+                    # Always clean up the per-request tmp AND the wav pin.
+                    # On link success the tmp is redundant; on failure we
+                    # don't want orphans cluttering work_dir.
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    try:
+                        wav_pinned.unlink()
+                    except OSError:
+                        pass
+            served_path = mp3_path
+            media_type = "audio/mpeg"
+            download_name = f"{snap_stem}.edited.mp3"
+
+        # TOCTOU + GC race: even after we verified the file exists, a concurrent
+        # /api/preview/render's GC pass or a library/select-driven cleanup could
+        # remove the canonical preview path between this handler returning and
+        # Starlette's FileResponse opening it. Pin the inode via a transient
+        # hardlink so the bytes survive even if the canonical name is unlinked.
+        try:
+            link_path = _pin_inode_via_hardlink(
+                served_path, dir=snap_work_dir,
+                prefix=f".export-{cache_key}-", suffix=f".{fmt}",
+            )
+        except OSError:
+            raise HTTPException(
+                status_code=404,
+                detail="render disappeared during export",
+            )
+        try:
+            bytes_now = link_path.stat().st_size
+        except OSError:
+            try:
+                link_path.unlink()
+            except OSError:
+                pass
+            raise HTTPException(status_code=404, detail="render disappeared during export")
+
+        _append_jsonl(snap_kpi_log, {
+            "server_ts": time.time(), "type": "server.export.served",
+            "cache_key": cache_key, "fmt": fmt,
+            "bytes": bytes_now,
+            "filename": download_name,
+        })
+        # Content-Disposition: attachment + filename + filename* (RFC 5987).
+        # Japanese filenames break the bare ``filename="..."`` form because
+        # Starlette encodes headers as latin-1, so include both forms: an
+        # ASCII fallback for ancient parsers and a percent-encoded UTF-8 form
+        # that modern browsers prefer. Sanitization rules for the fallback:
+        #   - replace any char outside [A-Za-z0-9._-] with "_"
+        #   - if that collapses to empty / dot-only, use a generic stem
+        #   - HTTP-quoted-string specials (", \\) can never appear after the
+        #     character class above, so no extra escaping is needed.
+        utf8_q = urllib.parse.quote(download_name, safe="")
+        ascii_safe = re.sub(r"[^A-Za-z0-9._-]", "_", download_name)
+        if not ascii_safe.strip("._"):
+            ascii_safe = f"podedit-export.edited.{fmt}"
+
+        def _cleanup_link(path: Path = link_path) -> None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+        return FileResponse(
+            link_path,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_safe}"; '
+                    f"filename*=UTF-8''{utf8_q}"
+                ),
+            },
+            background=BackgroundTask(_cleanup_link),
+        )
 
     # ------- waveform (W7) -------
     # Pre-decoded envelope for the UI. Cached as JSON next to the session,
@@ -520,7 +822,80 @@ def create_app(config: ServeConfig) -> FastAPI:
             "session_path": str(state.session_path),
         }
 
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+    # ------- transcribe (W7.7) -------
+    # Lets the UI kick off `podedit transcribe` for any library audio that
+    # doesn't have a transcript yet. The actual ASR runs in a worker thread
+    # owned by ``transcription_jobs``; this endpoint just validates the
+    # request and starts the job. The UI polls /status.
+    @app.post("/api/library/transcribe")
+    def library_transcribe(body: dict) -> JSONResponse:
+        from ..library import SUPPORTED_AUDIO_SUFFIXES
+
+        body = body or {}
+        # Type-check before string ops so a hand-crafted POST with non-string
+        # values (e.g. {"name": 42}) returns a 400 rather than a 500 from
+        # `int.startswith(...)`.
+        name = body.get("name")
+        if not isinstance(name, str):
+            raise HTTPException(status_code=400, detail="name must be a string")
+        raw_model = body.get("model", "tiny")
+        if not isinstance(raw_model, str):
+            raise HTTPException(status_code=400, detail="model must be a string")
+        model = raw_model.strip() or "tiny"
+        # Hardcoded allow-list — protects against a hand-crafted POST sending
+        # a weird model id that faster-whisper might still try to fetch.
+        allowed_models = {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}
+        if model not in allowed_models:
+            raise HTTPException(status_code=400, detail=f"unsupported model {model!r}")
+        # beam_size: optional, defaults to 1 (greedy). Allow 1-5 since beams
+        # above 5 give negligible quality gains and waste a lot of CPU on
+        # a 2-core box.
+        raw_beam = body.get("beam_size", 1)
+        if not isinstance(raw_beam, int) or isinstance(raw_beam, bool):
+            raise HTTPException(status_code=400, detail="beam_size must be an int")
+        if raw_beam < 1 or raw_beam > 5:
+            raise HTTPException(status_code=400, detail="beam_size must be in [1, 5]")
+        beam_size = raw_beam
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
+        candidate_audio = state.library_dir / name
+        if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
+        if not candidate_audio.exists() or not candidate_audio.is_file():
+            raise HTTPException(status_code=404, detail=f"{name!r} not found in library")
+        transcript_path = state.work_dir / f"{candidate_audio.stem}.transcript.json"
+        if transcript_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"transcript already exists for {name!r}",
+            )
+        try:
+            job = transcription_jobs.start(
+                name=name,
+                audio_path=candidate_audio,
+                transcript_path=transcript_path,
+                model=model,
+                beam_size=beam_size,
+            )
+        except RuntimeError as e:
+            # Another job is in flight.
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(), "type": "server.transcribe.started",
+            "name": name, "model": model, "beam_size": beam_size,
+            "job_id": job["job_id"],
+        })
+        return JSONResponse(job, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/library/transcribe/status")
+    def library_transcribe_status() -> JSONResponse:
+        snap = transcription_jobs.snapshot()
+        return JSONResponse(
+            {"job": snap},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
 
 
