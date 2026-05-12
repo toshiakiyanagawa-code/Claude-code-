@@ -106,6 +106,10 @@ main {
   opacity: 0.8;
 }
 .segment-deleted .seg-time { color: var(--red); }
+/* Words inside the cut block are an archival display only — disable input so
+   the user can't select / drag / seek from material that's no longer part of
+   the edited timeline. They reappear interactively if the user undoes the cut. */
+.segment-deleted .word { pointer-events: none; cursor: default; }
 .seg-time {
   color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
   margin-right: 8px; user-select: none;

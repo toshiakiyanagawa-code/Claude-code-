@@ -406,8 +406,27 @@
     extendSelectionDrag(i);
   }
 
+  function wordTimelineSegmentIndex(w) {
+    // Returns the index into state.timeline that contains this word, or -1
+    // if the word is in the trailing cut block (no surviving segment).
+    if (!w || !state.timeline.length) return -1;
+    for (let i = 0; i < state.timeline.length; i++) {
+      const r = state.timeline[i];
+      if (w.start >= r.sourceStart - 1e-3 && w.end <= r.sourceEnd + 1e-3) return i;
+    }
+    return -1;
+  }
+
   function extendSelectionDrag(i) {
     if (dragAnchor === null) return;
+    // Selection in the UI maps to a *single* contiguous source range
+    // (the anchor's timeline segment). After a Move op the DOM is in edited
+    // order, so a user dragging across timeline-segment boundaries would
+    // pick up arbitrary source content. Refuse to extend across boundaries:
+    // the selection stops at whichever side of the boundary the anchor lives.
+    const anchorTLSeg = wordTimelineSegmentIndex(words[dragAnchor]);
+    const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
+    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) return;
     if (i !== dragAnchor) dragMoved = true;
     if (!state.selection || state.selection.extent !== i) {
       state.selection = { anchor: dragAnchor, extent: i };
@@ -890,6 +909,14 @@
     // same objects — they keep their listeners, .selected/.deleted classes
     // get re-applied below. This is what makes a Move op visually rearrange
     // the transcript, not just rewrite the underlying ops list.
+    //
+    // Snapshot the active word's screen-relative offset so we can re-anchor
+    // the scroll position after the wholesale DOM swap. Without this every
+    // edit jumps the user back to the top of the transcript.
+    const activeWord = activeIdx >= 0 ? words[activeIdx]?.el : null;
+    const anchorOffset = activeWord ? activeWord.getBoundingClientRect().top : null;
+    const fallbackScrollTop = window.scrollY;
+
     $tx.innerHTML = '';
 
     // Per timeline segment, split words back into runs by their original
@@ -931,6 +958,17 @@
       div.appendChild(label);
       for (const w of orphans) div.appendChild(w.el);
       $tx.appendChild(div);
+    }
+
+    // Re-anchor scroll: if the playhead's word was on screen before the
+    // rebuild, keep it at the same vertical offset; otherwise restore the
+    // raw scrollY. Either is much less jarring than the implicit jump-to-top.
+    if (activeWord && anchorOffset != null && activeWord.isConnected) {
+      const newTop = activeWord.getBoundingClientRect().top;
+      const delta = newTop - anchorOffset;
+      if (Math.abs(delta) > 0.5) window.scrollBy(0, delta);
+    } else if (fallbackScrollTop !== window.scrollY) {
+      window.scrollTo(0, fallbackScrollTop);
     }
   }
 
