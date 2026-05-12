@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
 from .edit import keep_ranges_from_deletes
+from .seam_eval import SeamAnalysis, analyze_seam
 
 
 class RenderError(RuntimeError):
@@ -29,7 +30,7 @@ class RenderError(RuntimeError):
 
 # Bump when output-affecting render logic changes so cached previews aren't
 # silently reused across upgrades. Server preview cache keys include this.
-RENDERER_VERSION = "w5.1"
+RENDERER_VERSION = "w6.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,12 @@ class RenderResult:
     lufs_out: float | None
     true_peak_dbtp: float | None
     renderer_version: str = RENDERER_VERSION
+    # W6 additions. ``seam_xfades_ms`` is one entry per interior boundary in
+    # the same order as keeps; ``seam_analyses`` carries the underlying
+    # classification + zero-cross snap displacement for diagnostic logging.
+    seam_xfades_ms: list[float] = field(default_factory=list)
+    seam_analyses: list[dict] = field(default_factory=list)
+    seam_analysis_used: bool = False
 
 
 def _probe_source_sample_rate(source: Path) -> int | None:
@@ -64,11 +71,19 @@ def _probe_source_sample_rate(source: Path) -> int | None:
 
 def _build_filtergraph(
     keeps: list[tuple[float, float]],
-    xfade_ms: float,
+    seam_xfades_ms: list[float],
     lufs_target: float | None,
     true_peak_ceiling_dbtp: float,
     source_sample_rate: int | None,
 ) -> str:
+    """Build the ffmpeg filter graph.
+
+    ``seam_xfades_ms`` has one entry per interior seam (``len(keeps) - 1``).
+    A zero or negative value means the seam is a hard concat; a positive
+    value drives an equal-power ``acrossfade``. Mixing is supported per-seam
+    so a transient cut can stay short while an adjacent silence-to-silence
+    cut takes the full 50 ms.
+    """
     parts: list[str] = []
     for i, (s, e) in enumerate(keeps):
         # asetpts=PTS-STARTPTS resets the timestamps so the downstream filter
@@ -78,20 +93,20 @@ def _build_filtergraph(
     n = len(keeps)
     if n == 1:
         cur = "[k0]"
-    elif xfade_ms > 0:
-        # qsin/qsin = quarter-sine curves; sin²+cos²=1, so the combined energy
-        # at the splice stays constant (equal-power crossfade).
-        d_sec = xfade_ms / 1000.0
+    else:
+        # qsin/qsin = quarter-sine curves; sin²+cos²=1, so combined energy at
+        # the splice stays constant (equal-power crossfade). A hard concat per
+        # seam falls through to the n=2 acconcat path.
         cur = "[k0]"
         for i in range(1, n):
+            xfade = seam_xfades_ms[i - 1] if i - 1 < len(seam_xfades_ms) else 0.0
             out_label = "[xall]" if i == n - 1 else f"[x{i - 1}]"
-            parts.append(f"{cur}[k{i}]acrossfade=d={d_sec:.6f}:c1=qsin:c2=qsin{out_label}")
+            if xfade > 0:
+                d_sec = xfade / 1000.0
+                parts.append(f"{cur}[k{i}]acrossfade=d={d_sec:.6f}:c1=qsin:c2=qsin{out_label}")
+            else:
+                parts.append(f"{cur}[k{i}]concat=n=2:v=0:a=1{out_label}")
             cur = out_label
-    else:
-        # Hard splice — concat the keep ranges with no smoothing.
-        labels = "".join(f"[k{i}]" for i in range(n))
-        parts.append(f"{labels}concat=n={n}:v=0:a=1[xall]")
-        cur = "[xall]"
 
     if lufs_target is not None:
         # Single-pass loudnorm. Two-pass (measure then apply) is more accurate
@@ -141,6 +156,7 @@ def render_cuts(
     crossfade_ms: float = 10.0,
     lufs_target: float | None = -16.0,
     true_peak_ceiling_dbtp: float = -1.0,
+    seam_analysis: bool = True,
 ) -> RenderResult:
     """Apply ``deletes`` to ``source`` and write a wav with sample-precise cuts.
 
@@ -156,20 +172,61 @@ def render_cuts(
     if not keeps:
         raise RenderError("All audio is deleted; no output to render.")
 
-    # Clamp the crossfade to the shortest keep range — `acrossfade d=X` requires
-    # both inputs to be at least X long, otherwise ffmpeg either errors or
-    # produces an unusably short output for that segment. We never *exceed*
-    # the user's request; we just shrink it when the audio can't accommodate.
     requested_xfade = crossfade_ms
-    applied_xfade = crossfade_ms
-    if applied_xfade > 0 and len(keeps) > 1:
-        shortest_keep_sec = min((e - s) for s, e in keeps)
-        cap_ms = max(0.0, shortest_keep_sec * 1000.0 - 1.0)  # leave 1ms slack
-        if cap_ms < applied_xfade:
-            applied_xfade = cap_ms
+
+    # Optional pre-analysis pass (W6): for each interior boundary, snap toward
+    # a zero-crossing within ±20 ms and pick a content-aware crossfade length.
+    # We modify the keep ranges in place (mutable copies) and build a per-seam
+    # xfade list that the filter graph consumes.
+    analyses: list[dict] = []
+    mutable_keeps = [list(k) for k in keeps]
+    seam_xfades_ms: list[float] = []
+    seam_used = False
+    if seam_analysis and len(mutable_keeps) > 1:
+        seam_used = True
+        for i in range(1, len(mutable_keeps)):
+            end_seam: SeamAnalysis = analyze_seam(source, float(mutable_keeps[i - 1][1]))
+            start_seam: SeamAnalysis = analyze_seam(source, float(mutable_keeps[i][0]))
+            mutable_keeps[i - 1][1] = end_seam.snapped_sec
+            mutable_keeps[i][0] = start_seam.snapped_sec
+            # Take the shorter recommendation so a transient on either side
+            # caps the fade. The user's ``crossfade_ms`` still acts as an
+            # upper bound so a UI slider stays authoritative.
+            xfade = min(end_seam.recommended_xfade_ms, start_seam.recommended_xfade_ms, crossfade_ms)
+            seam_xfades_ms.append(xfade)
+            analyses.append({
+                "seam_index": i,
+                "end_seam_sec": end_seam.seam_sec,
+                "end_snapped_sec": end_seam.snapped_sec,
+                "end_class": end_seam.klass.value,
+                "end_rms_db": end_seam.rms_db,
+                "end_flux": end_seam.spectral_flux,
+                "start_seam_sec": start_seam.seam_sec,
+                "start_snapped_sec": start_seam.snapped_sec,
+                "start_class": start_seam.klass.value,
+                "start_rms_db": start_seam.rms_db,
+                "start_flux": start_seam.spectral_flux,
+                "applied_xfade_ms": xfade,
+            })
+    else:
+        # Uniform xfade fallback (W5 behavior).
+        seam_xfades_ms = [crossfade_ms] * max(0, len(mutable_keeps) - 1)
+    keeps = [tuple(k) for k in mutable_keeps]
+
+    # acrossfade requires both inputs to be at least d long. Clamp per-seam.
+    for idx, x in enumerate(seam_xfades_ms):
+        if x <= 0:
+            continue
+        left_len = (keeps[idx][1] - keeps[idx][0]) * 1000.0
+        right_len = (keeps[idx + 1][1] - keeps[idx + 1][0]) * 1000.0
+        cap = max(0.0, min(left_len, right_len) - 1.0)
+        if cap < x:
+            seam_xfades_ms[idx] = cap
+
+    applied_xfade = max(seam_xfades_ms) if seam_xfades_ms else 0.0
 
     source_sample_rate = _probe_source_sample_rate(source) if lufs_target is not None else None
-    fc = _build_filtergraph(keeps, applied_xfade, lufs_target, true_peak_ceiling_dbtp, source_sample_rate)
+    fc = _build_filtergraph(keeps, seam_xfades_ms, lufs_target, true_peak_ceiling_dbtp, source_sample_rate)
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
@@ -213,4 +270,7 @@ def render_cuts(
         lufs_in=lufs_in,
         lufs_out=lufs_out,
         true_peak_dbtp=true_peak_out,
+        seam_xfades_ms=seam_xfades_ms,
+        seam_analyses=analyses,
+        seam_analysis_used=seam_used,
     )

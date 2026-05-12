@@ -216,6 +216,8 @@ def _parse_range(rng: str) -> tuple[float, float]:
               help="Integrated loudness target. Use a sentinel like 999 with --no-lufs to skip.")
 @click.option("--no-lufs", is_flag=True, default=False,
               help="Skip LUFS normalization entirely.")
+@click.option("--seam-analysis/--no-seam-analysis", default=True, show_default=True,
+              help="W6: per-seam zero-cross snap + content-aware variable crossfade.")
 def cut_cmd(
     audio: Path,
     deletes: tuple[str, ...],
@@ -226,6 +228,7 @@ def cut_cmd(
     crossfade_ms: float,
     lufs_target: float,
     no_lufs: bool,
+    seam_analysis: bool,
 ) -> None:
     """Apply --delete ranges to AUDIO and write a wav with those ranges removed.
 
@@ -270,6 +273,7 @@ def cut_cmd(
             audio, info.duration_sec, ranges, out_path,
             crossfade_ms=crossfade_ms,
             lufs_target=None if no_lufs else lufs_target,
+            seam_analysis=seam_analysis,
         )
     except RenderError as e:
         _fatal(str(e))
@@ -278,8 +282,15 @@ def cut_cmd(
         f"[green]✓[/green] {out_path}  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
-        f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
+        f"{len(result.keeps)} keep ranges, max xfade {result.crossfade_ms:.1f}ms)"
     )
+    if result.seam_analysis_used and result.seam_analyses:
+        klass_counts: dict[str, int] = {}
+        for a in result.seam_analyses:
+            for side in ("end_class", "start_class"):
+                klass_counts[a[side]] = klass_counts.get(a[side], 0) + 1
+        summary = ", ".join(f"{v}× {k}" for k, v in sorted(klass_counts.items()))
+        console.print(f"  Seam analysis: {len(result.seam_analyses)} seam(s) classified — {summary}")
     if result.lufs_out is not None:
         before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
         peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
@@ -303,6 +314,8 @@ def cut_cmd(
 @click.option("--crossfade-ms", default=10.0, show_default=True, type=float)
 @click.option("--lufs-target", default=-16.0, show_default=True, type=float)
 @click.option("--no-lufs", is_flag=True, default=False, help="Skip LUFS normalization.")
+@click.option("--seam-analysis/--no-seam-analysis", default=True, show_default=True,
+              help="W6: per-seam zero-cross snap + content-aware variable crossfade.")
 def render_cmd(
     session_path: Path,
     out_path: Path,
@@ -311,6 +324,7 @@ def render_cmd(
     crossfade_ms: float,
     lufs_target: float,
     no_lufs: bool,
+    seam_analysis: bool,
 ) -> None:
     """Replay a saved EditSession against its source audio and write a wav."""
     try:
@@ -352,6 +366,7 @@ def render_cmd(
             source, info.duration_sec, ranges, out_path,
             crossfade_ms=crossfade_ms,
             lufs_target=None if no_lufs else lufs_target,
+            seam_analysis=seam_analysis,
         )
     except RenderError as e:
         _fatal(str(e))
@@ -360,12 +375,119 @@ def render_cmd(
         f"[green]✓[/green] {out_path}  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
-        f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
+        f"{len(result.keeps)} keep ranges, max xfade {result.crossfade_ms:.1f}ms)"
     )
+    if result.seam_analysis_used and result.seam_analyses:
+        klass_counts: dict[str, int] = {}
+        for a in result.seam_analyses:
+            for side in ("end_class", "start_class"):
+                klass_counts[a[side]] = klass_counts.get(a[side], 0) + 1
+        summary = ", ".join(f"{v}× {k}" for k, v in sorted(klass_counts.items()))
+        console.print(f"  Seam analysis: {len(result.seam_analyses)} seam(s) — {summary}")
     if result.lufs_out is not None:
         before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
         peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
         console.print(f"  Loudness: {before}{result.lufs_out:.1f} LUFS{peak}")
+
+
+@cli.command("eval")
+@click.argument("audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--delete", "-d", "deletes", multiple=True, required=True,
+              help="Delete range 'START-END' (repeatable). Use the same flag as `cut`.")
+@click.option("--out-dir", type=click.Path(path_type=Path),
+              default=Path(".podedit/eval"), show_default=True)
+@click.option("--click-threshold", default=0.25, show_default=True, type=float,
+              help="Sample-to-sample delta above which we flag a click candidate")
+def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_threshold: float) -> None:
+    """Render `hard`, `fixed_10ms`, and `seam_aware` variants of the same cuts
+    side-by-side and report a click-detection summary for each.
+
+    Use this to validate that the W6 pipeline reduces seam clicks vs the
+    earlier hard splice and uniform crossfade. The 10-cut evaluation set
+    Codex asks for is just `podedit eval <audio> -d ... -d ... -d ...` with
+    10 ranges chosen from the user's transcript.
+    """
+    import time
+
+    try:
+        ranges = [_parse_range(r) for r in deletes]
+    except ValueError as e:
+        _fatal(str(e))
+    try:
+        info = probe(audio)
+    except (FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = audio.stem
+    variants = [
+        ("hard", {"crossfade_ms": 0.0, "seam_analysis": False}),
+        ("fixed_10ms", {"crossfade_ms": 10.0, "seam_analysis": False}),
+        ("seam_aware", {"crossfade_ms": 50.0, "seam_analysis": True}),
+    ]
+    # Expected seam timestamps in OUTPUT space: each cut produces one seam at
+    # the cumulative-kept time up to that delete. We pre-compute them in
+    # source-keep order from the merged delete list.
+    from .edit import keep_ranges_from_deletes
+    keeps = keep_ranges_from_deletes(info.duration_sec, ranges)
+    expected_seams_sec = []
+    cursor = 0.0
+    for s, e in keeps[:-1]:
+        cursor += e - s
+        expected_seams_sec.append(cursor)
+
+    console.print(f"[bold]Source[/bold]: {audio.name}  ({info.duration_sec:.1f}s)  "
+                  f"{len(ranges)} deletes → {len(keeps)} keep ranges, {len(expected_seams_sec)} seam(s)")
+
+    summary: list[dict] = []
+    for name, kwargs in variants:
+        out_path = out_dir / f"{stem}.{name}.wav"
+        t0 = time.perf_counter()
+        try:
+            result = render_cuts(
+                audio, info.duration_sec, ranges, out_path,
+                lufs_target=None,  # eval focuses on seam quality, not loudness
+                **kwargs,
+            )
+        except RenderError as e:
+            _fatal(f"{name}: {e}")
+        wall = time.perf_counter() - t0
+
+        # Click detection over the output wav. soundfile reads small audio fine;
+        # for very large outputs we'd want chunked, but eval typically targets
+        # short cut sets.
+        import soundfile as sf
+        audio_out, sr_out = sf.read(str(out_path), dtype="float32", always_2d=False)
+        from .seam_eval import detect_clicks
+        clicks = detect_clicks(audio_out, sr_out, expected_seams_sec=expected_seams_sec,
+                               delta_threshold=click_threshold)
+        near_seam = sum(1 for c in clicks if c["near_seam"])
+        max_delta = max((c["delta"] for c in clicks), default=0.0)
+
+        summary.append({
+            "variant": name,
+            "wall_sec": wall,
+            "duration_out": result.duration_out,
+            "max_xfade_ms": result.crossfade_ms,
+            "clicks_total": len(clicks),
+            "clicks_near_seam": near_seam,
+            "max_click_delta": max_delta,
+        })
+        console.print(
+            f"  [green]✓[/green] {name:11s} wall {wall:5.1f}s  "
+            f"dur {result.duration_out:7.2f}s  "
+            f"clicks {len(clicks):3d} ({near_seam} near seams)  "
+            f"max Δ {max_delta:.3f}  "
+            f"→ {out_path}"
+        )
+
+    summary_path = out_dir / f"{stem}.eval_summary.json"
+    summary_path.write_text(json.dumps({
+        "audio": str(audio), "deletes": [{"start": s, "end": e} for s, e in ranges],
+        "expected_seams_sec": expected_seams_sec, "click_threshold": click_threshold,
+        "variants": summary,
+    }, ensure_ascii=False, indent=2))
+    console.print(f"[dim]Summary: {summary_path}[/dim]")
 
 
 @cli.command("serve")
