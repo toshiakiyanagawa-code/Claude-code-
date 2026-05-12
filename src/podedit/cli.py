@@ -1,4 +1,4 @@
-"""podedit CLI — W1: `transcribe` only."""
+"""podedit CLI — `transcribe` (W1), `cut` and `render` (W2)."""
 from __future__ import annotations
 
 import json
@@ -146,16 +146,39 @@ def _fatal(msg: str) -> None:
 
 
 def _parse_time(s: str) -> float:
-    """Parse seconds, 'M:SS', or 'H:MM:SS' into float seconds."""
+    """Parse seconds, 'M:SS', or 'H:MM:SS' into float seconds.
+
+    For colon-separated forms, each minutes/seconds field must be < 60. This
+    catches typos like "1:75" that would otherwise silently be accepted as
+    1m75s = 135s.
+    """
     s = s.strip()
-    if ":" in s:
-        parts = s.split(":")
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
-        if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-        raise ValueError(f"Invalid time format: {s!r}")
-    return float(s)
+    if not s:
+        raise ValueError("Empty time string")
+    if ":" not in s:
+        return float(s)
+
+    parts = s.split(":")
+    if len(parts) == 2:
+        m = int(parts[0])
+        secs = float(parts[1])
+        if secs < 0 or secs >= 60:
+            raise ValueError(f"Seconds field must be in [0, 60) in {s!r}")
+        if m < 0:
+            raise ValueError(f"Minutes must be non-negative in {s!r}")
+        return m * 60 + secs
+    if len(parts) == 3:
+        h = int(parts[0])
+        m = int(parts[1])
+        secs = float(parts[2])
+        if m < 0 or m >= 60:
+            raise ValueError(f"Minutes field must be in [0, 60) in {s!r}")
+        if secs < 0 or secs >= 60:
+            raise ValueError(f"Seconds field must be in [0, 60) in {s!r}")
+        if h < 0:
+            raise ValueError(f"Hours must be non-negative in {s!r}")
+        return h * 3600 + m * 60 + secs
+    raise ValueError(f"Invalid time format: {s!r}")
 
 
 def _parse_range(rng: str) -> tuple[float, float]:
@@ -242,6 +265,69 @@ def cut_cmd(
         save_session.parent.mkdir(parents=True, exist_ok=True)
         save_session.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
         console.print(f"  Session: {save_session}")
+
+
+@cli.command("render")
+@click.argument("session_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "--out", "out_path", type=click.Path(path_type=Path), required=True,
+              help="Output wav path")
+@click.option("--source-override", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None,
+              help="Use this audio file instead of the path recorded in the session")
+@click.option("--check-checksum/--no-check-checksum", default=True, show_default=True,
+              help="Verify the source SHA-256 matches the session record")
+def render_cmd(
+    session_path: Path,
+    out_path: Path,
+    source_override: Path | None,
+    check_checksum: bool,
+) -> None:
+    """Replay a saved EditSession against its source audio and write a wav."""
+    try:
+        session = EditSession.from_dict(json.loads(session_path.read_text()))
+    except (KeyError, ValueError) as e:
+        _fatal(f"Invalid session: {e}")
+    except json.JSONDecodeError as e:
+        _fatal(f"Session is not valid JSON: {e}")
+
+    source = source_override or Path(session.source_audio.path)
+    if not source.exists():
+        _fatal(
+            f"Source audio not found: {source}. "
+            "Use --source-override PATH if the file has moved."
+        )
+
+    if check_checksum and session.source_audio.sha256:
+        console.print("[dim]Verifying source SHA-256…[/dim]")
+        actual = sha256_of_file(source)
+        if actual != session.source_audio.sha256:
+            _fatal(
+                f"Source SHA-256 mismatch.\n  session: {session.source_audio.sha256}\n  actual:  {actual}\n"
+                "Pass --no-check-checksum to render anyway."
+            )
+
+    try:
+        info = probe(source)
+    except (FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+
+    ranges = [(op.start, op.end) for op in session.ops if op.op == "delete"]
+    console.print(
+        f"[bold]Session[/bold]: {session_path.name}  "
+        f"({len(session.ops)} ops, source {source.name}, {info.duration_sec:.1f}s)"
+    )
+
+    try:
+        result = render_cuts(source, info.duration_sec, ranges, out_path)
+    except RenderError as e:
+        _fatal(str(e))
+
+    console.print(
+        f"[green]✓[/green] {out_path}  "
+        f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
+        f"{result.duration_in - result.duration_out:.1f}s cut, "
+        f"{len(result.keeps)} keep ranges)"
+    )
 
 
 if __name__ == "__main__":

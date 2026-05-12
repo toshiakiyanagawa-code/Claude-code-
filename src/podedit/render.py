@@ -32,7 +32,8 @@ def _build_filtergraph(keeps: list[tuple[float, float]]) -> str:
     parts: list[str] = []
     for i, (s, e) in enumerate(keeps):
         # asetpts=PTS-STARTPTS is required after atrim so concat sees a 0-based PTS.
-        parts.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[k{i}]")
+        # Fixed precision (microseconds) for readability + filtergraph stability.
+        parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
     inputs = "".join(f"[k{i}]" for i in range(len(keeps)))
     parts.append(f"{inputs}concat=n={len(keeps)}:v=0:a=1[out]")
     return ";".join(parts)

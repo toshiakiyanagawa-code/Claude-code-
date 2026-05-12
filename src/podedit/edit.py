@@ -56,6 +56,41 @@ class EditSession:
         self.ops.append(op)
         return op
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "EditSession":
+        ver = data.get("schema_version")
+        if ver != ESS_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported EditSession schema_version {ver!r} (expected {ESS_SCHEMA_VERSION})"
+            )
+        src = data["source_audio"]
+        source_audio = AudioRef(
+            path=src["path"],
+            duration_sec=float(src["duration_sec"]),
+            sample_rate=int(src["sample_rate"]),
+            channels=int(src["channels"]),
+            codec=src["codec"],
+            sha256=src.get("sha256"),
+        )
+        ops = [
+            DeleteOp(
+                op_id=o["op_id"],
+                op=o["op"],
+                start=float(o["start"]),
+                end=float(o["end"]),
+                note=o.get("note"),
+            )
+            for o in data.get("ops", [])
+        ]
+        return cls(
+            schema_version=ver,
+            timeline_basis=data["timeline_basis"],
+            source_audio=source_audio,
+            transcript_ref=data.get("transcript_ref"),
+            created_at=data["created_at"],
+            ops=ops,
+        )
+
 
 def sha256_of_file(path: Path, chunk_size: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -76,7 +111,12 @@ def keep_ranges_from_deletes(
     """
     if duration <= 0:
         return []
-    cleaned = [(max(0.0, s), min(duration, e)) for s, e in deletes if e > s]
+    cleaned: list[tuple[float, float]] = []
+    for s, e in deletes:
+        s_c = max(0.0, s)
+        e_c = min(duration, e)
+        if e_c > s_c:  # filter AFTER clamping so fully out-of-range ranges drop out
+            cleaned.append((s_c, e_c))
     if not cleaned:
         return [(0.0, duration)]
     cleaned.sort()
