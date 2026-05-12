@@ -116,11 +116,12 @@
     (seg.words || []).forEach((w) => {
       const span = document.createElement('span');
       span.className = 'word';
-      span.dataset.idx = String(idx);
+      const wordIdx = idx;  // capture per-iteration value — `idx` is a closure ref
+      span.dataset.idx = String(wordIdx);
       span.textContent = w.text;
-      const word = { el: span, start: w.start, end: w.end, idx, segIdx };
+      const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
       words.push(word);
-      span.addEventListener('click', (ev) => onWordClick(idx, ev));
+      span.addEventListener('click', (ev) => onWordClick(wordIdx, ev));
       div.appendChild(span);
       idx += 1;
     });
