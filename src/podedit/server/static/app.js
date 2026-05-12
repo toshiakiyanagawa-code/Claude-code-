@@ -486,6 +486,9 @@
     // the seek immediately.
     isSkipping = true;
     const wasPlaying = !$player.paused && !$player.ended;
+    // Never seek past source duration — that's a no-op in some browsers and
+    // can confuse the readyState. The caller already handles "edited end".
+    targetEnd = Math.max(0, Math.min(targetEnd, state.sourceDuration));
     try {
       $player.pause();
       $player.currentTime = targetEnd;
@@ -516,11 +519,35 @@
       $scrubber.value = String(edt);
     }
 
+    // Edited-end detection: if the source playhead has reached the last
+    // keep range's sourceEnd, the user's "edited podcast" is over. Pause and
+    // pin the playhead. Without this, deleting the tail of the audio would
+    // make tick() repeatedly try to skip past the trailing delete and run
+    // off the end of the source file.
+    if (!isSkipping && !state.isScrubbing && state.timeline.length > 0) {
+      const lastKeep = state.timeline[state.timeline.length - 1];
+      if (t >= lastKeep.sourceEnd - 0.001) {
+        if (!$player.paused) {
+          $player.pause();
+          logKPI('ui.preview.edited_end', { source_t: t, edited_t: state.editedDuration });
+        }
+        // Pin to exactly the edited end so we don't drift into a tail-delete.
+        if (Math.abs($player.currentTime - lastKeep.sourceEnd) > 0.01) {
+          $player.currentTime = lastKeep.sourceEnd;
+        }
+      }
+    }
+
     // Preview-skip: jump out of any merged delete range. Suppressed while the
     // user is scrubbing so we don't fight their drag.
     if (!isSkipping && !state.isScrubbing) {
       for (const [s, e] of state.mergedDeletes) {
         if (t >= s && t < e) {
+          // If this delete extends to the source end (no keep range after it),
+          // we're past the edited end — handled by the block above. Don't
+          // try to seek past sourceDuration.
+          const hasKeepAfter = state.timeline.some((r) => r.sourceStart >= e - 0.001);
+          if (!hasKeepAfter) break;
           // 50ms nudge past the boundary — `+0.001` is too small; AAC frame
           // alignment can park currentTime fractionally before the boundary
           // and we'd re-trigger forever.
