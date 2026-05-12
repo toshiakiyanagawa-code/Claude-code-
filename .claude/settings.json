@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:books.rakuten.co.jp)",
+      "WebFetch(domain:search.rakuten.co.jp)",
+      "WebFetch(domain:www.rakuten.co.jp)",
+      "WebFetch(domain:www.amazon.co.jp)",
+      "WebFetch(domain:amazon.co.jp)",
+      "WebFetch(domain:president.jp)",
+      "WebFetch(domain:hon-hikidashi.jp)",
+      "WebFetch(domain:www.kodansha.co.jp)",
+      "WebFetch(domain:bookclub.kodansha.co.jp)",
+      "WebFetch(domain:gendai.media)",
+      "WebFetch(domain:shinsho.sk46.com)",
+      "WebFetch(domain:bunko.sumikko.info)",
+      "WebFetch(domain:www.shueisha.co.jp)",
+      "WebFetch(domain:www.chikumashobo.co.jp)",
+      "WebFetch(domain:new.chikumashobo.co.jp)",
+      "WebFetch(domain:www.kadokawa.co.jp)",
+      "WebFetch(domain:kadobun.jp)",
+      "WebFetch(domain:www.chuko.co.jp)",
+      "WebFetch(domain:str.toyokeizai.net)"
+    ]
+  },
+  "sandbox": {
+    "network": {
+      "allowedDomains": [
+        "books.rakuten.co.jp",
+        "search.rakuten.co.jp",
+        "*.rakuten.co.jp",
+        "www.amazon.co.jp",
+        "*.amazon.co.jp",
+        "president.jp",
+        "*.president.jp",
+        "hon-hikidashi.jp",
+        "www.kodansha.co.jp",
+        "bookclub.kodansha.co.jp",
+        "gendai.media",
+        "shinsho.sk46.com",
+        "bunko.sumikko.info",
+        "www.shueisha.co.jp",
+        "www.chikumashobo.co.jp",
+        "new.chikumashobo.co.jp",
+        "www.kadokawa.co.jp",
+        "kadobun.jp",
+        "www.chuko.co.jp",
+        "str.toyokeizai.net"
+      ]
+    }
+  }
+}
