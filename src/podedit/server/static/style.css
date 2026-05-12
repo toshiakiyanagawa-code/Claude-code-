@@ -135,27 +135,46 @@ main {
   left: 0;
   top: 0;
   z-index: 1000;
-  max-width: 280px;
-  padding: 6px 9px;
-  border: 1px solid rgba(98, 174, 255, 0.45);
-  border-radius: 4px;
-  background: rgba(22, 25, 34, 0.8);
+  /* Sized to feel substantial without taking over the viewport. The clipped
+     height + fade-mask cue at the bottom shows there's more material when a
+     long range is grabbed. */
+  max-width: min(520px, 80vw);
+  max-height: 180px;
+  padding: 8px 12px;
+  border: 1px solid rgba(98, 174, 255, 0.55);
+  border-radius: 6px;
+  background: rgba(22, 25, 34, 0.92);
   color: var(--text);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
-  font-size: 12px;
-  line-height: 1.3;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  font-size: 14px;
+  line-height: 1.7;
   pointer-events: none;
   user-select: none;
-  white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  /* Soft fade at the bottom edge so a clipped long selection signals
+     "there's more text below". */
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
 }
-.move-ghost-text { vertical-align: middle; }
+.move-ghost-content {
+  display: block;
+  /* Inline-block word clones inside this block layout naturally wrap to a new
+     line when the ghost width is exceeded, mirroring the transcript. */
+}
+.move-ghost-word {
+  display: inline-block;
+  padding: 2px 3px;
+  margin: 0 1px;
+}
 .move-ghost-badge {
-  margin-left: 6px;
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(247, 196, 106, 0.18);
   color: var(--amber);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
-  vertical-align: middle;
 }
 .drop-caret {
   position: fixed;

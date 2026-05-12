@@ -318,7 +318,6 @@
   // becomes a move once the pointer has travelled far enough to show intent.
   const MOVE_DRAG_THRESHOLD_PX = 4;
   const MOVE_DRAG_AUTOSCROLL_EDGE_PX = 80;
-  const MOVE_GHOST_MAX_CHARS = 22;
   let dragAnchor = null;  // word idx where selection drag started; null when idle
   let dragMoved = false;  // did selection drag cross at least one other word
   let dragStartT = 0;
@@ -326,7 +325,7 @@
   let activePointerCaptureEl = null;
   let pendingDragMove = null;  // {x, y} latest selection-drag pointer position; processed on rAF
   let isIMEComposing = false;
-  let moveDrag = null;  // {phase, pointerId, startX, startY, sourceRange, sourceText, duration, ...}
+  let moveDrag = null;  // {phase, pointerId, startX, startY, sourceRange, duration, ...}
 
   document.addEventListener('compositionstart', () => { isIMEComposing = true; });
   document.addEventListener('compositionend', () => { isIMEComposing = false; });
@@ -381,7 +380,6 @@
       lastX: ev.clientX,
       lastY: ev.clientY,
       sourceRange,
-      sourceText: selectedTextPreview(sourceRange),
       duration: sourceRange.end - sourceRange.start,
       candidate: null,
       ghostEl: null,
@@ -401,19 +399,6 @@
     if (activePointerId === null || !activePointerCaptureEl) return;
     try { activePointerCaptureEl.releasePointerCapture(activePointerId); } catch (_) {}
     activePointerCaptureEl = null;
-  }
-
-  function selectedTextPreview(r) {
-    let text = '';
-    for (let i = r.ws; i <= r.we; i++) {
-      const token = words[i].el.textContent || '';
-      text = text ? `${text} ${token}` : token;
-      if (text.length >= MOVE_GHOST_MAX_CHARS) break;
-    }
-    text = text.trim();
-    return text.length > MOVE_GHOST_MAX_CHARS
-      ? text.slice(0, MOVE_GHOST_MAX_CHARS - 1).trimEnd() + '…'
-      : text;
   }
 
   function onWordMouseEnter(i) {
@@ -475,13 +460,24 @@
     if (!moveDrag || moveDrag.ghostEl) return;
     const ghost = document.createElement('div');
     ghost.className = 'move-ghost';
-    const label = document.createElement('span');
-    label.className = 'move-ghost-text';
-    label.textContent = moveDrag.sourceText || 'Selection';
+
+    // Clone every selected word into the ghost so the user literally sees the
+    // text they grabbed travelling with the cursor — not a truncated preview.
+    // The source spans stay in place at 0.45 opacity (.move-source) so the
+    // user keeps the layout context.
+    const content = document.createElement('div');
+    content.className = 'move-ghost-content';
+    const r = moveDrag.sourceRange;
+    for (let i = r.ws; i <= r.we; i++) {
+      const clone = document.createElement('span');
+      clone.className = 'move-ghost-word';
+      clone.textContent = words[i].el.textContent || '';
+      content.appendChild(clone);
+    }
     const badge = document.createElement('span');
     badge.className = 'move-ghost-badge';
-    badge.textContent = `(${fmtMs(moveDrag.duration)})`;
-    ghost.append(label, badge);
+    badge.textContent = `${fmtMs(moveDrag.duration)}`;
+    ghost.append(content, badge);
     document.body.appendChild(ghost);
 
     const caret = document.createElement('div');
@@ -491,7 +487,7 @@
 
     moveDrag.ghostEl = ghost;
     moveDrag.caretEl = caret;
-    for (let i = moveDrag.sourceRange.ws; i <= moveDrag.sourceRange.we; i++) {
+    for (let i = r.ws; i <= r.we; i++) {
       words[i].el.classList.add('move-source');
     }
   }
