@@ -304,7 +304,7 @@
       span.textContent = w.text;
       const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
       words.push(word);
-      span.addEventListener('mousedown', (ev) => onWordMouseDown(wordIdx, ev));
+      span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
       span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
       div.appendChild(span);
       idx += 1;
@@ -312,34 +312,116 @@
     $tx.appendChild(div);
   });
 
-  // ------- selection + clicks -------
-  // Drag-to-select model:
-  //   mousedown on a word → start a tentative selection at that anchor
-  //   mouseenter on another word while still held → extend selection (drag)
-  //   mouseup → if we never crossed words, treat as a plain click (seek+play);
-  //             if we did cross, finalize the drag selection
-  // Shift+mousedown still extends from the existing anchor (W3 behavior).
-  let dragAnchor = null;  // word idx where mouse went down; null when idle
-  let dragMoved = false;  // did we enter at least one other word before mouseup
+  // ------- selection + move-drag clicks -------
+  // Pointerdown on an unselected word keeps the W4 drag-to-select behavior.
+  // Pointerdown inside an existing selection starts as a plain click and only
+  // becomes a move once the pointer has travelled far enough to show intent.
+  const MOVE_DRAG_THRESHOLD_PX = 4;
+  const MOVE_DRAG_AUTOSCROLL_EDGE_PX = 80;
+  const MOVE_GHOST_MAX_CHARS = 22;
+  let dragAnchor = null;  // word idx where selection drag started; null when idle
+  let dragMoved = false;  // did selection drag cross at least one other word
   let dragStartT = 0;
+  let activePointerId = null;
+  let activePointerCaptureEl = null;
+  let pendingDragMove = null;  // {x, y} latest selection-drag pointer position; processed on rAF
+  let isIMEComposing = false;
+  let moveDrag = null;  // {phase, pointerId, startX, startY, sourceRange, sourceText, duration, ...}
 
-  function onWordMouseDown(i, ev) {
+  document.addEventListener('compositionstart', () => { isIMEComposing = true; });
+  document.addEventListener('compositionend', () => { isIMEComposing = false; });
+
+  function onWordPointerDown(i, ev) {
     if (ev.button !== undefined && ev.button !== 0) return;  // left button only
+    if (ev.isComposing || isIMEComposing) return;
     if (ev.shiftKey && state.selection) {
       state.selection = { anchor: state.selection.anchor, extent: i };
       renderSelection();
       ev.preventDefault();
       return;
     }
-    dragAnchor = i;
-    dragMoved = false;
-    dragStartT = performance.now();
-    state.selection = { anchor: i, extent: i };
-    renderSelection();
+
+    const r = selectionRange();
+    const startsInsideSelection = !!r && i >= r.ws && i <= r.we;
+    if (startsInsideSelection && state.previewMode) {
+      // Simpler preview-mode policy: drag-to-move is disabled while auditioning
+      // because DOM word timestamps remain source-time while audio is edited-time.
+      ev.preventDefault();
+      return;
+    }
+    if (startsInsideSelection) {
+      beginTentativeMoveDrag(i, ev, r);
+      ev.preventDefault();
+      return;
+    }
+
+    beginSelectionDrag(i, ev);
     ev.preventDefault();
   }
 
+  function beginSelectionDrag(i, ev) {
+    dragAnchor = i;
+    dragMoved = false;
+    dragStartT = performance.now();
+    activePointerId = ev.pointerId;
+    pendingDragMove = null;
+    state.selection = { anchor: i, extent: i };
+    renderSelection();
+    capturePointer(ev);
+  }
+
+  function beginTentativeMoveDrag(i, ev, sourceRange) {
+    activePointerId = ev.pointerId;
+    moveDrag = {
+      phase: 'tentative',
+      pointerId: ev.pointerId,
+      startWordIdx: i,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      lastX: ev.clientX,
+      lastY: ev.clientY,
+      sourceRange,
+      sourceText: selectedTextPreview(sourceRange),
+      duration: sourceRange.end - sourceRange.start,
+      candidate: null,
+      ghostEl: null,
+      caretEl: null,
+      autoScrollRaf: null,
+      startedAt: performance.now(),
+    };
+    capturePointer(ev);
+  }
+
+  function capturePointer(ev) {
+    activePointerCaptureEl = ev.currentTarget;
+    try { activePointerCaptureEl.setPointerCapture(ev.pointerId); } catch (_) {}
+  }
+
+  function releaseActivePointerCapture() {
+    if (activePointerId === null || !activePointerCaptureEl) return;
+    try { activePointerCaptureEl.releasePointerCapture(activePointerId); } catch (_) {}
+    activePointerCaptureEl = null;
+  }
+
+  function selectedTextPreview(r) {
+    let text = '';
+    for (let i = r.ws; i <= r.we; i++) {
+      const token = words[i].el.textContent || '';
+      text = text ? `${text} ${token}` : token;
+      if (text.length >= MOVE_GHOST_MAX_CHARS) break;
+    }
+    text = text.trim();
+    return text.length > MOVE_GHOST_MAX_CHARS
+      ? text.slice(0, MOVE_GHOST_MAX_CHARS - 1).trimEnd() + '…'
+      : text;
+  }
+
   function onWordMouseEnter(i) {
+    if (dragAnchor === null) return;
+    extendSelectionDrag(i);
+  }
+
+  function extendSelectionDrag(i) {
     if (dragAnchor === null) return;
     if (i !== dragAnchor) dragMoved = true;
     if (!state.selection || state.selection.extent !== i) {
@@ -348,27 +430,36 @@
     }
   }
 
-  function finishDrag(ev) {
+  function handlePlainWordClick(startIdx) {
+    if (state.clipboard) {
+      setPasteAnchor(startIdx);
+      clearSelection();
+      logKPI('ui.paste.anchor', { word_idx: startIdx, t: words[startIdx].start });
+      return;
+    }
+    // Plain click: seek + play. Selection collapses to this one word so D
+    // can still delete a single word if the user wants.
+    state.selection = { anchor: startIdx, extent: startIdx };
+    renderSelection();
+    const w = words[startIdx];
+    $player.currentTime = w.start;
+    const p = $player.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+    logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+  }
+
+  function finishSelectionDrag() {
     if (dragAnchor === null) return;
     const wasDrag = dragMoved;
     const startIdx = dragAnchor;
     dragAnchor = null;
     dragMoved = false;
+    releaseActivePointerCapture();
+    activePointerId = null;
+    pendingDragMove = null;
 
     if (!wasDrag) {
-      if (state.clipboard) {
-        setPasteAnchor(startIdx);
-        clearSelection();
-        logKPI('ui.paste.anchor', { word_idx: startIdx, t: words[startIdx].start });
-        return;
-      }
-      // Plain click: seek + play. Selection collapses to this one word so D
-      // can still delete a single word if the user wants.
-      const w = words[startIdx];
-      $player.currentTime = w.start;
-      const p = $player.play();
-      if (p && typeof p.catch === 'function') p.catch(() => {});
-      logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+      handlePlainWordClick(startIdx);
     } else {
       const r = selectionRange();
       if (r) {
@@ -380,31 +471,218 @@
     }
   }
 
-  // mouseup fires on document so we still finalize even if the user releases
-  // outside the transcript (e.g. on the audio player or scrollbar).
-  document.addEventListener('mouseup', finishDrag);
-  // Drag can be aborted by leaving the window mid-drag; treat it the same as
-  // releasing in place so we don't leave dragAnchor sticky.
-  document.addEventListener('mouseleave', finishDrag);
+  function ensureMoveDragVisuals() {
+    if (!moveDrag || moveDrag.ghostEl) return;
+    const ghost = document.createElement('div');
+    ghost.className = 'move-ghost';
+    const label = document.createElement('span');
+    label.className = 'move-ghost-text';
+    label.textContent = moveDrag.sourceText || 'Selection';
+    const badge = document.createElement('span');
+    badge.className = 'move-ghost-badge';
+    badge.textContent = `(${fmtMs(moveDrag.duration)})`;
+    ghost.append(label, badge);
+    document.body.appendChild(ghost);
 
-  // Backstop for sensitivity: track mouse position during drag and resolve
-  // the word directly under the cursor each rAF. mouseenter alone misses
-  // words when the user drags fast across line breaks or through inter-word
-  // gaps. Throttled to rAF so we don't thrash DOM hit testing.
-  let pendingDragMove = null;  // {x, y} latest mouse position; processed on rAF
-  document.addEventListener('mousemove', (e) => {
+    const caret = document.createElement('div');
+    caret.className = 'drop-caret';
+    caret.hidden = true;
+    document.body.appendChild(caret);
+
+    moveDrag.ghostEl = ghost;
+    moveDrag.caretEl = caret;
+    for (let i = moveDrag.sourceRange.ws; i <= moveDrag.sourceRange.we; i++) {
+      words[i].el.classList.add('move-source');
+    }
+  }
+
+  function updateMoveGhost(x, y) {
+    if (!moveDrag?.ghostEl) return;
+    moveDrag.ghostEl.style.transform = `translate(${x + 12}px, ${y + 12}px)`;
+  }
+
+  function isPointInTranscript(x, y) {
+    const rect = $tx.getBoundingClientRect();
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }
+
+  function wordFromPoint(x, y) {
+    let el = document.elementFromPoint(x, y);
+    while (el && !el.classList?.contains('word')) el = el.parentElement;
+    if (el && el.classList.contains('word')) {
+      const i = parseInt(el.dataset.idx, 10);
+      if (!Number.isNaN(i)) return words[i] || null;
+    }
+    return null;
+  }
+
+  function nearestWordOnLine(x, y) {
+    let best = null;
+    let bestDx = Infinity;
+    for (const w of words) {
+      const rect = w.el.getBoundingClientRect();
+      if (y < rect.top || y > rect.bottom) continue;
+      const dx = x < rect.left ? rect.left - x : (x > rect.right ? x - rect.right : 0);
+      if (dx < bestDx) {
+        best = w;
+        bestDx = dx;
+      }
+    }
+    return best;
+  }
+
+  function findDropCandidate(x, y) {
+    if (!isPointInTranscript(x, y)) return null;
+    const word = wordFromPoint(x, y) || nearestWordOnLine(x, y);
+    if (!word) return null;
+    const rect = word.el.getBoundingClientRect();
+    const where = x < rect.left + rect.width / 2 ? 'before' : 'after';
+    return {
+      wordIdx: word.idx,
+      where,
+      x: where === 'before' ? rect.left : rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      targetEditedT: where === 'before' ? sourceToEdited(word.start) : sourceToEdited(word.end),
+    };
+  }
+
+  function updateDropCaret(candidate) {
+    if (!moveDrag?.caretEl) return;
+    if (!candidate) {
+      moveDrag.caretEl.hidden = true;
+      return;
+    }
+    moveDrag.caretEl.hidden = false;
+    moveDrag.caretEl.style.left = `${candidate.x}px`;
+    moveDrag.caretEl.style.top = `${candidate.top}px`;
+    moveDrag.caretEl.style.height = `${Math.max(14, candidate.bottom - candidate.top)}px`;
+  }
+
+  function updateMoveDropTarget(x, y) {
+    if (!moveDrag) return;
+    const candidate = findDropCandidate(x, y);
+    moveDrag.candidate = candidate;
+    updateDropCaret(candidate);
+  }
+
+  function startMoveAutoScroll() {
+    if (!moveDrag || moveDrag.autoScrollRaf) return;
+    const tickScroll = () => {
+      if (!moveDrag || moveDrag.phase !== 'dragging') return;
+      const y = moveDrag.lastY;
+      let velocity = 0;
+      if (y < MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
+        velocity = -((MOVE_DRAG_AUTOSCROLL_EDGE_PX - y) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
+      } else if (y > window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
+        velocity = ((y - (window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX)) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
+      }
+      if (velocity !== 0) {
+        $tx.scrollTop += velocity;
+        updateMoveDropTarget(moveDrag.lastX, moveDrag.lastY);
+      }
+      moveDrag.autoScrollRaf = requestAnimationFrame(tickScroll);
+    };
+    moveDrag.autoScrollRaf = requestAnimationFrame(tickScroll);
+  }
+
+  function enterMoveDrag() {
+    if (!moveDrag || moveDrag.phase !== 'tentative') return;
+    moveDrag.phase = 'dragging';
+    ensureMoveDragVisuals();
+    updateMoveGhost(moveDrag.lastX, moveDrag.lastY);
+    updateMoveDropTarget(moveDrag.lastX, moveDrag.lastY);
+    startMoveAutoScroll();
+  }
+
+  function cleanupMoveDrag() {
+    if (!moveDrag) return;
+    if (moveDrag.autoScrollRaf) cancelAnimationFrame(moveDrag.autoScrollRaf);
+    if (moveDrag.ghostEl) moveDrag.ghostEl.remove();
+    if (moveDrag.caretEl) moveDrag.caretEl.remove();
+    for (let i = moveDrag.sourceRange.ws; i <= moveDrag.sourceRange.we; i++) {
+      words[i].el.classList.remove('move-source');
+    }
+    releaseActivePointerCapture();
+    moveDrag = null;
+    activePointerId = null;
+  }
+
+  function cancelMoveDrag() {
+    cleanupMoveDrag();
+  }
+
+  function finishMoveDrag(x, y) {
+    if (!moveDrag) return;
+    const wasDragging = moveDrag.phase === 'dragging';
+    const startIdx = moveDrag.startWordIdx;
+    const r = moveDrag.sourceRange;
+    const candidate = wasDragging ? moveDrag.candidate || findDropCandidate(x, y) : null;
+    cleanupMoveDrag();
+
+    if (!wasDragging) {
+      handlePlainWordClick(startIdx);
+      return;
+    }
+    if (!candidate || (candidate.wordIdx >= r.ws && candidate.wordIdx <= r.we)) return;
+    applyMoveRange(r.start, r.end, candidate.targetEditedT);
+    logKPI('ui.drag.move', {
+      ws: r.ws, we: r.we, start: r.start, end: r.end,
+      target_word_idx: candidate.wordIdx, where: candidate.where,
+      target_edited_t: candidate.targetEditedT,
+    });
+  }
+
+  document.addEventListener('pointermove', (e) => {
+    if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    if (moveDrag) {
+      moveDrag.lastX = e.clientX;
+      moveDrag.lastY = e.clientY;
+      if (moveDrag.phase === 'tentative') {
+        const dx = e.clientX - moveDrag.startX;
+        const dy = e.clientY - moveDrag.startY;
+        if (Math.hypot(dx, dy) >= MOVE_DRAG_THRESHOLD_PX) enterMoveDrag();
+      }
+      if (moveDrag.phase === 'dragging') {
+        updateMoveGhost(e.clientX, e.clientY);
+        updateMoveDropTarget(e.clientX, e.clientY);
+        e.preventDefault();
+      }
+      return;
+    }
     if (dragAnchor === null) return;
     pendingDragMove = { x: e.clientX, y: e.clientY };
   });
+
+  document.addEventListener('pointerup', (e) => {
+    if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    if (moveDrag) {
+      finishMoveDrag(e.clientX, e.clientY);
+      return;
+    }
+    finishSelectionDrag();
+  });
+
+  document.addEventListener('pointercancel', (e) => {
+    if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    if (moveDrag) cancelMoveDrag();
+    if (dragAnchor !== null) finishSelectionDrag();
+  });
+
+  // Drag can be aborted by leaving the window mid-drag; treat it as cancel for
+  // move-drag and as release for selection-drag so dragAnchor never sticks.
+  document.addEventListener('mouseleave', () => {
+    if (moveDrag) cancelMoveDrag();
+    if (dragAnchor !== null) finishSelectionDrag();
+  });
+
+  // Backstop for sensitivity: track pointer position during selection drag and
+  // resolve the word directly under the cursor each rAF. mouseenter alone
+  // misses words when dragging fast across line breaks or inter-word gaps.
   function dragMoveTick() {
     if (pendingDragMove && dragAnchor !== null) {
-      let el = document.elementFromPoint(pendingDragMove.x, pendingDragMove.y);
-      // Walk up in case the hit target is a text node wrapper.
-      while (el && !el.classList?.contains('word')) el = el.parentElement;
-      if (el && el.classList.contains('word')) {
-        const i = parseInt(el.dataset.idx, 10);
-        if (!Number.isNaN(i)) onWordMouseEnter(i);
-      }
+      const w = wordFromPoint(pendingDragMove.x, pendingDragMove.y);
+      if (w) extendSelectionDrag(w.idx);
       pendingDragMove = null;
     }
     requestAnimationFrame(dragMoveTick);
@@ -1082,6 +1360,11 @@
       return;
     }
     if (e.key === 'Escape') {
+      if (moveDrag) {
+        e.preventDefault();
+        cancelMoveDrag();
+        return;
+      }
       clearSelection();
       return;
     }
