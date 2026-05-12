@@ -56,6 +56,22 @@
     if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
     return r.json();
   }
+  async function fetchJSONWithTimeout(url, init, timeoutMs) {
+    if (typeof AbortController === 'undefined') return fetchJSON(url, init);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const mergedInit = { ...(init || {}), signal: controller.signal };
+      return await fetchJSON(url, mergedInit);
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        throw new Error(`${url} timed out after ${Math.round(timeoutMs / 1000)}s`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
   function logKPI(type, extra) {
     const event = { type, client_ts: Date.now() / 1000, ...extra };
     fetch('/api/kpi/event', {
@@ -1509,9 +1525,11 @@
   let libraryOpen = false;
   let librarySwitching = false;
   let libraryReturnFocus = null;
+  let libraryLoadSeq = 0;
   function showLibraryModal() {
     if (libraryOpen) return;
     libraryOpen = true;
+    const seq = ++libraryLoadSeq;
     libraryReturnFocus = document.activeElement;
     $libraryModal.hidden = false;
     $libraryList.innerHTML = '';
@@ -1519,15 +1537,21 @@
     $libraryStatus.hidden = false;
     // Move keyboard focus into the dialog so Esc works without an extra click.
     $btnLibraryClose.focus();
-    fetchJSON('/api/library')
-      .then((data) => populateLibrary(data))
+    fetchJSONWithTimeout('/api/library', { cache: 'no-store' }, 10000)
+      .then((data) => {
+        if (!libraryOpen || seq !== libraryLoadSeq) return;
+        populateLibrary(data);
+      })
       .catch((e) => {
+        if (!libraryOpen || seq !== libraryLoadSeq) return;
         $libraryStatus.textContent = `Failed to load library: ${e.message}`;
+        $libraryStatus.hidden = false;
       });
   }
   function hideLibraryModal() {
     if (!libraryOpen) return;
     libraryOpen = false;
+    libraryLoadSeq += 1;
     $libraryModal.hidden = true;
     // Restore focus to whatever element triggered the open, so screen readers
     // and keyboard users don't lose their place.
@@ -1537,16 +1561,18 @@
     libraryReturnFocus = null;
   }
   function populateLibrary(data) {
-    $libraryStatus.hidden = true;
-    $libraryDirHint.textContent = data.library_dir || '—';
+    const entries = Array.isArray(data && data.entries) ? data.entries : [];
+    const libraryDir = data && data.library_dir ? data.library_dir : '—';
+    const active = data && data.active ? data.active : '';
+    $libraryDirHint.textContent = libraryDir;
     $libraryList.innerHTML = '';
-    const active = data.active || '';
-    if (!data.entries.length) {
-      $libraryStatus.textContent = `No audio files found in ${data.library_dir}.`;
+    if (!entries.length) {
+      $libraryStatus.textContent = `No audio files found in ${libraryDir}.`;
       $libraryStatus.hidden = false;
       return;
     }
-    for (const e of data.entries) {
+    $libraryStatus.hidden = true;
+    for (const e of entries) {
       const li = document.createElement('li');
       const isActive = e.name === active;
       const selectable = e.has_transcript && !isActive;

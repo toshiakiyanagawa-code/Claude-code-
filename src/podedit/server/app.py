@@ -473,15 +473,15 @@ def create_app(config: ServeConfig) -> FastAPI:
     # full page reload after a successful POST so every cached resource
     # (transcript, waveform, audio) is re-fetched against the new state.
     @app.get("/api/library")
-    def library() -> dict:
+    def library() -> JSONResponse:
         entries = scan_library(state.library_dir, state.work_dir)
         active_name = state.audio_path.name
-        return {
+        return JSONResponse({
             "library_dir": str(state.library_dir),
             "work_dir": str(state.work_dir),
             "active": active_name,
             "entries": [e.to_dict() for e in entries],
-        }
+        }, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/library/select")
     def library_select(body: dict) -> dict:
