@@ -73,6 +73,7 @@ def _measure_loudnorm(
     lufs_target: float,
     true_peak_ceiling_dbtp: float,
     source_sample_rate: int | None,
+    timeout_sec: float | None = None,
 ) -> LoudnormStats:
     """Run ffmpeg pass-1 to measure integrated LUFS / true peak / LRA.
 
@@ -100,13 +101,19 @@ def _measure_loudnorm(
         f"{cur}loudnorm=I={lufs_target}:TP={true_peak_ceiling_dbtp}:LRA=11:print_format=json[out]"
     )
     fc = ";".join(parts)
-    proc = subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-nostats",
-         "-i", str(source),
-         "-filter_complex", fc, "-map", "[out]",
-         "-f", "null", "-"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-nostats",
+             "-i", str(source),
+             "-filter_complex", fc, "-map", "[out]",
+             "-f", "null", "-"],
+            capture_output=True, text=True, check=False,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RenderError(
+            f"loudnorm measurement pass timed out after {timeout_sec}s"
+        ) from e
     if proc.returncode != 0:
         raise RenderError(f"loudnorm measurement pass failed: {proc.stderr.strip()[-400:]}")
     # The JSON block is emitted at the very end of stderr.
@@ -153,6 +160,46 @@ class RenderResult:
     output_format: str = "wav"             # "wav" | "mp3" | "flac" | "ogg" | "m4a"
     lufs_two_pass: bool = False            # True when we ran the measure pass first
     lufs_measured_input: float | None = None  # pass-1 integrated LUFS of the input
+
+
+def _ebur128_measure(path: Path, *, timeout_sec: float | None = None) -> tuple[float | None, float | None]:
+    """Streaming integrated-LUFS + true-peak via ffmpeg's ebur128 filter.
+
+    Doesn't need to load the audio into memory, so this works for full
+    30-minute episodes and any output format ffmpeg can decode. Returns
+    (lufs, dBTP) or (None, None) if the summary couldn't be parsed.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise RenderError("ffmpeg not found for ebur128 measurement")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats",
+             "-i", str(path),
+             "-filter_complex", "ebur128=peak=true",
+             "-f", "null", "-"],
+            capture_output=True, text=True, check=False,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RenderError(f"ebur128 measurement timed out after {timeout_sec}s") from e
+    if proc.returncode != 0:
+        raise RenderError(f"ebur128 measurement failed: {proc.stderr.strip()[-300:]}")
+    text = proc.stderr
+    summary = text[text.rfind("Summary:"):] if "Summary:" in text else text
+    integrated = peak = None
+    for line in summary.splitlines():
+        line = line.strip()
+        if line.startswith("I:"):
+            try:
+                integrated = float(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("Peak:"):
+            try:
+                peak = float(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+    return integrated, peak
 
 
 def _probe_output_duration_and_rate(path: Path) -> tuple[float, int]:
@@ -394,6 +441,7 @@ def render_cuts(
             lufs_target=lufs_target,
             true_peak_ceiling_dbtp=true_peak_ceiling_dbtp,
             source_sample_rate=source_sample_rate,
+            timeout_sec=ffmpeg_timeout_sec,
         )
 
     fc = _build_filtergraph(
@@ -436,10 +484,16 @@ def render_cuts(
     lufs_out: float | None = None
     true_peak_out: float | None = None
     if lufs_target is not None and duration_out <= 600 and output.suffix.lower() in (".wav", ".flac"):
-        # Round-trip post-render measurement, but only on lossless outputs
-        # that ``soundfile`` can read and only when the output is short enough
-        # (~700 MB ceiling for a 30 min stereo float64 read).
+        # Short lossless output: cheap to read via soundfile + pyloudnorm.
         lufs_out, true_peak_out = _measure_loudness(output)
+    elif lufs_target is not None and shutil.which("ffmpeg") is not None:
+        # Any other case (mp3, long episode, ogg, m4a): ffmpeg-side ebur128
+        # measurement so we never need to fully load the file. The summary
+        # block ends with "I:  X LUFS" / "Peak: Y dBFS" lines we can scrape.
+        try:
+            lufs_out, true_peak_out = _ebur128_measure(output, timeout_sec=ffmpeg_timeout_sec)
+        except RenderError:
+            pass  # post-check is informational; never let it fail the render
 
     return RenderResult(
         output=output,

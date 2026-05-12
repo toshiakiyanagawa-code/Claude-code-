@@ -812,10 +812,21 @@
     if (!waveformData) return;
     const rect = $waveform.getBoundingClientRect();
     const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-    const dur = state.previewMode
-      ? (state.previewDuration != null ? state.previewDuration : ($player.duration || 1))
-      : state.sourceDuration;
-    $player.currentTime = frac * dur;
+    // The scrubber and the time displays live in *edited* space. The waveform
+    // pixels still represent source content (we shade deletes onto them) but
+    // a click is "I want to listen from this position in the podcast",
+    // which matches the scrubber: frac maps to the edited timeline. In source
+    // mode we then bridge back to a source currentTime; in preview mode the
+    // player's clock already is edited time.
+    let targetT;
+    if (state.previewMode) {
+      const dur = state.previewDuration != null ? state.previewDuration : ($player.duration || 1);
+      targetT = frac * dur;
+    } else {
+      const editedT = frac * state.editedDuration;
+      targetT = editedToSource(editedT);
+    }
+    $player.currentTime = targetT;
     const p = $player.play();
     if (p && typeof p.catch === 'function') p.catch(() => {});
     logKPI('ui.waveform.seek', { frac, t: $player.currentTime, mode: state.previewMode ? 'preview' : 'source' });

@@ -93,15 +93,22 @@ def compute_waveform(source: Path, *, target_points: int = 4000) -> Waveform:
         )
 
     bins = min(target_points, n)
-    # Use numpy reshape semantics: trim the tail so n is divisible by bins.
     chunk = n // bins
     if chunk < 1:
         chunk = 1
         bins = n
     usable = chunk * bins
     grid = audio[:usable].reshape(bins, chunk)
-    peaks_min = grid.min(axis=1)
-    peaks_max = grid.max(axis=1)
+    peaks_min = grid.min(axis=1).tolist()
+    peaks_max = grid.max(axis=1).tolist()
+    # Don't lose the tail. If reshape truncated `n - usable` samples (always
+    # < chunk), fold them into the final bin so the envelope covers the whole
+    # source duration. Without this the waveform UI ends a few ms before the
+    # actual EOF.
+    if n > usable:
+        tail = audio[usable:]
+        peaks_min[-1] = min(peaks_min[-1], float(tail.min()))
+        peaks_max[-1] = max(peaks_max[-1], float(tail.max()))
 
     return Waveform(
         version=WAVEFORM_VERSION,
