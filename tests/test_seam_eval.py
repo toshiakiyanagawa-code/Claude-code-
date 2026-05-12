@@ -52,6 +52,27 @@ def test_detect_clicks_flags_spike() -> None:
     assert any(abs(c["position_sec"] - 0.5) < 0.01 for c in clicks)
 
 
+def test_detect_clicks_catches_sign_flip() -> None:
+    # Regression test for a real bug Codex caught: abs(audio) → diff would
+    # silently miss a +0.5 → -0.5 swing because |0.5| - |-0.5| = 0.
+    # The correct order is diff → abs (or compare signed delta directly).
+    sr = 1000
+    audio = np.full(sr, 0.5, dtype=np.float32)
+    audio[500:] = -0.5  # 1.0 absolute swing across one sample
+    clicks = detect_clicks(audio, sr, delta_threshold=0.3)
+    assert clicks, "sign-flip click must be detected"
+    assert any(c["delta"] > 0.9 for c in clicks)
+
+
+def test_detect_clicks_stereo_uses_per_channel_max() -> None:
+    # Click on the right channel only — the left channel's diff is tiny.
+    sr = 1000
+    audio = np.zeros((sr, 2), dtype=np.float32)
+    audio[500, 1] = 0.9  # only right channel jumps
+    clicks = detect_clicks(audio, sr, delta_threshold=0.3)
+    assert any(abs(c["position_sec"] - 0.5) < 0.01 for c in clicks)
+
+
 def test_detect_clicks_near_seam_flag() -> None:
     sr = 1000
     audio = np.zeros(sr, dtype=np.float32)

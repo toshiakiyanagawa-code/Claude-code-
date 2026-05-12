@@ -185,10 +185,25 @@ def render_cuts(
     if seam_analysis and len(mutable_keeps) > 1:
         seam_used = True
         for i in range(1, len(mutable_keeps)):
-            end_seam: SeamAnalysis = analyze_seam(source, float(mutable_keeps[i - 1][1]))
-            start_seam: SeamAnalysis = analyze_seam(source, float(mutable_keeps[i][0]))
-            mutable_keeps[i - 1][1] = end_seam.snapped_sec
-            mutable_keeps[i][0] = start_seam.snapped_sec
+            orig_end = float(mutable_keeps[i - 1][1])
+            orig_start = float(mutable_keeps[i][0])
+            end_seam: SeamAnalysis = analyze_seam(source, orig_end)
+            start_seam: SeamAnalysis = analyze_seam(source, orig_start)
+
+            # Bound the snap so we never:
+            #  - rewind past the keep's own start (`start < end` must hold);
+            #  - cross more than half the original delete on either side, so
+            #    snap can't eat into the *other* keep's content.
+            delete_span = max(0.0, orig_start - orig_end)
+            half_span = delete_span / 2.0 if delete_span > 0 else 0.020
+            keep_left_start = mutable_keeps[i - 1][0]
+            keep_right_end = mutable_keeps[i][1]
+
+            new_end = max(keep_left_start + 1e-3, min(end_seam.snapped_sec, orig_end + half_span))
+            new_start = min(keep_right_end - 1e-3, max(start_seam.snapped_sec, orig_start - half_span))
+            mutable_keeps[i - 1][1] = new_end
+            mutable_keeps[i][0] = new_start
+
             # Take the shorter recommendation so a transient on either side
             # caps the fade. The user's ``crossfade_ms`` still acts as an
             # upper bound so a UI slider stays authoritative.
@@ -197,12 +212,12 @@ def render_cuts(
             analyses.append({
                 "seam_index": i,
                 "end_seam_sec": end_seam.seam_sec,
-                "end_snapped_sec": end_seam.snapped_sec,
+                "end_snapped_sec": new_end,
                 "end_class": end_seam.klass.value,
                 "end_rms_db": end_seam.rms_db,
                 "end_flux": end_seam.spectral_flux,
                 "start_seam_sec": start_seam.seam_sec,
-                "start_snapped_sec": start_seam.snapped_sec,
+                "start_snapped_sec": new_start,
                 "start_class": start_seam.klass.value,
                 "start_rms_db": start_seam.rms_db,
                 "start_flux": start_seam.spectral_flux,

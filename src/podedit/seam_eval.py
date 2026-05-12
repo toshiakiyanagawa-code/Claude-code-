@@ -204,15 +204,22 @@ def analyze_seam(
     else:
         klass = SeamClass.VOICE
 
-    # Snap toward a zero-crossing only when there's actual signal — snapping in
-    # silence is meaningless and just adds jitter.
-    target_sample = audio.size // 2  # the seam sits at window center
-    snap_window = int(ZERO_CROSS_WINDOW_MS * sr / 1000)
+    # Where is the seam in the decoded window? `_extract_window` requests
+    # ``seam - half_window`` as the ffmpeg ``-ss``; if that clamps to 0 (seam
+    # is closer than 50 ms to the file head), the window starts at 0 and the
+    # seam isn't at the geometric center anymore. Same logic for tail clips.
+    window_start = max(0.0, seam_sec - ANALYSIS_WINDOW_MS / 1000.0)
+    seam_offset_samples = max(0, min(audio.size - 1, int(round((seam_sec - window_start) * sr))))
+
+    # Tighter zero-cross window for consonants — moving the splice by 20 ms
+    # inside a plosive smears the attack worse than the click we're avoiding.
     if klass == SeamClass.SILENCE:
-        snapped_sample = target_sample
+        snapped_sample = seam_offset_samples
     else:
-        snapped_sample = find_zero_cross(audio, target_sample, snap_window)
-    offset = snapped_sample - target_sample
+        snap_ms = 10.0 if klass == SeamClass.CONSONANT else ZERO_CROSS_WINDOW_MS
+        snap_window = int(snap_ms * sr / 1000)
+        snapped_sample = find_zero_cross(audio, seam_offset_samples, snap_window)
+    offset = snapped_sample - seam_offset_samples
     snapped_sec = seam_sec + offset / sr
 
     return SeamAnalysis(
@@ -238,19 +245,27 @@ def detect_clicks(
 ) -> list[dict]:
     """Find suspicious sample-to-sample jumps in a rendered output.
 
-    Returns one record per click candidate: ``{position_sec, delta, near_seam}``.
-    Where ``near_seam`` is True if the click is within ``window_ms`` of any
-    listed expected seam — useful for verifying that a particular seam is
-    click-free without flagging genuine percussive content as a false positive.
+    The metric is the absolute value of the *signed* sample diff — clicks
+    show up as a sudden swing in amplitude, e.g. +0.5 → -0.5 is a 1.0 delta
+    that ``abs(audio)`` then ``diff`` would silently miss (|0.5|-|−0.5|=0).
+    For stereo we take the per-channel max so a click on either channel is
+    flagged.
+
+    Returns one record per click candidate:
+    ``{position_sec, delta, near_seam}``. ``near_seam`` is True if the click
+    sits within ``window_ms`` of any listed expected seam.
     """
-    if audio.ndim == 2:
-        # Per-channel max delta, then take the louder side.
-        mono = np.max(np.abs(audio), axis=1)
-    else:
-        mono = np.abs(audio)
-    if mono.size < 2:
+    if audio.size < 2:
         return []
-    diffs = np.abs(np.diff(mono))
+    if audio.ndim == 2:
+        # Per-channel signed diff first, then take the largest absolute swing
+        # across channels at each sample.
+        per_chan = np.abs(np.diff(audio, axis=0))
+        diffs = np.max(per_chan, axis=1)
+    else:
+        diffs = np.abs(np.diff(audio))
+    if diffs.size == 0:
+        return []
     candidates = np.where(diffs > delta_threshold)[0]
     win = int(window_ms * sr / 1000)
     out: list[dict] = []

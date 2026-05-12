@@ -425,19 +425,26 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
         ("fixed_10ms", {"crossfade_ms": 10.0, "seam_analysis": False}),
         ("seam_aware", {"crossfade_ms": 50.0, "seam_analysis": True}),
     ]
-    # Expected seam timestamps in OUTPUT space: each cut produces one seam at
-    # the cumulative-kept time up to that delete. We pre-compute them in
-    # source-keep order from the merged delete list.
+    # Expected seam timestamps in OUTPUT space, by variant. With a crossfade
+    # of length X the output shortens by X per seam, so the seam centers shift
+    # cumulatively earlier compared to a hard splice. ``_seam_times`` computes
+    # the OUTPUT-time center of each seam given the per-seam xfade vector.
     from .edit import keep_ranges_from_deletes
     keeps = keep_ranges_from_deletes(info.duration_sec, ranges)
-    expected_seams_sec = []
-    cursor = 0.0
-    for s, e in keeps[:-1]:
-        cursor += e - s
-        expected_seams_sec.append(cursor)
+
+    def _seam_times(per_seam_xfade_ms: list[float]) -> list[float]:
+        out: list[float] = []
+        cursor = 0.0
+        for i in range(len(keeps) - 1):
+            xs = per_seam_xfade_ms[i] / 1000.0 if i < len(per_seam_xfade_ms) else 0.0
+            keep_len = keeps[i][1] - keeps[i][0]
+            cursor += keep_len - xs / 2.0  # seam center sits inside the xfade region
+            out.append(cursor)
+            cursor += xs / 2.0  # second half of the xfade lives in the next keep
+        return out
 
     console.print(f"[bold]Source[/bold]: {audio.name}  ({info.duration_sec:.1f}s)  "
-                  f"{len(ranges)} deletes → {len(keeps)} keep ranges, {len(expected_seams_sec)} seam(s)")
+                  f"{len(ranges)} deletes → {len(keeps)} keep ranges, {len(keeps) - 1} seam(s)")
 
     summary: list[dict] = []
     for name, kwargs in variants:
@@ -459,32 +466,45 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
         import soundfile as sf
         audio_out, sr_out = sf.read(str(out_path), dtype="float32", always_2d=False)
         from .seam_eval import detect_clicks
-        clicks = detect_clicks(audio_out, sr_out, expected_seams_sec=expected_seams_sec,
-                               delta_threshold=click_threshold)
+        # Per-variant expected seam centers — crossfade pulls them earlier.
+        per_seam_xfade = result.seam_xfades_ms or ([result.crossfade_ms] * (len(keeps) - 1))
+        seam_times = _seam_times(per_seam_xfade)
+        # Lengthen the near-seam window enough to cover the xfade region itself
+        # plus a few ms of slack (default detect_clicks window_ms=5).
+        near_seam_window_ms = max(5.0, (max(per_seam_xfade) if per_seam_xfade else 0.0) + 5.0)
+        clicks = detect_clicks(
+            audio_out, sr_out, expected_seams_sec=seam_times,
+            delta_threshold=click_threshold, window_ms=near_seam_window_ms,
+        )
         near_seam = sum(1 for c in clicks if c["near_seam"])
         max_delta = max((c["delta"] for c in clicks), default=0.0)
+        max_delta_near_seam = max((c["delta"] for c in clicks if c["near_seam"]), default=0.0)
 
         summary.append({
             "variant": name,
             "wall_sec": wall,
             "duration_out": result.duration_out,
             "max_xfade_ms": result.crossfade_ms,
+            "seam_xfades_ms": per_seam_xfade,
+            "seam_times_sec": seam_times,
+            "near_seam_window_ms": near_seam_window_ms,
             "clicks_total": len(clicks),
             "clicks_near_seam": near_seam,
             "max_click_delta": max_delta,
+            "max_click_delta_near_seam": max_delta_near_seam,
+            "seam_analyses": result.seam_analyses,
         })
         console.print(
             f"  [green]✓[/green] {name:11s} wall {wall:5.1f}s  "
             f"dur {result.duration_out:7.2f}s  "
-            f"clicks {len(clicks):3d} ({near_seam} near seams)  "
-            f"max Δ {max_delta:.3f}  "
-            f"→ {out_path}"
+            f"clicks {len(clicks):3d} ({near_seam} near seams, max-near Δ {max_delta_near_seam:.3f})  "
+            f"max Δ {max_delta:.3f}"
         )
 
     summary_path = out_dir / f"{stem}.eval_summary.json"
     summary_path.write_text(json.dumps({
         "audio": str(audio), "deletes": [{"start": s, "end": e} for s, e in ranges],
-        "expected_seams_sec": expected_seams_sec, "click_threshold": click_threshold,
+        "click_threshold": click_threshold,
         "variants": summary,
     }, ensure_ascii=False, indent=2))
     console.print(f"[dim]Summary: {summary_path}[/dim]")
