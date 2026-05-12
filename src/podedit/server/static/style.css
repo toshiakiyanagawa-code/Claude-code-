@@ -164,24 +164,24 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 .library-preset-row select:hover { border-color: var(--accent); }
 .library-preset-hint { font-size: 11px; color: var(--muted); flex: 1; }
-.library-path-form {
-  display: flex; align-items: center; gap: 8px;
-  margin: 0 0 8px;
+.library-upload-row {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0 0 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
 }
-.library-path-form label { font-size: 12px; color: var(--muted); }
-.library-path-form input {
-  flex: 1; min-width: 0;
-  background: #10131a; color: var(--text); border: 1px solid var(--border);
-  border-radius: 4px; padding: 6px 8px; font-size: 12px;
-  font-family: ui-monospace, monospace;
+.library-upload-row button {
+  background: var(--accent); color: #0f1115; border: 0;
+  padding: 6px 14px; border-radius: 4px; cursor: pointer;
+  font-size: 12px; font-family: inherit; font-weight: 600;
 }
-.library-path-form button,
+.library-upload-row button:hover:not(:disabled) { filter: brightness(1.08); }
+.library-upload-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.library-upload-hint { font-size: 11px; color: var(--muted); flex: 1; }
 .library-breadcrumbs button {
   background: #232735; color: var(--text); border: 1px solid var(--border);
   border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit;
 }
-.library-path-form button { padding: 6px 10px; }
-.library-path-form button:hover,
 .library-breadcrumbs button:hover { border-color: var(--accent); background: #2b303f; }
 .library-breadcrumbs {
   display: flex; align-items: center; gap: 4px; flex-wrap: wrap;

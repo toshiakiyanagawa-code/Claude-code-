@@ -34,8 +34,9 @@
   const $libraryStatus = $('library-status');
   const $libraryDirHint = $('library-dir-hint');
   const $libraryCurrentPath = $('library-current-path');
-  const $libraryPathForm = $('library-path-form');
-  const $libraryPathInput = $('library-path-input');
+  const $btnLibraryUpload = $('btn-library-upload');
+  const $libraryFileInput = $('library-file-input');
+  const $libraryUploadHint = $('library-upload-hint');
   const $libraryBreadcrumbs = $('library-breadcrumbs');
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
@@ -1957,7 +1958,6 @@
       $libraryList.innerHTML = '';
       $libraryDirHint.textContent = 'checking...';
       if ($libraryCurrentPath) $libraryCurrentPath.textContent = 'checking...';
-      if ($libraryPathInput) $libraryPathInput.value = '';
       if ($libraryBreadcrumbs) $libraryBreadcrumbs.innerHTML = '';
       libraryBrowsePath = null;
       libraryBrowseMode = false;
@@ -2080,7 +2080,6 @@
     console.log('[podedit] populateLibrary start', { entries: entries.length, libraryDir, currentPath, active });
     $libraryDirHint.textContent = libraryDir;
     if ($libraryCurrentPath) $libraryCurrentPath.textContent = currentPath;
-    if ($libraryPathInput) $libraryPathInput.value = currentPath;
     renderLibraryBreadcrumbs(currentPath);
     $libraryList.innerHTML = '';
     if (!entries.length && !parentPath) {
@@ -2410,13 +2409,44 @@
       librarySwitching = false;
     }
   }
+  async function uploadFileToLibrary(file) {
+    const maxBytes = 500 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      setLibraryStatus(`File too large: ${(file.size / 1024 / 1024).toFixed(1)} MB (max 500 MB)`);
+      return;
+    }
+    $btnLibraryUpload.disabled = true;
+    const prev = $btnLibraryUpload.textContent;
+    $btnLibraryUpload.textContent = `uploading ${file.name}…`;
+    try {
+      const form = new FormData();
+      form.append('file', file, file.name);
+      const r = await fetch('/api/library/upload', { method: 'POST', body: form });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      }
+      const reply = await r.json();
+      logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
+      const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
+      await navigateLibraryTo(uploadsDir);
+      setLibraryStatus(`Uploaded ${reply.basename}. Click Transcribe to process.`);
+    } catch (e) {
+      setLibraryStatus(`Upload failed: ${e.message}`);
+    } finally {
+      $btnLibraryUpload.disabled = false;
+      $btnLibraryUpload.textContent = prev;
+    }
+  }
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
-  if ($libraryPathForm) {
-    $libraryPathForm.addEventListener('submit', (ev) => {
-      ev.preventDefault();
-      const path = $libraryPathInput ? $libraryPathInput.value.trim() : '';
-      if (path) navigateLibraryTo(path);
+  if ($btnLibraryUpload && $libraryFileInput) {
+    $btnLibraryUpload.addEventListener('click', () => $libraryFileInput.click());
+    $libraryFileInput.addEventListener('change', async () => {
+      const f = $libraryFileInput.files && $libraryFileInput.files[0];
+      if (!f) return;
+      await uploadFileToLibrary(f);
+      $libraryFileInput.value = '';
     });
   }
   $libraryModal.addEventListener('click', (ev) => {

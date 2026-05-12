@@ -69,11 +69,11 @@
         </span>
       </div>
       <div id="library-status" class="status">Loading library…</div>
-      <form id="library-path-form" class="library-path-form">
-        <label for="library-path-input">Path</label>
-        <input id="library-path-input" type="text" autocomplete="off" spellcheck="false" />
-        <button id="library-path-go" type="submit">Go</button>
-      </form>
+      <div class="library-upload-row">
+        <button id="btn-library-upload" type="button" title="Upload an audio file from your computer">PC からファイルを選択</button>
+        <span class="library-upload-hint" id="library-upload-hint">最大 500 MB · m4a/mp3/wav/flac/aac/ogg/opus/mp4</span>
+      </div>
+      <input id="library-file-input" type="file" accept="audio/*,.m4a,.mp3,.wav,.flac,.aac,.ogg,.opus,.mp4" hidden />
       <div id="library-breadcrumbs" class="library-breadcrumbs" aria-label="Current path"></div>
       <ul id="library-list" class="library-list"></ul>
       <div class="library-hint">

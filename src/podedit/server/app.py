@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -818,6 +818,141 @@ def create_app(config: ServeConfig) -> FastAPI:
         payload["active"] = state.audio_path.name
         payload["active_path"] = str(state.audio_path.resolve())
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    def _multipart_boundary(content_type: str) -> bytes:
+        match = re.search(r'(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))', content_type)
+        if not match:
+            raise HTTPException(status_code=400, detail="multipart boundary is required")
+        boundary = (match.group(1) or match.group(2) or "").strip()
+        if not boundary:
+            raise HTTPException(status_code=400, detail="multipart boundary is required")
+        return ("--" + boundary).encode("ascii", "strict")
+
+    def _filename_from_multipart_headers(header_bytes: bytes) -> str:
+        try:
+            header_text = header_bytes.decode("latin1")
+        except UnicodeDecodeError as e:
+            raise HTTPException(status_code=400, detail="invalid multipart headers") from e
+        disposition = ""
+        for line in header_text.split("\r\n")[1:]:
+            if line.lower().startswith("content-disposition:"):
+                disposition = line
+                break
+        name_match = re.search(r'(?:^|;)\s*name="([^"]*)"', disposition)
+        if not name_match or name_match.group(1) != "file":
+            raise HTTPException(status_code=400, detail="multipart field must be named 'file'")
+        filename_match = re.search(r'(?:^|;)\s*filename="([^"]*)"', disposition)
+        if not filename_match:
+            raise HTTPException(status_code=400, detail="multipart file filename is required")
+        return filename_match.group(1)
+
+    def _validate_upload_basename(filename: str) -> str:
+        raw_filename = (filename or "").strip()
+        basename = os.path.basename(raw_filename)
+        if (
+            not raw_filename
+            or basename != raw_filename
+            or "/" in raw_filename
+            or "\\" in raw_filename
+            or raw_filename.startswith(".")
+            or ".." in raw_filename
+        ):
+            raise HTTPException(status_code=400, detail="filename must be a plain non-hidden basename")
+        if Path(basename).suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {Path(basename).suffix!r}")
+        return basename
+
+    @app.post("/api/library/upload")
+    async def library_upload(request: Request) -> JSONResponse:
+        max_bytes = 500 * 1024 * 1024
+        boundary = _multipart_boundary(request.headers.get("content-type", ""))
+        marker = b"\r\n" + boundary
+        keep_bytes = len(marker) + 4  # boundary plus possible "--\r\n"
+
+        stream = request.stream().__aiter__()
+        header_buffer = b""
+        while b"\r\n\r\n" not in header_buffer:
+            try:
+                chunk = await stream.__anext__()
+            except StopAsyncIteration as e:
+                raise HTTPException(status_code=400, detail="multipart body is empty") from e
+            header_buffer += chunk
+            if len(header_buffer) > 64 * 1024 and b"\r\n\r\n" not in header_buffer:
+                raise HTTPException(status_code=400, detail="multipart headers too large")
+
+        header_bytes, file_buffer = header_buffer.split(b"\r\n\r\n", 1)
+        if not header_bytes.startswith(boundary + b"\r\n"):
+            raise HTTPException(status_code=400, detail="multipart file part is required")
+        basename = _validate_upload_basename(_filename_from_multipart_headers(header_bytes))
+        uploads_dir = state.work_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        final_path = uploads_dir / basename
+        tmp_path: str | None = None
+        total = 0
+        pending = b""
+        found_boundary = False
+
+        def write_capped(dst, data: bytes) -> None:
+            nonlocal total
+            if not data:
+                return
+            total += len(data)
+            if total > max_bytes:
+                raise HTTPException(status_code=413, detail="upload exceeds 500 MB limit")
+            dst.write(data)
+
+        def consume(dst, data: bytes) -> None:
+            nonlocal pending, found_boundary
+            if found_boundary:
+                return
+            combined = pending + data
+            idx = combined.find(marker)
+            if idx >= 0:
+                write_capped(dst, combined[:idx])
+                pending = b""
+                found_boundary = True
+                return
+            if len(combined) > keep_bytes:
+                write_capped(dst, combined[:-keep_bytes])
+                pending = combined[-keep_bytes:]
+            else:
+                pending = combined
+
+        try:
+            with tempfile.NamedTemporaryFile(dir=uploads_dir, delete=False) as tmp:
+                tmp_path = tmp.name
+                consume(tmp, file_buffer)
+                while not found_boundary:
+                    try:
+                        chunk = await stream.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    consume(tmp, chunk)
+                if not found_boundary:
+                    raise HTTPException(status_code=400, detail="multipart closing boundary not found")
+            try:
+                os.link(tmp_path, final_path)
+            except FileExistsError as e:
+                raise HTTPException(status_code=409, detail=f"{basename!r} already exists in uploads") from e
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.uploaded",
+            "basename": basename,
+            "bytes": total,
+        })
+        return JSONResponse({
+            "ok": True,
+            "path": str(final_path),
+            "basename": basename,
+            "bytes": total,
+        }, headers={"Cache-Control": "no-store"})
 
     def _audio_from_library_request(body: dict, *, require_string_name: bool = False) -> tuple[Path, str]:
         body = body or {}
