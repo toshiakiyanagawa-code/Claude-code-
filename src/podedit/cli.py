@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -98,6 +99,7 @@ def transcribe_cmd(
             _fatal(f"ffmpeg resample failed: {e}")
     total_wall += rec_ff["wall_sec"]
 
+    asr_t0 = time.perf_counter()
     with measure("asr_transcribe", bench_log, extra={**bench_extra, "stage": "asr_transcribe"}) as rec_asr:
         try:
             tx, gen = transcribe(info, asr_wav, cfg)
@@ -117,12 +119,12 @@ def transcribe_cmd(
             raise
         rec_asr["extra"]["segments"] = len(tx.segments)
         rec_asr["extra"]["word_count"] = sum(len(s.words) for s in tx.segments)
-    total_wall += rec_asr["wall_sec"]
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(tx.to_dict(), ensure_ascii=False, indent=2))
-    rec_asr["extra"]["transcript_bytes"] = out_path.stat().st_size
-    rec_asr["extra"]["total_wall_sec"] = total_wall
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(tx.to_dict(), ensure_ascii=False, indent=2))
+        rec_asr["extra"]["transcript_path"] = str(out_path)
+        rec_asr["extra"]["transcript_bytes"] = out_path.stat().st_size
+        rec_asr["extra"]["total_wall_sec"] = rec_ff["wall_sec"] + (time.perf_counter() - asr_t0)
+    total_wall = rec_asr["extra"]["total_wall_sec"]
 
     rtf = rec_asr["wall_sec"] / max(info.duration_sec, 1e-6)
     console.print(
