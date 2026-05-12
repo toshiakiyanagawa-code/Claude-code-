@@ -25,6 +25,12 @@
   const $timeDuration = $('time-duration');
   const $scrubber = $('scrubber');
   const $btnAudition = $('btn-audition');
+  const $btnOpen = $('btn-open');
+  const $libraryModal = $('library-modal');
+  const $libraryList = $('library-list');
+  const $libraryStatus = $('library-status');
+  const $libraryDirHint = $('library-dir-hint');
+  const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
 
@@ -1447,12 +1453,28 @@
       return;
     }
     if (e.key === 'Escape') {
+      if (libraryOpen) {
+        e.preventDefault();
+        hideLibraryModal();
+        return;
+      }
       if (moveDrag) {
         e.preventDefault();
         cancelMoveDrag();
         return;
       }
       clearSelection();
+      return;
+    }
+    if (e.key === 'o' || e.key === 'O') {
+      // Plain 'o' opens the library modal — no modifier, so we still get it
+      // while a selection is active. Skip if a real input is focused so the
+      // user can type literal 'o' anywhere that exists in the future.
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+      if (mod) return;  // don't grab Ctrl+O / Cmd+O — those are browser shortcuts
+      e.preventDefault();
+      showLibraryModal();
       return;
     }
     if (e.key === ' ' || e.code === 'Space') {
@@ -1476,6 +1498,102 @@
       e.preventDefault();
       e.returnValue = '';
     }
+  });
+
+  // ------- library / open-file dialog (W7.6) -------
+  // The server can swap which (audio, transcript, session) it's serving in
+  // place. We just POST the chosen filename and then full-page-reload so
+  // every cached resource (transcript, waveform, audio) re-fetches against
+  // the new state. Page reload also gives us the existing beforeunload
+  // unsaved-work warning for free.
+  let libraryOpen = false;
+  let librarySwitching = false;
+  function showLibraryModal() {
+    if (libraryOpen) return;
+    libraryOpen = true;
+    $libraryModal.hidden = false;
+    $libraryList.innerHTML = '';
+    $libraryStatus.textContent = 'Loading library…';
+    $libraryStatus.hidden = false;
+    fetchJSON('/api/library')
+      .then((data) => populateLibrary(data))
+      .catch((e) => {
+        $libraryStatus.textContent = `Failed to load library: ${e.message}`;
+      });
+  }
+  function hideLibraryModal() {
+    if (!libraryOpen) return;
+    libraryOpen = false;
+    $libraryModal.hidden = true;
+  }
+  function populateLibrary(data) {
+    $libraryStatus.hidden = true;
+    $libraryDirHint.textContent = data.library_dir || '—';
+    $libraryList.innerHTML = '';
+    const active = data.active || '';
+    if (!data.entries.length) {
+      $libraryStatus.textContent = `No audio files found in ${data.library_dir}.`;
+      $libraryStatus.hidden = false;
+      return;
+    }
+    for (const e of data.entries) {
+      const li = document.createElement('li');
+      const isActive = e.name === active;
+      const selectable = e.has_transcript && !isActive;
+      li.className = [
+        selectable ? 'selectable' : 'disabled',
+        isActive ? 'active' : '',
+      ].filter(Boolean).join(' ');
+      const name = document.createElement('span');
+      name.className = 'library-name';
+      name.textContent = e.name;
+      const meta = document.createElement('span');
+      meta.className = 'library-meta';
+      const dur = e.duration_sec != null
+        ? `${Math.floor(e.duration_sec / 60)}:${String(Math.round(e.duration_sec) % 60).padStart(2, '0')}`
+        : '—';
+      const tBadge = e.has_transcript
+        ? '<span class="badge ok">transcript</span>'
+        : '<span class="badge missing">no transcript</span>';
+      const sBadge = e.has_session ? '<span class="badge session">session</span>' : '';
+      const activeBadge = isActive ? '<span class="badge ok">active</span>' : '';
+      meta.innerHTML = `${dur}${tBadge}${sBadge}${activeBadge}`;
+      li.append(name, meta);
+      if (selectable) {
+        li.addEventListener('click', () => selectLibraryEntry(e.name));
+      }
+      $libraryList.appendChild(li);
+    }
+  }
+  async function selectLibraryEntry(name) {
+    if (librarySwitching) return;
+    librarySwitching = true;
+    $libraryStatus.textContent = `Switching to ${name}…`;
+    $libraryStatus.hidden = false;
+    try {
+      const r = await fetch('/api/library/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status} ${text.slice(0, 200)}`);
+      }
+      logKPI('ui.library.selected', { name });
+      // The page reload picks up the new transcript / waveform / audio.
+      // beforeunload above will warn if there's unsaved work.
+      window.location.reload();
+    } catch (e) {
+      $libraryStatus.textContent = `Could not switch: ${e.message}`;
+      librarySwitching = false;
+    }
+  }
+  $btnOpen.addEventListener('click', showLibraryModal);
+  $btnLibraryClose.addEventListener('click', hideLibraryModal);
+  $libraryModal.addEventListener('click', (ev) => {
+    // click on the dim backdrop closes; clicks inside the panel don't bubble
+    if (ev.target === $libraryModal) hideLibraryModal();
   });
 
   // ------- initial paint -------

@@ -23,6 +23,7 @@
 </header>
 
 <div class="toolbar">
+  <button id="btn-open" title="Switch to a different audio file (O)">Open <kbd>O</kbd></button>
   <button id="btn-delete" disabled title="Delete selected range (D)">Delete <kbd>D</kbd></button>
   <button id="btn-undo" disabled title="Undo (⌘Z)">Undo <kbd>⌘Z</kbd></button>
   <button id="btn-redo" disabled title="Redo (⌘⇧Z)">Redo <kbd>⌘⇧Z</kbd></button>
@@ -41,6 +42,24 @@
 </div>
 
 <main id="transcript"><div class="status">Loading transcript…</div></main>
+
+<!-- Open-file modal. Hidden until the user clicks the toolbar button. -->
+<div id="library-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="library-title">
+    <div class="modal-header">
+      <h2 id="library-title">Open audio</h2>
+      <button id="btn-library-close" class="modal-close" title="Close (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="library-status" class="status">Loading library…</div>
+      <ul id="library-list" class="library-list"></ul>
+      <div class="library-hint">
+        Scanned from <code id="library-dir-hint">—</code>. Files without a
+        transcript need <code>podedit transcribe</code> first.
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="/app.js"></script>
 </body>

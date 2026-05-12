@@ -544,6 +544,11 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
                    "Default: <audio.stem>.session.json next to the transcript.")
 @click.option("--kpi-log", type=click.Path(path_type=Path), default=None,
               help="JSONL path for KPI events. Default: <audio.stem>.kpi.jsonl next to the transcript.")
+@click.option("--library-dir", type=click.Path(path_type=Path), default=None,
+              help="Directory the UI's Open dialog scans for switchable audio files. "
+                   "Defaults to the parent dir of --audio.")
+@click.option("--work-dir", type=click.Path(path_type=Path), default=None,
+              help="Directory holding transcripts and sessions. Defaults to the parent dir of --transcript.")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, show_default=True, type=int)
 def serve_cmd(
@@ -551,6 +556,8 @@ def serve_cmd(
     transcript: Path,
     session_path: Path | None,
     kpi_log: Path | None,
+    library_dir: Path | None,
+    work_dir: Path | None,
     host: str,
     port: int,
 ) -> None:
@@ -568,6 +575,8 @@ def serve_cmd(
             transcript_path=transcript,
             session_path=session_path,
             kpi_log_path=kpi_log,
+            library_dir=library_dir,
+            work_dir=work_dir,
         ))
     except AudioTranscriptMismatch as e:
         _fatal(str(e))

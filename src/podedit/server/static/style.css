@@ -95,6 +95,55 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   border: 1px solid var(--border);
 }
 
+/* ----- Open-file modal (W7.6) ----- */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.modal {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  width: 100%; max-width: 640px; max-height: 80vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+}
+.modal-header h2 { font-size: 15px; font-weight: 600; margin: 0; }
+.modal-close {
+  background: transparent; color: var(--muted); border: 0;
+  font-size: 22px; cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 12px 18px 18px; overflow-y: auto; }
+.library-list { list-style: none; padding: 0; margin: 0; }
+.library-list li {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-radius: 5px; cursor: pointer;
+  border: 1px solid transparent;
+}
+.library-list li.selectable:hover { background: var(--hover-bg); border-color: var(--border); }
+.library-list li.active { border-color: var(--accent); background: #1a2a3d; }
+.library-list li.disabled { color: var(--muted); cursor: not-allowed; opacity: 0.7; }
+.library-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px; }
+.library-meta { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.library-meta .badge {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  border-radius: 3px; background: #1a1d28;
+}
+.library-meta .badge.ok { color: var(--green); }
+.library-meta .badge.missing { color: var(--amber); }
+.library-meta .badge.session { color: var(--accent); }
+.library-hint { font-size: 11px; color: var(--muted); margin-top: 12px; }
+.library-hint code {
+  background: #1a1d28; padding: 1px 4px; border-radius: 3px;
+  font-family: ui-monospace, monospace;
+}
+
 main {
   padding: 16px 20px; max-width: 920px; width: 100%; margin: 0 auto;
   line-height: 2; flex: 1; overflow-y: auto;

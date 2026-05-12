@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..audio import probe as audio_probe
 from ..edit import EditSession, compile_timeline, sha256_of_file
+from ..library import scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
 from ..waveform import WaveformError, get_or_compute_waveform
@@ -50,6 +51,70 @@ class ServeConfig:
     transcript_path: Path
     session_path: Path  # JSON; auto-loaded if exists, auto-saved on UI changes
     kpi_log_path: Path  # JSONL; one line per UI event
+    library_dir: Path | None = None  # parent dir for the library file picker; defaults to audio_path's parent
+    work_dir: Path | None = None  # parent dir for transcripts/sessions; defaults to session_path's parent
+
+
+class ServeState:
+    """Mutable bundle of "what we're currently serving" state.
+
+    Created at startup from the bootstrap ``ServeConfig`` and then mutated by
+    ``POST /api/library/select`` when the user switches files in the UI. All
+    route handlers read from ``state``; ``ServeConfig`` is only the bootstrap.
+    """
+
+    def __init__(self, config: ServeConfig) -> None:
+        self.library_dir: Path = (config.library_dir or config.audio_path.parent).resolve()
+        self.work_dir: Path = (config.work_dir or config.session_path.parent).resolve()
+        # All these get filled in by load_active() below.
+        self.audio_path: Path = config.audio_path
+        self.transcript_path: Path = config.transcript_path
+        self.session_path: Path = config.session_path
+        self.kpi_log_path: Path = config.kpi_log_path
+        self.serve_audio_path: Path = config.audio_path
+        self.transcript_data: dict = {}
+        self.session: EditSession | None = None
+        self.session_lock = Lock()
+
+    def serve_audio_tag(self) -> str:
+        st = self.serve_audio_path.stat()
+        return f"{int(st.st_mtime)}-{st.st_size}"
+
+    def load_active(self, audio_path: Path, transcript_path: Path) -> None:
+        """Switch the active (audio, transcript, session) triple. Validates fully."""
+        if not audio_path.exists():
+            raise FileNotFoundError(f"audio not found: {audio_path}")
+        if not transcript_path.exists():
+            raise FileNotFoundError(f"transcript not found: {transcript_path}")
+        transcript_data = json.loads(transcript_path.read_text())
+        _validate_audio_matches_transcript(audio_path, transcript_data)
+
+        # Faststart-remux m4a if moov sits at the tail, same trick we use at boot.
+        serve_audio_path = audio_path
+        if audio_path.suffix.lower() in (".m4a", ".mp4", ".mov") and _moov_atom_position(audio_path) == "tail":
+            cached = self.work_dir / f"{audio_path.stem}.faststart{audio_path.suffix}"
+            serve_audio_path = _ensure_faststart(audio_path, cached)
+
+        session_path = self.work_dir / f"{audio_path.stem}.session.json"
+        kpi_log_path = self.work_dir / f"{audio_path.stem}.kpi.jsonl"
+        if session_path.exists():
+            session = EditSession.from_dict(json.loads(session_path.read_text()))
+        else:
+            session = EditSession.new(
+                source_audio=_source_audio_ref_from_transcript(transcript_data, audio_path),
+                transcript_ref=str(transcript_path),
+            )
+
+        # Under the session lock so a concurrent autosave POST can't trip over a
+        # half-switched state.
+        with self.session_lock:
+            self.audio_path = audio_path
+            self.transcript_path = transcript_path
+            self.session_path = session_path
+            self.kpi_log_path = kpi_log_path
+            self.serve_audio_path = serve_audio_path
+            self.transcript_data = transcript_data
+            self.session = session
 
 
 def _validate_audio_matches_transcript(audio_path: Path, transcript_data: dict) -> None:
@@ -165,35 +230,11 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def create_app(config: ServeConfig) -> FastAPI:
-    if not config.audio_path.exists():
-        raise FileNotFoundError(f"audio not found: {config.audio_path}")
-    if not config.transcript_path.exists():
-        raise FileNotFoundError(f"transcript not found: {config.transcript_path}")
-
-    transcript_data = json.loads(config.transcript_path.read_text())
-    _validate_audio_matches_transcript(config.audio_path, transcript_data)
-
-    # If we're serving an m4a/mp4 with moov-atom-at-tail, the browser can't
-    # respond to JS-driven currentTime seeks until the whole file is downloaded,
-    # which breaks W4's preview-skip. Remux a faststart-ordered copy once and
-    # serve that instead. Cached in the same dir as the session file.
-    serve_audio_path = config.audio_path
-    if config.audio_path.suffix.lower() in (".m4a", ".mp4", ".mov") and \
-            _moov_atom_position(config.audio_path) == "tail":
-        cached = config.session_path.parent / f"{config.audio_path.stem}.faststart{config.audio_path.suffix}"
-        serve_audio_path = _ensure_faststart(config.audio_path, cached)
-
-    # Load or create the EditSession we'll mutate via POSTs.
-    if config.session_path.exists():
-        session = EditSession.from_dict(json.loads(config.session_path.read_text()))
-    else:
-        session = EditSession.new(
-            source_audio=_source_audio_ref_from_transcript(transcript_data, config.audio_path),
-            transcript_ref=str(config.transcript_path),
-        )
-
-    # Hold the session under a lock so concurrent autosave POSTs don't interleave.
-    session_lock = Lock()
+    state = ServeState(config)
+    state.load_active(config.audio_path, config.transcript_path)
+    # ``state.session_path`` and friends may differ from ``config.*`` after
+    # load_active() because we always derive them from the work_dir + audio
+    # stem now. The bootstrap config still pins down library_dir / work_dir.
 
     app = FastAPI(title="podedit", docs_url="/api/docs", redoc_url=None)
 
@@ -203,45 +244,38 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/transcript")
     def transcript() -> JSONResponse:
-        return JSONResponse(transcript_data)
-
-    # Cache-buster: changes when the served-audio file changes (e.g. after we
-    # generate a new faststart-remux). Used by the UI in the audio <src>.
-    serve_audio_tag = f"{int(serve_audio_path.stat().st_mtime)}-{serve_audio_path.stat().st_size}"
+        return JSONResponse(state.transcript_data)
 
     @app.get("/api/audio/info")
     def audio_info() -> dict:
-        src = transcript_data.get("source_audio") or {}
+        src = state.transcript_data.get("source_audio") or {}
         return {
-            "name": Path(src.get("path", str(config.audio_path))).name,
+            "name": Path(src.get("path", str(state.audio_path))).name,
             "duration_sec": src.get("duration_sec"),
             "sample_rate": src.get("sample_rate"),
             "channels": src.get("channels"),
             "codec": src.get("codec"),
-            "url": f"/api/audio?v={serve_audio_tag}",
-            "serve_audio_filename": serve_audio_path.name,
-            "serve_audio_bytes": serve_audio_path.stat().st_size,
+            "url": f"/api/audio?v={state.serve_audio_tag()}",
+            "serve_audio_filename": state.serve_audio_path.name,
+            "serve_audio_bytes": state.serve_audio_path.stat().st_size,
         }
 
     @app.get("/api/audio")
     def audio() -> FileResponse:
-        media_type = _guess_media_type(serve_audio_path)
-        # no-store: the audio file changes when we re-remux (e.g. different
-        # faststart). Combined with the ?v=<tag> query in /api/audio/info, this
-        # guarantees the browser fetches the current file after any change.
+        media_type = _guess_media_type(state.serve_audio_path)
         return FileResponse(
-            serve_audio_path, media_type=media_type, filename=serve_audio_path.name,
+            state.serve_audio_path, media_type=media_type, filename=state.serve_audio_path.name,
             headers={"Cache-Control": "no-store"},
         )
 
     @app.get("/api/session")
     def get_session() -> dict:
-        with session_lock:
-            return session.to_dict()
+        with state.session_lock:
+            return state.session.to_dict()
 
     @app.put("/api/session")
     def put_session(body: dict) -> dict:
-        nonlocal session
+        # Mutations go through state.session via the lock; no nonlocal needed.
         try:
             new_session = EditSession.from_dict(body)
         except (KeyError, ValueError) as e:
@@ -255,7 +289,7 @@ def create_app(config: ServeConfig) -> FastAPI:
                 status_code=400,
                 detail=f"timeline_basis must be 'source_audio_seconds', got {new_session.timeline_basis!r}",
             )
-        expected_src = transcript_data.get("source_audio") or {}
+        expected_src = state.transcript_data.get("source_audio") or {}
         expected_sha = expected_src.get("sha256")
         actual_sha = new_session.source_audio.sha256
         if expected_sha and actual_sha and expected_sha != actual_sha:
@@ -294,18 +328,18 @@ def create_app(config: ServeConfig) -> FastAPI:
                         ),
                     )
 
-        with session_lock:
-            session = new_session
+        with state.session_lock:
+            state.session = new_session
             _atomic_write_text(
-                config.session_path,
-                json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
+                state.session_path,
+                json.dumps(state.session.to_dict(), ensure_ascii=False, indent=2),
             )
-        return {"saved_at": time.time(), "path": str(config.session_path), "ops": len(session.ops)}
+        return {"saved_at": time.time(), "path": str(state.session_path), "ops": len(state.session.ops)}
 
     @app.post("/api/kpi/event")
     def post_kpi(event: dict) -> dict:
         record = {"server_ts": time.time(), **event}
-        _append_jsonl(config.kpi_log_path, record)
+        _append_jsonl(state.kpi_log_path, record)
         return {"ok": True}
 
     # ------- preview render (W5) -------
@@ -322,10 +356,10 @@ def create_app(config: ServeConfig) -> FastAPI:
             lufs_target = float(lufs_target)
         true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
 
-        with session_lock:
-            ops_for_render = list(session.ops)
-            ops_blob = session.to_dict().get("ops", [])
-            source_duration = session.source_audio.duration_sec
+        with state.session_lock:
+            ops_for_render = list(state.session.ops)
+            ops_blob = state.session.to_dict().get("ops", [])
+            source_duration = state.session.source_audio.duration_sec
 
         # Cache key covers every parameter that can change the bytes on disk.
         # Including RENDERER_VERSION means a code change automatically
@@ -341,16 +375,16 @@ def create_app(config: ServeConfig) -> FastAPI:
             sort_keys=True,
         ).encode()
         cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
-        preview_path = config.session_path.parent / f"{config.audio_path.stem}.preview.{cache_key}.wav"
+        preview_path = state.work_dir / f"{state.audio_path.stem}.preview.{cache_key}.wav"
 
         cached = preview_path.exists()
         if not cached:
-            _gc_previews(config.session_path.parent, config.audio_path.stem, keep=preview_path)
+            _gc_previews(state.work_dir, state.audio_path.stem, keep=preview_path)
             t0 = time.time()
             try:
                 segments = compile_timeline(source_duration, ops_for_render)
                 result = render_segments(
-                    config.audio_path,
+                    state.audio_path,
                     segments=segments,
                     output=preview_path,
                     source_duration=source_duration,
@@ -361,7 +395,7 @@ def create_app(config: ServeConfig) -> FastAPI:
                 )
             except RenderError as e:
                 raise HTTPException(status_code=500, detail=str(e)) from e
-            _append_jsonl(config.kpi_log_path, {
+            _append_jsonl(state.kpi_log_path, {
                 "server_ts": time.time(), "type": "server.preview.rendered",
                 "cache_key": cache_key, "wall_sec": time.time() - t0,
                 "duration_in": result.duration_in, "duration_out": result.duration_out,
@@ -402,7 +436,7 @@ def create_app(config: ServeConfig) -> FastAPI:
     def preview_audio(cache_key: str) -> FileResponse:
         if not _CACHE_KEY_RE.match(cache_key):
             raise HTTPException(status_code=400, detail="invalid cache key")
-        p = config.session_path.parent / f"{config.audio_path.stem}.preview.{cache_key}.wav"
+        p = state.work_dir / f"{state.audio_path.stem}.preview.{cache_key}.wav"
         if not p.exists():
             raise HTTPException(status_code=404, detail="preview not rendered; POST /api/preview/render first")
         return FileResponse(p, media_type="audio/wav", filename=p.name,
@@ -415,12 +449,58 @@ def create_app(config: ServeConfig) -> FastAPI:
     def waveform(points: int = 4000) -> JSONResponse:
         if points <= 0 or points > 20_000:
             raise HTTPException(status_code=400, detail="points must be in (0, 20000]")
-        cache_path = config.session_path.parent / f"{config.audio_path.stem}.waveform.{points}.json"
+        cache_path = state.work_dir / f"{state.audio_path.stem}.waveform.{points}.json"
         try:
-            wf = get_or_compute_waveform(config.audio_path, cache_path, target_points=points)
+            wf = get_or_compute_waveform(state.audio_path, cache_path, target_points=points)
         except WaveformError as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         return JSONResponse(wf.to_dict())
+
+    # ------- library (W7.6) -------
+    # Lets the UI swap which (audio, transcript, session) triple is being
+    # served without restarting the server. The browser is expected to do a
+    # full page reload after a successful POST so every cached resource
+    # (transcript, waveform, audio) is re-fetched against the new state.
+    @app.get("/api/library")
+    def library() -> dict:
+        entries = scan_library(state.library_dir, state.work_dir)
+        active_name = state.audio_path.name
+        return {
+            "library_dir": str(state.library_dir),
+            "work_dir": str(state.work_dir),
+            "active": active_name,
+            "entries": [e.to_dict() for e in entries],
+        }
+
+    @app.post("/api/library/select")
+    def library_select(body: dict) -> dict:
+        name = (body or {}).get("name")
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
+        candidate_audio = state.library_dir / name
+        if not candidate_audio.exists():
+            raise HTTPException(status_code=404, detail=f"{name!r} not found in library")
+        candidate_transcript = state.work_dir / f"{candidate_audio.stem}.transcript.json"
+        if not candidate_transcript.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"no transcript found for {name!r}; run `podedit transcribe` first",
+            )
+        try:
+            state.load_active(candidate_audio, candidate_transcript)
+        except (FileNotFoundError, AudioTranscriptMismatch) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(), "type": "server.library.selected",
+            "name": name, "audio_path": str(state.audio_path),
+        })
+        return {
+            "ok": True,
+            "active": name,
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+            "session_path": str(state.session_path),
+        }
 
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
