@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -86,6 +88,54 @@ def _source_audio_ref_from_transcript(transcript_data: dict, audio_path: Path) -
     )
 
 
+def _moov_atom_position(path: Path, head_bytes: int = 2 * 1024 * 1024) -> str:
+    """Return 'head', 'tail', or 'none' depending on where the m4a/mp4 moov atom sits.
+
+    A browser <audio> element can't seek reliably inside an m4a until it has the
+    moov atom. When moov is at the tail, seeks (incl. JS ``currentTime = x``)
+    can be silently dropped or deferred until the whole file is downloaded.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            head = f.read(min(head_bytes, size))
+        if b"moov" in head:
+            return "head"
+        if size > head_bytes:
+            with path.open("rb") as f:
+                f.seek(max(0, size - head_bytes))
+                tail = f.read()
+            if b"moov" in tail:
+                return "tail"
+    except OSError:
+        return "none"
+    return "none"
+
+
+def _ensure_faststart(src: Path, dst: Path) -> Path:
+    """Remux ``src`` to ``dst`` with the moov atom at the head (faststart).
+
+    Stream-copies audio/video without re-encoding, so it's effectively a
+    metadata move. Skips work if dst already exists and is newer than src.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found on PATH; cannot faststart-remux audio")
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(src),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(dst),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    return dst
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Atomic file replace: write to a sibling tempfile and rename.
 
@@ -113,6 +163,16 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     transcript_data = json.loads(config.transcript_path.read_text())
     _validate_audio_matches_transcript(config.audio_path, transcript_data)
+
+    # If we're serving an m4a/mp4 with moov-atom-at-tail, the browser can't
+    # respond to JS-driven currentTime seeks until the whole file is downloaded,
+    # which breaks W4's preview-skip. Remux a faststart-ordered copy once and
+    # serve that instead. Cached in the same dir as the session file.
+    serve_audio_path = config.audio_path
+    if config.audio_path.suffix.lower() in (".m4a", ".mp4", ".mov") and \
+            _moov_atom_position(config.audio_path) == "tail":
+        cached = config.session_path.parent / f"{config.audio_path.stem}.faststart{config.audio_path.suffix}"
+        serve_audio_path = _ensure_faststart(config.audio_path, cached)
 
     # Load or create the EditSession we'll mutate via POSTs.
     if config.session_path.exists():
@@ -150,8 +210,8 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/audio")
     def audio() -> FileResponse:
-        media_type = _guess_media_type(config.audio_path)
-        return FileResponse(config.audio_path, media_type=media_type, filename=config.audio_path.name)
+        media_type = _guess_media_type(serve_audio_path)
+        return FileResponse(serve_audio_path, media_type=media_type, filename=serve_audio_path.name)
 
     @app.get("/api/session")
     def get_session() -> dict:
