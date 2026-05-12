@@ -223,9 +223,13 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 
 main {
   padding: 12px 16px; max-width: 920px; width: 100%; margin: 0 auto;
-  line-height: 1.4; flex: 1; overflow-y: auto;
+  /* line-height: 1.4 had ~5px extra gap per line on a 14px font; user
+     asked for ~half that. 1.15 leaves just enough headroom for the
+     selected/active background pills not to visually collide between
+     adjacent rows. */
+  line-height: 1.15; flex: 1; overflow-y: auto;
 }
-.segment { margin-bottom: 7px; padding: 4px 8px; border-radius: 6px; }
+.segment { margin-bottom: 4px; padding: 2px 6px; border-radius: 6px; }
 .segment-deleted {
   border-left: 2px solid rgba(255, 80, 80, 0.45);
   background: rgba(255, 80, 80, 0.05);
@@ -242,7 +246,10 @@ main {
 }
 .word {
   cursor: pointer;
-  padding: 2px 3px;       /* enough vertical pad to keep drag-select forgiving */
+  /* Vertical pad stays at 2px so the selection background reads as a
+     contiguous pill across a run of words; horizontal pad cut to 1px
+     for tight Japanese (no inter-word spaces in source). */
+  padding: 2px 1px;
   margin: 0;
   border-radius: 3px;
   transition: background-color 80ms ease;
