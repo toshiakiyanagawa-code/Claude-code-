@@ -341,16 +341,36 @@ def render_cmd(
               help="Source audio to stream to the UI")
 @click.option("--transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True,
               help="Transcript JSON to render")
+@click.option("--session", "session_path", type=click.Path(path_type=Path), default=None,
+              help="EditSession JSON path. Auto-loaded if exists, auto-saved on UI changes. "
+                   "Default: <audio.stem>.session.json next to the transcript.")
+@click.option("--kpi-log", type=click.Path(path_type=Path), default=None,
+              help="JSONL path for KPI events. Default: <audio.stem>.kpi.jsonl next to the transcript.")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, show_default=True, type=int)
-def serve_cmd(audio: Path, transcript: Path, host: str, port: int) -> None:
+def serve_cmd(
+    audio: Path,
+    transcript: Path,
+    session_path: Path | None,
+    kpi_log: Path | None,
+    host: str,
+    port: int,
+) -> None:
     """Start the local web UI on http://host:port."""
     import uvicorn
 
     from .server.app import AudioTranscriptMismatch, ServeConfig, create_app
 
+    session_path = session_path or transcript.parent / f"{audio.stem}.session.json"
+    kpi_log = kpi_log or transcript.parent / f"{audio.stem}.kpi.jsonl"
+
     try:
-        app = create_app(ServeConfig(audio_path=audio, transcript_path=transcript))
+        app = create_app(ServeConfig(
+            audio_path=audio,
+            transcript_path=transcript,
+            session_path=session_path,
+            kpi_log_path=kpi_log,
+        ))
     except AudioTranscriptMismatch as e:
         _fatal(str(e))
     except FileNotFoundError as e:
@@ -360,6 +380,8 @@ def serve_cmd(audio: Path, transcript: Path, host: str, port: int) -> None:
         f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
         f"at [link]http://{host}:{port}[/link]"
     )
+    console.print(f"  Session: {session_path}  ({'exists' if session_path.exists() else 'will be created'})")
+    console.print(f"  KPI log: {kpi_log}")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
