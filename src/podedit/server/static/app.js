@@ -22,6 +22,7 @@
   const $scrubber = $('scrubber');
   const $btnAudition = $('btn-audition');
   const $modePill = $('mode-pill');
+  const $waveform = $('waveform');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -604,6 +605,7 @@
       }
       activeIdx = idx;
     }
+    paintWaveform();
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -727,6 +729,109 @@
   }
 
   $btnAudition.addEventListener('click', renderAndAudition);
+
+  // ------- waveform (W7) -------
+  // Render the envelope above the scrubber. Playhead + delete-range shading
+  // both repaint on every rAF so they always reflect the live state, but the
+  // (expensive) envelope itself is drawn once into an offscreen canvas so the
+  // per-frame redraw is just a single drawImage call.
+  let waveformData = null;             // {min:[], max:[], duration_sec, step_sec}
+  let waveformBaseCanvas = null;       // pre-rendered envelope
+  let waveformCssWidth = 0;
+  let waveformDevicePixelRatio = 1;
+
+  function buildBaseWaveformCanvas(cssWidth, cssHeight) {
+    if (!waveformData) return;
+    const dpr = window.devicePixelRatio || 1;
+    const off = document.createElement('canvas');
+    off.width = Math.max(1, Math.round(cssWidth * dpr));
+    off.height = Math.max(1, Math.round(cssHeight * dpr));
+    const ctx = off.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#62aeff';
+    ctx.globalAlpha = 0.6;
+    const mid = cssHeight / 2;
+    const n = waveformData.min.length;
+    for (let i = 0; i < n; i++) {
+      const x = (i / n) * cssWidth;
+      const w = Math.max(1, cssWidth / n);
+      const mn = waveformData.min[i];
+      const mx = waveformData.max[i];
+      const top = mid - mx * mid;
+      const bot = mid - mn * mid;
+      ctx.fillRect(x, top, w, Math.max(1, bot - top));
+    }
+    waveformBaseCanvas = off;
+    waveformCssWidth = cssWidth;
+    waveformDevicePixelRatio = dpr;
+  }
+
+  function paintWaveform() {
+    if (!waveformData) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = $waveform.clientWidth;
+    const cssH = $waveform.clientHeight || 48;
+    if ($waveform.width !== Math.round(cssW * dpr) ||
+        $waveform.height !== Math.round(cssH * dpr) ||
+        !waveformBaseCanvas ||
+        waveformCssWidth !== cssW) {
+      $waveform.width = Math.round(cssW * dpr);
+      $waveform.height = Math.round(cssH * dpr);
+      buildBaseWaveformCanvas(cssW, cssH);
+    }
+    const ctx = $waveform.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, $waveform.width, $waveform.height);
+    if (waveformBaseCanvas) ctx.drawImage(waveformBaseCanvas, 0, 0);
+    ctx.scale(dpr, dpr);
+
+    // Shade merged delete ranges so the waveform doubles as a cut overview.
+    // Coordinates are in source-time space; the rendered preview wav has its
+    // cuts baked in so we don't shade there.
+    if (!state.previewMode && state.mergedDeletes.length > 0 && state.sourceDuration > 0) {
+      ctx.fillStyle = 'rgba(255, 80, 80, 0.35)';
+      for (const [s, e] of state.mergedDeletes) {
+        const x = (s / state.sourceDuration) * cssW;
+        const w = ((e - s) / state.sourceDuration) * cssW;
+        ctx.fillRect(x, 0, w, cssH);
+      }
+    }
+
+    // Playhead — uses source time so the line tracks the scrubbable position.
+    const dur = state.previewMode
+      ? (state.previewDuration != null ? state.previewDuration : ($player.duration || 1))
+      : state.sourceDuration;
+    if (dur > 0) {
+      const x = ($player.currentTime / dur) * cssW;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x - 1, 0, 2, cssH);
+    }
+  }
+
+  $waveform.addEventListener('click', (ev) => {
+    if (!waveformData) return;
+    const rect = $waveform.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    const dur = state.previewMode
+      ? (state.previewDuration != null ? state.previewDuration : ($player.duration || 1))
+      : state.sourceDuration;
+    $player.currentTime = frac * dur;
+    const p = $player.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+    logKPI('ui.waveform.seek', { frac, t: $player.currentTime, mode: state.previewMode ? 'preview' : 'source' });
+  });
+
+  window.addEventListener('resize', () => {
+    waveformBaseCanvas = null;  // force re-render on next paint
+  });
+
+  fetchJSON('/api/waveform?points=2000').then((wf) => {
+    waveformData = wf;
+    paintWaveform();
+    logKPI('ui.waveform.loaded', { points: wf.target_points, duration_sec: wf.duration_sec });
+  }).catch((e) => {
+    logKPI('ui.waveform.error', { error: e.message });
+  });
 
   // ------- keyboard shortcuts -------
   document.addEventListener('keydown', (e) => {

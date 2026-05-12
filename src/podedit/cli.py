@@ -218,6 +218,8 @@ def _parse_range(rng: str) -> tuple[float, float]:
               help="Skip LUFS normalization entirely.")
 @click.option("--seam-analysis/--no-seam-analysis", default=True, show_default=True,
               help="W6: per-seam zero-cross snap + content-aware variable crossfade.")
+@click.option("--lufs-two-pass", is_flag=True, default=False,
+              help="W7: two-pass loudnorm (slower, ~±0.5 LU accuracy). Recommended for final export.")
 def cut_cmd(
     audio: Path,
     deletes: tuple[str, ...],
@@ -229,6 +231,7 @@ def cut_cmd(
     lufs_target: float,
     no_lufs: bool,
     seam_analysis: bool,
+    lufs_two_pass: bool,
 ) -> None:
     """Apply --delete ranges to AUDIO and write a wav with those ranges removed.
 
@@ -274,12 +277,13 @@ def cut_cmd(
             crossfade_ms=crossfade_ms,
             lufs_target=None if no_lufs else lufs_target,
             seam_analysis=seam_analysis,
+            lufs_two_pass=lufs_two_pass,
         )
     except RenderError as e:
         _fatal(str(e))
 
     console.print(
-        f"[green]✓[/green] {out_path}  "
+        f"[green]✓[/green] {out_path} [{result.output_format}]  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
         f"{len(result.keeps)} keep ranges, max xfade {result.crossfade_ms:.1f}ms)"
@@ -291,10 +295,16 @@ def cut_cmd(
                 klass_counts[a[side]] = klass_counts.get(a[side], 0) + 1
         summary = ", ".join(f"{v}× {k}" for k, v in sorted(klass_counts.items()))
         console.print(f"  Seam analysis: {len(result.seam_analyses)} seam(s) classified — {summary}")
-    if result.lufs_out is not None:
-        before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
-        peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
-        console.print(f"  Loudness: {before}{result.lufs_out:.1f} LUFS{peak}")
+    if result.lufs_measured_input is not None or result.lufs_out is not None:
+        parts = []
+        if result.lufs_measured_input is not None:
+            parts.append(f"measured-in {result.lufs_measured_input:.1f} LUFS")
+        if result.lufs_out is not None:
+            parts.append(f"out {result.lufs_out:.1f} LUFS")
+        if result.true_peak_dbtp is not None:
+            parts.append(f"peak {result.true_peak_dbtp:.1f} dBTP")
+        pass_kind = "two-pass" if result.lufs_two_pass else "single-pass"
+        console.print(f"  Loudness ({pass_kind}): {' · '.join(parts)}")
 
     if save_session:
         save_session.parent.mkdir(parents=True, exist_ok=True)
@@ -316,6 +326,8 @@ def cut_cmd(
 @click.option("--no-lufs", is_flag=True, default=False, help="Skip LUFS normalization.")
 @click.option("--seam-analysis/--no-seam-analysis", default=True, show_default=True,
               help="W6: per-seam zero-cross snap + content-aware variable crossfade.")
+@click.option("--lufs-two-pass", is_flag=True, default=False,
+              help="W7: two-pass loudnorm (slower, ~±0.5 LU accuracy). Recommended for final export.")
 def render_cmd(
     session_path: Path,
     out_path: Path,
@@ -325,6 +337,7 @@ def render_cmd(
     lufs_target: float,
     no_lufs: bool,
     seam_analysis: bool,
+    lufs_two_pass: bool,
 ) -> None:
     """Replay a saved EditSession against its source audio and write a wav."""
     try:
@@ -367,12 +380,13 @@ def render_cmd(
             crossfade_ms=crossfade_ms,
             lufs_target=None if no_lufs else lufs_target,
             seam_analysis=seam_analysis,
+            lufs_two_pass=lufs_two_pass,
         )
     except RenderError as e:
         _fatal(str(e))
 
     console.print(
-        f"[green]✓[/green] {out_path}  "
+        f"[green]✓[/green] {out_path} [{result.output_format}]  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
         f"{len(result.keeps)} keep ranges, max xfade {result.crossfade_ms:.1f}ms)"
@@ -384,10 +398,16 @@ def render_cmd(
                 klass_counts[a[side]] = klass_counts.get(a[side], 0) + 1
         summary = ", ".join(f"{v}× {k}" for k, v in sorted(klass_counts.items()))
         console.print(f"  Seam analysis: {len(result.seam_analyses)} seam(s) — {summary}")
-    if result.lufs_out is not None:
-        before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
-        peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
-        console.print(f"  Loudness: {before}{result.lufs_out:.1f} LUFS{peak}")
+    if result.lufs_measured_input is not None or result.lufs_out is not None:
+        parts = []
+        if result.lufs_measured_input is not None:
+            parts.append(f"measured-in {result.lufs_measured_input:.1f} LUFS")
+        if result.lufs_out is not None:
+            parts.append(f"out {result.lufs_out:.1f} LUFS")
+        if result.true_peak_dbtp is not None:
+            parts.append(f"peak {result.true_peak_dbtp:.1f} dBTP")
+        pass_kind = "two-pass" if result.lufs_two_pass else "single-pass"
+        console.print(f"  Loudness ({pass_kind}): {' · '.join(parts)}")
 
 
 @cli.command("eval")

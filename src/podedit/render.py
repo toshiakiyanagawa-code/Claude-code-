@@ -30,7 +30,104 @@ class RenderError(RuntimeError):
 
 # Bump when output-affecting render logic changes so cached previews aren't
 # silently reused across upgrades. Server preview cache keys include this.
-RENDERER_VERSION = "w6.0"
+RENDERER_VERSION = "w7.0"
+
+
+# Output formats accepted by ``render_cuts``. Picked from the extension of the
+# requested output path. mp3/aac/ogg are lossy and intended for distribution;
+# wav/flac are lossless and meant for further editing or archival.
+_FORMAT_CODECS: dict[str, list[str]] = {
+    "wav":  ["-acodec", "pcm_s16le"],
+    "flac": ["-acodec", "flac"],
+    "mp3":  ["-acodec", "libmp3lame", "-b:a", "96k"],
+    "ogg":  ["-acodec", "libvorbis", "-q:a", "5"],
+    "m4a":  ["-acodec", "aac", "-b:a", "96k"],
+}
+
+
+def _codec_args_for(output: Path) -> list[str]:
+    fmt = output.suffix.lower().lstrip(".")
+    if fmt not in _FORMAT_CODECS:
+        raise RenderError(
+            f"Unsupported output format {output.suffix!r}; expected one of "
+            f"{sorted(_FORMAT_CODECS)}"
+        )
+    return list(_FORMAT_CODECS[fmt])
+
+
+@dataclass(frozen=True, slots=True)
+class LoudnormStats:
+    """Pass-1 measurement output from ffmpeg's ``loudnorm`` filter."""
+    input_i: float
+    input_tp: float
+    input_lra: float
+    input_thresh: float
+    target_offset: float
+
+
+def _measure_loudnorm(
+    source: Path,
+    keeps: list[tuple[float, float]],
+    seam_xfades_ms: list[float],
+    *,
+    lufs_target: float,
+    true_peak_ceiling_dbtp: float,
+    source_sample_rate: int | None,
+) -> LoudnormStats:
+    """Run ffmpeg pass-1 to measure integrated LUFS / true peak / LRA.
+
+    ffmpeg writes its loudnorm JSON to *stderr* even when ``-f null`` is the
+    output target. We discard the audio (``-f null -``) and just scrape the
+    final JSON block.
+    """
+    parts: list[str] = []
+    for i, (s, e) in enumerate(keeps):
+        parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
+    n = len(keeps)
+    if n == 1:
+        cur = "[k0]"
+    else:
+        cur = "[k0]"
+        for i in range(1, n):
+            x = seam_xfades_ms[i - 1] if i - 1 < len(seam_xfades_ms) else 0.0
+            out_label = "[xall]" if i == n - 1 else f"[x{i - 1}]"
+            if x > 0:
+                parts.append(f"{cur}[k{i}]acrossfade=d={x / 1000.0:.6f}:c1=qsin:c2=qsin{out_label}")
+            else:
+                parts.append(f"{cur}[k{i}]concat=n=2:v=0:a=1{out_label}")
+            cur = out_label
+    parts.append(
+        f"{cur}loudnorm=I={lufs_target}:TP={true_peak_ceiling_dbtp}:LRA=11:print_format=json[out]"
+    )
+    fc = ";".join(parts)
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-nostats",
+         "-i", str(source),
+         "-filter_complex", fc, "-map", "[out]",
+         "-f", "null", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        raise RenderError(f"loudnorm measurement pass failed: {proc.stderr.strip()[-400:]}")
+    # The JSON block is emitted at the very end of stderr.
+    import json as _json
+    err = proc.stderr
+    brace_start = err.rfind("{")
+    brace_end = err.rfind("}")
+    if brace_start < 0 or brace_end < brace_start:
+        raise RenderError("loudnorm measurement: no JSON in ffmpeg stderr")
+    blob = err[brace_start:brace_end + 1]
+    try:
+        data = _json.loads(blob)
+    except _json.JSONDecodeError as e:
+        raise RenderError(f"loudnorm measurement: malformed JSON ({e})") from e
+    return LoudnormStats(
+        input_i=float(data["input_i"]),
+        input_tp=float(data["input_tp"]),
+        input_lra=float(data["input_lra"]),
+        input_thresh=float(data["input_thresh"]),
+        target_offset=float(data["target_offset"]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +149,38 @@ class RenderResult:
     seam_xfades_ms: list[float] = field(default_factory=list)
     seam_analyses: list[dict] = field(default_factory=list)
     seam_analysis_used: bool = False
+    # W7 additions.
+    output_format: str = "wav"             # "wav" | "mp3" | "flac" | "ogg" | "m4a"
+    lufs_two_pass: bool = False            # True when we ran the measure pass first
+    lufs_measured_input: float | None = None  # pass-1 integrated LUFS of the input
+
+
+def _probe_output_duration_and_rate(path: Path) -> tuple[float, int]:
+    """Return (duration_sec, sample_rate) for any output ffmpeg can produce.
+
+    soundfile only handles wav/flac/ogg; for mp3/m4a we fall back to ffprobe.
+    """
+    if shutil.which("ffprobe") is None:
+        # Best-effort: try soundfile and accept that mp3 won't work without ffprobe.
+        info = sf.info(str(path))
+        return info.frames / info.samplerate, info.samplerate
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "format=duration:stream=sample_rate",
+             "-of", "default=noprint_wrappers=1:nokey=0", str(path)],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RenderError(f"ffprobe failed on output: {e.stderr.strip()}") from e
+    duration_sec = 0.0
+    sample_rate = 0
+    for line in out.stdout.splitlines():
+        if line.startswith("duration="):
+            duration_sec = float(line.split("=", 1)[1])
+        elif line.startswith("sample_rate="):
+            sample_rate = int(line.split("=", 1)[1])
+    return duration_sec, sample_rate
 
 
 def _probe_source_sample_rate(source: Path) -> int | None:
@@ -75,6 +204,8 @@ def _build_filtergraph(
     lufs_target: float | None,
     true_peak_ceiling_dbtp: float,
     source_sample_rate: int | None,
+    *,
+    measured: LoudnormStats | None = None,
 ) -> str:
     """Build the ffmpeg filter graph.
 
@@ -109,14 +240,25 @@ def _build_filtergraph(
             cur = out_label
 
     if lufs_target is not None:
-        # Single-pass loudnorm. Two-pass (measure then apply) is more accurate
-        # and lands at W7 export. loudnorm internally upsamples to 192 kHz, so
-        # we aresample back to the source rate to avoid bloating the output.
         loud_label = "[loud]" if source_sample_rate else "[out]"
-        parts.append(
-            f"{cur}loudnorm=I={lufs_target}:TP={true_peak_ceiling_dbtp}:LRA=11{loud_label}"
+        loudnorm = (
+            f"loudnorm=I={lufs_target}:TP={true_peak_ceiling_dbtp}:LRA=11"
+            ":linear=true"  # required for measured-pass parameters to take effect
         )
+        if measured is not None:
+            # Two-pass mode: feed the pass-1 measurements back so loudnorm can
+            # plan an exact gain rather than guessing from a streaming look-ahead.
+            loudnorm += (
+                f":measured_I={measured.input_i:.3f}"
+                f":measured_TP={measured.input_tp:.3f}"
+                f":measured_LRA={measured.input_lra:.3f}"
+                f":measured_thresh={measured.input_thresh:.3f}"
+                f":offset={measured.target_offset:.3f}"
+            )
+        parts.append(f"{cur}{loudnorm}{loud_label}")
         if source_sample_rate:
+            # loudnorm internally upsamples to 192 kHz, so resample back to the
+            # source rate to keep output files at the rate users expect.
             parts.append(f"{loud_label}aresample={source_sample_rate}[out]")
     else:
         parts.append(f"{cur}anull[out]")
@@ -157,6 +299,8 @@ def render_cuts(
     lufs_target: float | None = -16.0,
     true_peak_ceiling_dbtp: float = -1.0,
     seam_analysis: bool = True,
+    lufs_two_pass: bool = False,
+    ffmpeg_timeout_sec: float | None = None,
 ) -> RenderResult:
     """Apply ``deletes`` to ``source`` and write a wav with sample-precise cuts.
 
@@ -241,7 +385,21 @@ def render_cuts(
     applied_xfade = max(seam_xfades_ms) if seam_xfades_ms else 0.0
 
     source_sample_rate = _probe_source_sample_rate(source) if lufs_target is not None else None
-    fc = _build_filtergraph(keeps, seam_xfades_ms, lufs_target, true_peak_ceiling_dbtp, source_sample_rate)
+    codec_args = _codec_args_for(output)
+
+    measured: LoudnormStats | None = None
+    if lufs_target is not None and lufs_two_pass:
+        measured = _measure_loudnorm(
+            source, keeps, seam_xfades_ms,
+            lufs_target=lufs_target,
+            true_peak_ceiling_dbtp=true_peak_ceiling_dbtp,
+            source_sample_rate=source_sample_rate,
+        )
+
+    fc = _build_filtergraph(
+        keeps, seam_xfades_ms, lufs_target, true_peak_ceiling_dbtp, source_sample_rate,
+        measured=measured,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
@@ -250,36 +408,45 @@ def render_cuts(
                 "-i", str(source),
                 "-filter_complex", fc,
                 "-map", "[out]",
-                "-acodec", "pcm_s16le",
+                *codec_args,
                 str(output),
             ],
             check=True, capture_output=True, text=True,
+            timeout=ffmpeg_timeout_sec,
         )
+    except subprocess.TimeoutExpired as e:
+        # Don't leave a half-written file behind if we killed the encode early.
+        try:
+            output.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except OSError:
+            pass
+        raise RenderError(f"ffmpeg render timed out after {ffmpeg_timeout_sec}s") from e
     except subprocess.CalledProcessError as e:
+        try:
+            output.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except OSError:
+            pass
         raise RenderError(f"ffmpeg render failed: {e.stderr.strip()}") from e
 
-    # Probe the output for accurate duration / sample rate — ffmpeg drops the
-    # crossfade-overlap samples (~xfade_ms per seam) so we don't pre-compute it.
-    info = sf.info(str(output))
-    duration_out = info.frames / info.samplerate
+    # Probe the output for accurate duration / sample rate. For mp3/ogg/m4a we
+    # fall through to ffprobe since soundfile can only read wav/flac/ogg etc.
+    duration_out, sample_rate = _probe_output_duration_and_rate(output)
 
-    lufs_in: float | None = None
+    lufs_in: float | None = measured.input_i if measured is not None else None
     lufs_out: float | None = None
     true_peak_out: float | None = None
-    if lufs_target is not None:
-        # Round-trip post-render measurement. For long outputs the file would
-        # have to be loaded fully into memory (~700 MB for 30 min stereo
-        # float64) so cap by duration — the bench KPI is more useful for
-        # short audition previews than for full episodes.
-        if duration_out <= 600:  # 10 minutes
-            lufs_out, true_peak_out = _measure_loudness(output)
+    if lufs_target is not None and duration_out <= 600 and output.suffix.lower() in (".wav", ".flac"):
+        # Round-trip post-render measurement, but only on lossless outputs
+        # that ``soundfile`` can read and only when the output is short enough
+        # (~700 MB ceiling for a 30 min stereo float64 read).
+        lufs_out, true_peak_out = _measure_loudness(output)
 
     return RenderResult(
         output=output,
         keeps=keeps,
         duration_in=source_duration,
         duration_out=duration_out,
-        sample_rate=info.samplerate,
+        sample_rate=sample_rate,
         crossfade_ms=applied_xfade,
         crossfade_ms_requested=requested_xfade,
         lufs_in=lufs_in,
@@ -288,4 +455,7 @@ def render_cuts(
         seam_xfades_ms=seam_xfades_ms,
         seam_analyses=analyses,
         seam_analysis_used=seam_used,
+        output_format=output.suffix.lower().lstrip("."),
+        lufs_two_pass=lufs_two_pass and measured is not None,
+        lufs_measured_input=measured.input_i if measured else None,
     )

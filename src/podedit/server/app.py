@@ -28,6 +28,7 @@ from ..audio import probe as audio_probe
 from ..edit import EditSession, sha256_of_file
 from ..render import RENDERER_VERSION, RenderError, render_cuts
 from ..schema import AudioRef
+from ..waveform import WaveformError, get_or_compute_waveform
 
 # Garbage collection knobs for the preview cache. Previews are ~340 MB / 30 min,
 # so a small file count keeps the workdir from blowing up on the user's host.
@@ -393,6 +394,20 @@ def create_app(config: ServeConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail="preview not rendered; POST /api/preview/render first")
         return FileResponse(p, media_type="audio/wav", filename=p.name,
                             headers={"Cache-Control": "no-store"})
+
+    # ------- waveform (W7) -------
+    # Pre-decoded envelope for the UI. Cached as JSON next to the session,
+    # recomputed when the source mtime changes or the schema bumps.
+    @app.get("/api/waveform")
+    def waveform(points: int = 4000) -> JSONResponse:
+        if points <= 0 or points > 20_000:
+            raise HTTPException(status_code=400, detail="points must be in (0, 20000]")
+        cache_path = config.session_path.parent / f"{config.audio_path.stem}.waveform.{points}.json"
+        try:
+            wf = get_or_compute_waveform(config.audio_path, cache_path, target_points=points)
+        except WaveformError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        return JSONResponse(wf.to_dict())
 
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
