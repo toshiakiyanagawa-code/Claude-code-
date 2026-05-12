@@ -16,6 +16,10 @@
   const $kpiElapsed = $('kpi-elapsed');
   const $skipPill = $('skip-pill');
   const $kpiTime = $('kpi-time');
+  const $btnPlay = $('btn-play');
+  const $timeCurrent = $('time-current');
+  const $timeDuration = $('time-duration');
+  const $scrubber = $('scrubber');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -52,7 +56,11 @@
   // ------- state -------
   const state = {
     ops: [],           // active delete ops
-    mergedDeletes: [], // normalized [start, end][] cached from ops; for preview-skip + total
+    mergedDeletes: [], // normalized [start, end][] cached from ops
+    timeline: [],      // [{sourceStart, sourceEnd, editedStart, editedEnd}] — keep ranges
+    editedDuration: 0, // sum of keep-range lengths; the "podcast duration after cuts"
+    sourceDuration: 0, // unedited audio duration (from /api/audio/info)
+    isScrubbing: false,
     undoStack: [],     // {type:'add'|'remove', op}
     redoStack: [],
     selection: null,   // {anchor: wordIdx, extent: wordIdx} (inclusive)
@@ -75,6 +83,51 @@
     }
     state.mergedDeletes = merged;
   }
+
+  // Virtual timeline: the "edited" timeline is what the user sees on the
+  // scrubber and time displays. The audio element keeps playing on the source
+  // timeline; sourceToEdited()/editedToSource() bridge between the two.
+  function rebuildTimeline() {
+    const keeps = [];
+    let cursor = 0;
+    let edited = 0;
+    const dur = state.sourceDuration;
+    for (const [s, e] of state.mergedDeletes) {
+      if (cursor < s) {
+        const span = s - cursor;
+        keeps.push({ sourceStart: cursor, sourceEnd: s, editedStart: edited, editedEnd: edited + span });
+        edited += span;
+      }
+      cursor = Math.max(cursor, e);
+    }
+    if (cursor < dur) {
+      const span = dur - cursor;
+      keeps.push({ sourceStart: cursor, sourceEnd: dur, editedStart: edited, editedEnd: edited + span });
+      edited += span;
+    }
+    state.timeline = keeps;
+    state.editedDuration = edited;
+  }
+
+  function editedToSource(t) {
+    if (!state.timeline.length) return 0;
+    t = Math.max(0, Math.min(t, state.editedDuration));
+    for (const r of state.timeline) {
+      if (t >= r.editedStart && t <= r.editedEnd) {
+        return r.sourceStart + (t - r.editedStart);
+      }
+    }
+    return state.timeline[state.timeline.length - 1].sourceEnd;
+  }
+
+  function sourceToEdited(t) {
+    if (!state.timeline.length) return 0;
+    for (const r of state.timeline) {
+      if (t < r.sourceStart) return r.editedStart;  // playhead is in a cut; clamp to next keep
+      if (t <= r.sourceEnd) return r.editedStart + (t - r.sourceStart);
+    }
+    return state.editedDuration;
+  }
   const words = [];    // [{el, start, end, idx, segIdx}]
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
 
@@ -93,6 +146,7 @@
   }
   state.sessionTemplate = session;
   state.ops = session.ops || [];
+  state.sourceDuration = info.duration_sec;
   logKPI('ui.loaded', { latency_ms: performance.now() - t0, has_existing_session: state.ops.length > 0 });
 
   $name.textContent = info.name;
@@ -305,8 +359,25 @@
     scheduleSave();
   }
 
+  function syncTimelineUI() {
+    $scrubber.max = String(state.editedDuration);
+    $timeDuration.textContent = fmt(state.editedDuration);
+  }
+
   function rerenderOps() {
+    // Snapshot the user's current EDITED position so we can preserve it across
+    // the timeline rebuild. Without this, adding a cut to the left of the
+    // playhead would visibly snap the scrubber backwards.
+    const prevEdited = state.timeline.length ? sourceToEdited($player.currentTime) : null;
     recomputeMergedDeletes();
+    rebuildTimeline();
+    syncTimelineUI();
+    if (prevEdited != null) {
+      const newSource = editedToSource(prevEdited);
+      if (Math.abs(newSource - $player.currentTime) > 0.05) {
+        $player.currentTime = newSource;
+      }
+    }
     // Tag every word as deleted if it lies entirely within ANY merged delete
     // range. Strict inclusion avoids half-shading words that only partly fall
     // in a cut; partial-overlap visualization arrives in W5.
@@ -435,13 +506,19 @@
 
   function tick() {
     const t = $player.currentTime;
+    const edt = sourceToEdited(t);
     $kpiTime.textContent = `${t.toFixed(2)}s`;
 
-    // Preview-skip: walk the merged (sorted, non-overlapping) delete ranges.
-    // When the playhead lands inside one, invoke the async pause/seek/play
-    // helper. `isSkipping` keeps tick from firing a second jump while the
-    // first is still resolving.
-    if (!isSkipping) {
+    // Mirror the playhead into the edited timeline displays — unless the user
+    // is actively dragging the scrubber, in which case they own those values.
+    if (!state.isScrubbing) {
+      $timeCurrent.textContent = fmt(edt);
+      $scrubber.value = String(edt);
+    }
+
+    // Preview-skip: jump out of any merged delete range. Suppressed while the
+    // user is scrubbing so we don't fight their drag.
+    if (!isSkipping && !state.isScrubbing) {
       for (const [s, e] of state.mergedDeletes) {
         if (t >= s && t < e) {
           // 50ms nudge past the boundary — `+0.001` is too small; AAC frame
@@ -483,6 +560,35 @@
   $btnRedo.addEventListener('click', redo);
   $btnClear.addEventListener('click', clearSelection);
 
+  // ------- custom player controls -------
+  $btnPlay.addEventListener('click', () => {
+    if ($player.paused) {
+      const p = $player.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } else {
+      $player.pause();
+    }
+  });
+  $player.addEventListener('play', () => { $btnPlay.textContent = '⏸'; });
+  $player.addEventListener('pause', () => { $btnPlay.textContent = '▶'; });
+  $player.addEventListener('ended', () => { $btnPlay.textContent = '▶'; });
+
+  // Scrubber: 'input' fires continuously while dragging; 'change' fires on
+  // release. We only commit the seek on release so we don't issue dozens of
+  // seeks during a single drag.
+  $scrubber.addEventListener('input', () => {
+    state.isScrubbing = true;
+    const edt = parseFloat($scrubber.value);
+    $timeCurrent.textContent = fmt(edt);
+  });
+  $scrubber.addEventListener('change', () => {
+    const edt = parseFloat($scrubber.value);
+    const src = editedToSource(edt);
+    $player.currentTime = src;
+    state.isScrubbing = false;
+    logKPI('ui.scrubber.seek', { edited: edt, source: src });
+  });
+
   // ------- keyboard shortcuts -------
   document.addEventListener('keydown', (e) => {
     // Never grab keys while an IME is composing — Japanese/CJK input would
@@ -511,6 +617,20 @@
     }
     if (e.key === 'Escape') {
       clearSelection();
+      return;
+    }
+    if (e.key === ' ' || e.code === 'Space') {
+      // Toggle playback; don't swallow Space when a real form input is focused
+      // (currently only the scrubber range, where Space has no useful default).
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && t !== $scrubber) return;
+      e.preventDefault();
+      if ($player.paused) {
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } else {
+        $player.pause();
+      }
     }
   });
 

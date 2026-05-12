@@ -29,7 +29,39 @@ header {
 .title-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 h1 { font-size: 14px; font-weight: 600; margin: 0; }
 .meta { color: var(--muted); font-size: 12px; }
-audio { width: 100%; margin-top: 10px; }
+audio { display: none; }  /* hidden — we drive the player via custom controls */
+
+.player-bar {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+}
+.play-btn {
+  background: var(--accent); color: #0f1115;
+  border: 0; border-radius: 50%;
+  width: 36px; height: 36px; font-size: 14px;
+  cursor: pointer; font-family: inherit; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.play-btn:hover { filter: brightness(1.1); }
+.time {
+  color: var(--text); font-size: 13px;
+  font-variant-numeric: tabular-nums; min-width: 70px;
+}
+.time-right { text-align: right; color: var(--muted); }
+.scrubber {
+  flex: 1; cursor: pointer; height: 6px;
+  -webkit-appearance: none; appearance: none;
+  background: #1a1d28; border-radius: 3px;
+}
+.scrubber::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: 0;
+}
+.scrubber::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: 0;
+}
 
 .toolbar {
   display: flex; gap: 8px; align-items: center;
