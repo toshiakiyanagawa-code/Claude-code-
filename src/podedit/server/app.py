@@ -26,8 +26,13 @@ from fastapi.staticfiles import StaticFiles
 
 from ..audio import probe as audio_probe
 from ..edit import EditSession, sha256_of_file
-from ..render import RenderError, render_cuts
+from ..render import RENDERER_VERSION, RenderError, render_cuts
 from ..schema import AudioRef
+
+# Garbage collection knobs for the preview cache. Previews are ~340 MB / 30 min,
+# so a small file count keeps the workdir from blowing up on the user's host.
+PREVIEW_GC_MAX_FILES = 3
+PREVIEW_GC_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB combined
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -293,7 +298,8 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     # ------- preview render (W5) -------
     # Renders the current session to a wav using the W5 PCM pipeline. Cached by
-    # the merged deletes hash, so re-clicking with no edits is a free no-op.
+    # a hash of (deletes + opts + renderer version), so re-clicking with no
+    # edits is a free no-op and a renderer upgrade invalidates stale cache.
     # Render is synchronous; for the 30-min episode it takes ~75 s.
     @app.post("/api/preview/render")
     def render_preview(opts: dict | None = None) -> dict:
@@ -302,6 +308,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         lufs_target = opts.get("lufs_target", -16.0)
         if lufs_target is not None:
             lufs_target = float(lufs_target)
+        true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
 
         with session_lock:
             deletes = sorted(
@@ -310,13 +317,25 @@ def create_app(config: ServeConfig) -> FastAPI:
             )
             source_duration = session.source_audio.duration_sec
 
-        cache_key = hashlib.sha256(
-            json.dumps([deletes, crossfade_ms, lufs_target], sort_keys=True).encode()
-        ).hexdigest()[:16]
+        # Cache key covers every parameter that can change the bytes on disk.
+        # Including RENDERER_VERSION means a code change automatically
+        # invalidates previously-rendered previews.
+        cache_key_blob = json.dumps(
+            {
+                "deletes": deletes,
+                "crossfade_ms": crossfade_ms,
+                "lufs_target": lufs_target,
+                "true_peak_ceiling_dbtp": true_peak,
+                "renderer_version": RENDERER_VERSION,
+            },
+            sort_keys=True,
+        ).encode()
+        cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
         preview_path = config.session_path.parent / f"{config.audio_path.stem}.preview.{cache_key}.wav"
 
         cached = preview_path.exists()
         if not cached:
+            _gc_previews(config.session_path.parent, config.audio_path.stem, keep=preview_path)
             t0 = time.time()
             try:
                 result = render_cuts(
@@ -326,6 +345,7 @@ def create_app(config: ServeConfig) -> FastAPI:
                     output=preview_path,
                     crossfade_ms=crossfade_ms,
                     lufs_target=lufs_target,
+                    true_peak_ceiling_dbtp=true_peak,
                 )
             except RenderError as e:
                 raise HTTPException(status_code=500, detail=str(e)) from e
@@ -333,18 +353,33 @@ def create_app(config: ServeConfig) -> FastAPI:
                 "server_ts": time.time(), "type": "server.preview.rendered",
                 "cache_key": cache_key, "wall_sec": time.time() - t0,
                 "duration_in": result.duration_in, "duration_out": result.duration_out,
-                "n_keeps": len(result.keeps), "crossfade_ms": result.crossfade_ms,
+                "n_keeps": len(result.keeps),
+                "crossfade_ms_requested": result.crossfade_ms_requested,
+                "crossfade_ms_applied": result.crossfade_ms,
                 "lufs_target": lufs_target, "lufs_out": result.lufs_out,
                 "true_peak_dbtp": result.true_peak_dbtp,
+                "renderer_version": result.renderer_version,
             })
 
         st = preview_path.stat()
         tag = f"{int(st.st_mtime)}-{st.st_size}"
+        # Mirror the (possibly drift-from-keeps-sum) actual output duration back
+        # to the UI so its scrubber max can match the rendered file exactly.
+        try:
+            import soundfile as sf
+            info_out = sf.info(str(preview_path))
+            preview_duration = info_out.frames / info_out.samplerate
+        except Exception:
+            preview_duration = None
         return {
             "cache_key": cache_key,
             "url": f"/api/preview-audio/{cache_key}?v={tag}",
             "cached": cached,
             "bytes": st.st_size,
+            "duration_sec": preview_duration,
+            "ops_hash": hashlib.sha256(
+                json.dumps(deletes).encode()
+            ).hexdigest()[:16],
         }
 
     _CACHE_KEY_RE = re.compile(r"^[a-f0-9]{1,64}$")
@@ -367,6 +402,42 @@ def _append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _gc_previews(dir_: Path, stem: str, *, keep: Path) -> list[Path]:
+    """Evict old preview wavs so the workdir doesn't accumulate hundreds of MB.
+
+    Keeps at most ``PREVIEW_GC_MAX_FILES`` files, and at most
+    ``PREVIEW_GC_MAX_BYTES`` of combined size, dropping oldest-first by mtime.
+    ``keep`` is preserved unconditionally (it's the cache target we're about to
+    write, so deleting it would defeat the cache).
+    """
+    pattern = f"{stem}.preview.*.wav"
+    files = sorted(
+        (p for p in dir_.glob(pattern) if p.exists() and p != keep),
+        key=lambda p: p.stat().st_mtime,
+    )
+    removed: list[Path] = []
+    # Cap by file count first
+    while len(files) >= PREVIEW_GC_MAX_FILES:
+        victim = files.pop(0)
+        try:
+            victim.unlink()
+            removed.append(victim)
+        except OSError:
+            pass
+    # Then cap by combined bytes
+    total = sum(p.stat().st_size for p in files if p.exists())
+    while total > PREVIEW_GC_MAX_BYTES and files:
+        victim = files.pop(0)
+        try:
+            sz = victim.stat().st_size
+            victim.unlink()
+            total -= sz
+            removed.append(victim)
+        except OSError:
+            pass
+    return removed
 
 
 def _guess_media_type(path: Path) -> str:

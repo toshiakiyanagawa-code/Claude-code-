@@ -27,6 +27,11 @@ class RenderError(RuntimeError):
     pass
 
 
+# Bump when output-affecting render logic changes so cached previews aren't
+# silently reused across upgrades. Server preview cache keys include this.
+RENDERER_VERSION = "w5.1"
+
+
 @dataclass(frozen=True, slots=True)
 class RenderResult:
     output: Path
@@ -34,10 +39,12 @@ class RenderResult:
     duration_in: float
     duration_out: float
     sample_rate: int
-    crossfade_ms: float
+    crossfade_ms: float          # the *applied* xfade (may be clamped below requested)
+    crossfade_ms_requested: float
     lufs_in: float | None
     lufs_out: float | None
     true_peak_dbtp: float | None
+    renderer_version: str = RENDERER_VERSION
 
 
 def _probe_source_sample_rate(source: Path) -> int | None:
@@ -149,8 +156,20 @@ def render_cuts(
     if not keeps:
         raise RenderError("All audio is deleted; no output to render.")
 
+    # Clamp the crossfade to the shortest keep range — `acrossfade d=X` requires
+    # both inputs to be at least X long, otherwise ffmpeg either errors or
+    # produces an unusably short output for that segment. We never *exceed*
+    # the user's request; we just shrink it when the audio can't accommodate.
+    requested_xfade = crossfade_ms
+    applied_xfade = crossfade_ms
+    if applied_xfade > 0 and len(keeps) > 1:
+        shortest_keep_sec = min((e - s) for s, e in keeps)
+        cap_ms = max(0.0, shortest_keep_sec * 1000.0 - 1.0)  # leave 1ms slack
+        if cap_ms < applied_xfade:
+            applied_xfade = cap_ms
+
     source_sample_rate = _probe_source_sample_rate(source) if lufs_target is not None else None
-    fc = _build_filtergraph(keeps, crossfade_ms, lufs_target, true_peak_ceiling_dbtp, source_sample_rate)
+    fc = _build_filtergraph(keeps, applied_xfade, lufs_target, true_peak_ceiling_dbtp, source_sample_rate)
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
@@ -176,9 +195,12 @@ def render_cuts(
     lufs_out: float | None = None
     true_peak_out: float | None = None
     if lufs_target is not None:
-        # Round-trip measurement for the bench / KPI. Skips if pyloudnorm or the
-        # output is too short for the gating window.
-        lufs_out, true_peak_out = _measure_loudness(output)
+        # Round-trip post-render measurement. For long outputs the file would
+        # have to be loaded fully into memory (~700 MB for 30 min stereo
+        # float64) so cap by duration — the bench KPI is more useful for
+        # short audition previews than for full episodes.
+        if duration_out <= 600:  # 10 minutes
+            lufs_out, true_peak_out = _measure_loudness(output)
 
     return RenderResult(
         output=output,
@@ -186,7 +208,8 @@ def render_cuts(
         duration_in=source_duration,
         duration_out=duration_out,
         sample_rate=info.samplerate,
-        crossfade_ms=crossfade_ms,
+        crossfade_ms=applied_xfade,
+        crossfade_ms_requested=requested_xfade,
         lufs_in=lufs_in,
         lufs_out=lufs_out,
         true_peak_dbtp=true_peak_out,

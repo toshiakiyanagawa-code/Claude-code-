@@ -280,10 +280,10 @@ def cut_cmd(
         f"{result.duration_in - result.duration_out:.1f}s cut, "
         f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
     )
-    if result.lufs_in is not None:
-        lufs_after = f" → {result.lufs_out:.1f} LUFS" if result.lufs_out is not None else ""
+    if result.lufs_out is not None:
+        before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
         peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
-        console.print(f"  Loudness: {result.lufs_in:.1f} LUFS{lufs_after}{peak}")
+        console.print(f"  Loudness: {before}{result.lufs_out:.1f} LUFS{peak}")
 
     if save_session:
         save_session.parent.mkdir(parents=True, exist_ok=True)
@@ -362,10 +362,10 @@ def render_cmd(
         f"{result.duration_in - result.duration_out:.1f}s cut, "
         f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
     )
-    if result.lufs_in is not None:
-        lufs_after = f" → {result.lufs_out:.1f} LUFS" if result.lufs_out is not None else ""
+    if result.lufs_out is not None:
+        before = f"{result.lufs_in:.1f} → " if result.lufs_in is not None else ""
         peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
-        console.print(f"  Loudness: {result.lufs_in:.1f} LUFS{lufs_after}{peak}")
+        console.print(f"  Loudness: {before}{result.lufs_out:.1f} LUFS{peak}")
 
 
 @cli.command("serve")

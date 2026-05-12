@@ -66,6 +66,8 @@
     previewMode: false,  // false = audio is the source m4a; true = it's a rendered preview wav
     previewURL: null,
     previewCacheKey: null,
+    previewDuration: null,  // exact rendered duration from the server (xfade trims a few ms per seam)
+    renderSeq: 0,  // monotonic counter; render responses older than the current seq are discarded
     undoStack: [],     // {type:'add'|'remove', op}
     redoStack: [],
     selection: null,   // {anchor: wordIdx, extent: wordIdx} (inclusive)
@@ -316,8 +318,10 @@
   function applyDeleteRange(start, end) {
     if (end <= start) return;
     // Any edit invalidates the rendered preview — jump back to the source so
-    // the user isn't auditioning a stale render.
+    // the user isn't auditioning a stale render. revertToSource bumps
+    // renderSeq, so any in-flight Audition response is also discarded.
     if (state.previewMode) revertToSource('apply-delete');
+    else state.renderSeq += 1;  // still bump so a stale response can't land on us
     const op = { op_id: newOpId(), op: 'delete', start, end, note: null };
     state.ops.push(op);
     state.undoStack.push({ type: 'add', op });
@@ -341,6 +345,7 @@
     const entry = state.undoStack.pop();
     if (!entry) return;
     if (state.previewMode) revertToSource('undo');
+    else state.renderSeq += 1;
     if (entry.type === 'add') {
       state.ops = state.ops.filter((o) => o.op_id !== entry.op.op_id);
     } else if (entry.type === 'remove') {
@@ -357,6 +362,7 @@
     const entry = state.redoStack.pop();
     if (!entry) return;
     if (state.previewMode) revertToSource('redo');
+    else state.renderSeq += 1;
     if (entry.type === 'add') {
       state.ops.push(entry.op);
     } else if (entry.type === 'remove') {
@@ -370,8 +376,14 @@
   }
 
   function syncTimelineUI() {
-    $scrubber.max = String(state.editedDuration);
-    $timeDuration.textContent = fmt(state.editedDuration);
+    // In preview mode the rendered wav is *shorter* than the virtual edited
+    // duration by ~crossfade_ms × seams (acrossfade overlaps adjacent keeps).
+    // Show the actual playable duration so the scrubber doesn't run past EOF.
+    const dur = state.previewMode && state.previewDuration != null
+      ? state.previewDuration
+      : state.editedDuration;
+    $scrubber.max = String(dur);
+    $timeDuration.textContent = fmt(dur);
   }
 
   function rerenderOps() {
@@ -661,9 +673,12 @@
     const currentEdited = $player.currentTime;  // already edited-space in preview
     state.previewURL = null;
     state.previewCacheKey = null;
+    state.previewDuration = null;
+    state.renderSeq += 1;  // any in-flight render's response is now stale
     setModePill('source', 'source');
     logKPI('ui.audition.revert', { reason });
     switchPlayerSrc(info.url, currentEdited, false);
+    syncTimelineUI();
   }
 
   async function renderAndAudition() {
@@ -672,6 +687,7 @@
       setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source', state.previewMode ? 'preview' : 'source'), 1500);
       return;
     }
+    const mySeq = ++state.renderSeq;
     setModePill('rendering', 'rendering…');
     $btnAudition.disabled = true;
     const t0 = performance.now();
@@ -683,18 +699,26 @@
       });
       if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
       const reply = await r.json();
+      // Discard if the user edited (and bumped renderSeq) while we were rendering.
+      if (mySeq !== state.renderSeq) {
+        logKPI('ui.audition.discarded_stale', { my_seq: mySeq, current_seq: state.renderSeq });
+        return;
+      }
       const latency = performance.now() - t0;
       state.previewURL = reply.url;
       state.previewCacheKey = reply.cache_key;
+      state.previewDuration = reply.duration_sec;
       logKPI('ui.audition.rendered', {
         latency_ms: latency, cached: reply.cached, bytes: reply.bytes,
-        cache_key: reply.cache_key,
+        cache_key: reply.cache_key, preview_duration: reply.duration_sec,
       });
       // Snapshot edited position now so we can land at the same spot in the preview.
       const curEdited = sourceToEdited($player.currentTime);
       setModePill('preview', reply.cached ? 'preview (cached)' : 'preview');
       switchPlayerSrc(reply.url, curEdited, true);
+      syncTimelineUI();
     } catch (e) {
+      if (mySeq !== state.renderSeq) return;  // late failure for a discarded render
       setModePill('error', 'render error');
       logKPI('ui.audition.error', { error: e.message });
     } finally {
