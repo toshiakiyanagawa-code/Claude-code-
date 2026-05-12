@@ -15,6 +15,7 @@
   const $kpiCut = $('kpi-cut');
   const $kpiElapsed = $('kpi-elapsed');
   const $skipPill = $('skip-pill');
+  const $kpiTime = $('kpi-time');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -103,6 +104,15 @@
     tx.model_config && `· model: ${tx.model_config.model}`,
   ].filter(Boolean).join(' · ');
   $player.src = info.url;
+
+  // Diagnostic logging: if seeks are silently ignored, we still see seeking/
+  // seeked/error events in the KPI log.
+  $player.addEventListener('seeking', () => logKPI('ui.audio.seeking', { t: $player.currentTime }));
+  $player.addEventListener('seeked', () => logKPI('ui.audio.seeked', { t: $player.currentTime }));
+  $player.addEventListener('error', () => logKPI('ui.audio.error', {
+    code: $player.error && $player.error.code, message: $player.error && $player.error.message,
+  }));
+  $player.addEventListener('stalled', () => logKPI('ui.audio.stalled', { t: $player.currentTime }));
 
   // ------- render -------
   $tx.innerHTML = '';
@@ -372,29 +382,60 @@
     }
   }
   let lastSkipAt = 0;
+  let isSkipping = false;  // guard so we don't fire concurrent pause/seek/play
+
+  async function jumpPast(targetEnd) {
+    // pause→currentTime=→play with an awaited 'seeked' event. AAC seeks via
+    // bare `currentTime = x` can be silently deferred mid-playback over a
+    // forwarded proxy; the pause/play cycle forces the audio element to honor
+    // the seek immediately.
+    isSkipping = true;
+    const wasPlaying = !$player.paused && !$player.ended;
+    try {
+      $player.pause();
+      $player.currentTime = targetEnd;
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        $player.addEventListener('seeked', finish, { once: true });
+        setTimeout(finish, 200);  // hard ceiling: don't block playback forever
+      });
+      if (wasPlaying) {
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      }
+    } finally {
+      isSkipping = false;
+    }
+  }
+
   function tick() {
-    // Preview-skip: walk the merged (sorted, non-overlapping) delete ranges
-    // and jump over any that the playhead lands inside. mergedDeletes is
-    // sorted so a single linear scan suffices, but recompute `t` after each
-    // jump in case the new position lands inside the next range.
-    let t = $player.currentTime;
-    let didSkip = false;
-    for (const [s, e] of state.mergedDeletes) {
-      if (t >= s && t < e) {
-        // Nudge slightly past the boundary so floating-point drift can't park
-        // us inside the same range on the very next frame.
-        $player.currentTime = e + 0.001;
-        t = e + 0.001;
-        didSkip = true;
-      } else if (t < s) {
-        break;  // ranges are sorted; remaining ones are further ahead
+    const t = $player.currentTime;
+    $kpiTime.textContent = `${t.toFixed(2)}s`;
+
+    // Preview-skip: walk the merged (sorted, non-overlapping) delete ranges.
+    // When the playhead lands inside one, invoke the async pause/seek/play
+    // helper. `isSkipping` keeps tick from firing a second jump while the
+    // first is still resolving.
+    if (!isSkipping) {
+      for (const [s, e] of state.mergedDeletes) {
+        if (t >= s && t < e) {
+          // 50ms nudge past the boundary — `+0.001` is too small; AAC frame
+          // alignment can park currentTime fractionally before the boundary
+          // and we'd re-trigger forever.
+          const target = e + 0.05;
+          $skipPill.classList.add('active');
+          $skipPill.textContent = 'SKIP';
+          lastSkipAt = performance.now();
+          logKPI('ui.preview.skip', { from: t, to: target, range_s: s, range_e: e });
+          jumpPast(target);
+          break;  // jumpPast is async; resume scanning on next tick
+        } else if (t < s) {
+          break;  // ranges are sorted; remaining ones are further ahead
+        }
       }
     }
-    if (didSkip) {
-      lastSkipAt = performance.now();
-      $skipPill.classList.add('active');
-      $skipPill.textContent = 'SKIP';
-    } else if ($skipPill.classList.contains('active') && performance.now() - lastSkipAt > 250) {
+    if ($skipPill.classList.contains('active') && performance.now() - lastSkipAt > 350) {
       $skipPill.classList.remove('active');
       $skipPill.textContent = 'no cut';
     }

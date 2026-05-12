@@ -196,6 +196,10 @@ def create_app(config: ServeConfig) -> FastAPI:
     def transcript() -> JSONResponse:
         return JSONResponse(transcript_data)
 
+    # Cache-buster: changes when the served-audio file changes (e.g. after we
+    # generate a new faststart-remux). Used by the UI in the audio <src>.
+    serve_audio_tag = f"{int(serve_audio_path.stat().st_mtime)}-{serve_audio_path.stat().st_size}"
+
     @app.get("/api/audio/info")
     def audio_info() -> dict:
         src = transcript_data.get("source_audio") or {}
@@ -205,13 +209,21 @@ def create_app(config: ServeConfig) -> FastAPI:
             "sample_rate": src.get("sample_rate"),
             "channels": src.get("channels"),
             "codec": src.get("codec"),
-            "url": "/api/audio",
+            "url": f"/api/audio?v={serve_audio_tag}",
+            "serve_audio_filename": serve_audio_path.name,
+            "serve_audio_bytes": serve_audio_path.stat().st_size,
         }
 
     @app.get("/api/audio")
     def audio() -> FileResponse:
         media_type = _guess_media_type(serve_audio_path)
-        return FileResponse(serve_audio_path, media_type=media_type, filename=serve_audio_path.name)
+        # no-store: the audio file changes when we re-remux (e.g. different
+        # faststart). Combined with the ?v=<tag> query in /api/audio/info, this
+        # guarantees the browser fetches the current file after any change.
+        return FileResponse(
+            serve_audio_path, media_type=media_type, filename=serve_audio_path.name,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/session")
     def get_session() -> dict:
