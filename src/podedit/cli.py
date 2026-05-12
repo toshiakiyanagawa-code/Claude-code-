@@ -13,8 +13,8 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 from .asr import ASRConfig, resolve_device, transcribe
 from .audio import AudioProbeError, FFmpegMissingError, probe, to_wav_16k_mono
 from .bench import measure
-from .edit import EditSession, sha256_of_file
-from .render import RenderError, render_cuts
+from .edit import EditSession, compile_timeline, sha256_of_file
+from .render import RenderError, render_cuts, render_segments
 
 console = Console()
 
@@ -201,9 +201,9 @@ def _parse_range(rng: str) -> tuple[float, float]:
 @cli.command("cut")
 @click.argument("audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--delete", "-d", "deletes", multiple=True, required=True,
-              help="Delete range 'START-END'. Times in seconds or M:SS / H:MM:SS. Repeatable.")
+              help="Delete range 'START-END'. Times in seconds or M:SS / H:MM:SS. Repeatable. Saved sessions can also include move ops.")
 @click.option("-o", "--out", "out_path", type=click.Path(path_type=Path), required=True,
-              help="Output wav path")
+              help="Output audio path. Delete and move ops render through the same timeline path.")
 @click.option("--save-session", type=click.Path(path_type=Path), default=None,
               help="Also write the EditSession JSON here")
 @click.option("--transcript", type=click.Path(exists=True, path_type=Path), default=None,
@@ -237,6 +237,7 @@ def cut_cmd(
 
     W5: sample-precise PCM render with an equal-power crossfade at each cut
     boundary and optional LUFS normalization (default -16 LUFS for podcasts).
+    Saved sessions use the same render path and may include move ops.
     """
     try:
         ranges = [_parse_range(r) for r in deletes]
@@ -339,7 +340,7 @@ def render_cmd(
     seam_analysis: bool,
     lufs_two_pass: bool,
 ) -> None:
-    """Replay a saved EditSession against its source audio and write a wav."""
+    """Replay a saved EditSession, including delete and move ops, against its source audio."""
     try:
         session = EditSession.from_dict(json.loads(session_path.read_text()))
     except (KeyError, ValueError) as e:
@@ -368,15 +369,18 @@ def render_cmd(
     except (FFmpegMissingError, AudioProbeError) as e:
         _fatal(str(e))
 
-    ranges = [(op.start, op.end) for op in session.ops if op.op == "delete"]
+    segments = compile_timeline(info.duration_sec, session.ops)
+    move_count = sum(1 for op in session.ops if op.op == "move")
     console.print(
         f"[bold]Session[/bold]: {session_path.name}  "
-        f"({len(session.ops)} ops, source {source.name}, {info.duration_sec:.1f}s)"
+        f"({len(session.ops)} ops, {move_count} move(s), source {source.name}, {info.duration_sec:.1f}s)"
     )
 
     try:
-        result = render_cuts(
-            source, info.duration_sec, ranges, out_path,
+        result = render_segments(
+            source, segments, out_path,
+            source_duration=info.duration_sec,
+            move_count=move_count,
             crossfade_ms=crossfade_ms,
             lufs_target=None if no_lufs else lufs_target,
             seam_analysis=seam_analysis,
@@ -388,8 +392,8 @@ def render_cmd(
     console.print(
         f"[green]✓[/green] {out_path} [{result.output_format}]  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
-        f"{result.duration_in - result.duration_out:.1f}s cut, "
-        f"{len(result.keeps)} keep ranges, max xfade {result.crossfade_ms:.1f}ms)"
+        f"{result.duration_in - result.duration_out:.1f}s removed by duration, "
+        f"{result.segments_count} segment(s), max xfade {result.crossfade_ms:.1f}ms)"
     )
     if result.seam_analysis_used and result.seam_analyses:
         klass_counts: dict[str, int] = {}

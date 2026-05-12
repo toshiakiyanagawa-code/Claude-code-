@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from podedit.render import RenderError, render_cuts
+from podedit.edit import MoveOp, compile_timeline
+from podedit.render import RenderError, render_cuts, render_segments
 
 
 SR = 48000
@@ -136,3 +137,47 @@ def test_overlapping_deletes_merged_in_output(ramp_audio, tmp_path: Path) -> Non
     result = render_cuts(src, dur, deletes, out, crossfade_ms=0, lufs_target=None)
     # Expected duration_out = 5 - (3 - 1) = 3s
     assert result.duration_out == pytest.approx(3.0, abs=5e-3)
+
+
+def test_render_segments_supports_move_op(ramp_audio, tmp_path: Path) -> None:
+    src, dur = ramp_audio
+    out = tmp_path / "move.wav"
+    segments = compile_timeline(dur, [
+        MoveOp(op_id="move1", op="move", src_start=1.0, src_end=2.0, target_edited_t=4.0),
+    ])
+
+    result = render_segments(src, segments, out, source_duration=dur, move_count=1, crossfade_ms=0, lufs_target=None)
+    a, sr = _read(out)
+
+    assert sr == SR
+    assert result.duration_out == pytest.approx(5.0, abs=2e-3)
+    assert result.keeps == [(0.0, 1.0), (2.0, 4.0), (1.0, 2.0), (4.0, 5.0)]
+    assert result.segments_count == 4
+    assert result.move_count == 1
+    # The inserted segment starts at edited t=3s and comes from source t=1s.
+    assert a[int(3.0 * SR)] == pytest.approx(0.2, abs=5e-4)
+
+
+def test_move_render_with_crossfade_preserves_duration(ramp_audio, tmp_path: Path) -> None:
+    """Regression: ffmpeg's atrim can't rewind on a single input. With a
+    move op the segments are non-monotonic in source time, and a chained
+    acrossfade chain on top of `[0:a]atrim` silently produced ~25 s less
+    output than expected. The renderer now switches to per-segment
+    `-ss/-t -i` inputs when source order isn't monotonic. This test would
+    have caught it (the existing move test used crossfade_ms=0 so it never
+    invoked acrossfade).
+    """
+    src, dur = ramp_audio
+    out = tmp_path / "move_xfade.wav"
+    segments = compile_timeline(dur, [
+        MoveOp(op_id="move1", op="move", src_start=1.0, src_end=2.0, target_edited_t=4.0),
+    ])
+    result = render_segments(
+        src, segments, out, source_duration=dur, move_count=1,
+        crossfade_ms=10.0, lufs_target=None,
+    )
+    # 4 segments → 3 seams. Each 10 ms acrossfade trims 10 ms from total.
+    # Expected: 5.0 - 3 * 0.010 = 4.97 s. Allow ffmpeg frame-align slack.
+    assert result.duration_out == pytest.approx(4.97, abs=0.05)
+    assert result.segments_count == 4
+    assert result.move_count == 1

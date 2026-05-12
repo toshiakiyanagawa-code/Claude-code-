@@ -25,8 +25,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..audio import probe as audio_probe
-from ..edit import EditSession, sha256_of_file
-from ..render import RENDERER_VERSION, RenderError, render_cuts
+from ..edit import EditSession, compile_timeline, sha256_of_file
+from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
 from ..waveform import WaveformError, get_or_compute_waveform
 
@@ -274,11 +274,22 @@ def create_app(config: ServeConfig) -> FastAPI:
                     ),
                 )
             for op in new_session.ops:
-                if op.start < 0 or op.end > float(expected_duration) + 1e-3 or op.end <= op.start:
+                if op.op == "delete":
+                    src_start, src_end = op.start, op.end
+                elif op.op == "move":
+                    src_start, src_end = op.src_start, op.src_end
+                    if op.target_edited_t < 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"op {op.op_id} target_edited_t must be >= 0",
+                        )
+                else:
+                    raise HTTPException(status_code=400, detail=f"unsupported op {op.op!r}")
+                if src_start < 0 or src_end > float(expected_duration) + 1e-3 or src_end <= src_start:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"op {op.op_id} range {op.start}-{op.end} falls outside "
+                            f"op {op.op_id} range {src_start}-{src_end} falls outside "
                             f"[0, {float(expected_duration):.2f}]"
                         ),
                     )
@@ -299,7 +310,7 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     # ------- preview render (W5) -------
     # Renders the current session to a wav using the W5 PCM pipeline. Cached by
-    # a hash of (deletes + opts + renderer version), so re-clicking with no
+    # a hash of (ops + opts + renderer version), so re-clicking with no
     # edits is a free no-op and a renderer upgrade invalidates stale cache.
     # Render is synchronous; for the 30-min episode it takes ~75 s.
     @app.post("/api/preview/render")
@@ -312,10 +323,8 @@ def create_app(config: ServeConfig) -> FastAPI:
         true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
 
         with session_lock:
-            deletes = sorted(
-                (round(op.start, 3), round(op.end, 3))
-                for op in session.ops if op.op == "delete"
-            )
+            ops_for_render = list(session.ops)
+            ops_blob = session.to_dict().get("ops", [])
             source_duration = session.source_audio.duration_sec
 
         # Cache key covers every parameter that can change the bytes on disk.
@@ -323,7 +332,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         # invalidates previously-rendered previews.
         cache_key_blob = json.dumps(
             {
-                "deletes": deletes,
+                "ops": ops_blob,
                 "crossfade_ms": crossfade_ms,
                 "lufs_target": lufs_target,
                 "true_peak_ceiling_dbtp": true_peak,
@@ -339,11 +348,13 @@ def create_app(config: ServeConfig) -> FastAPI:
             _gc_previews(config.session_path.parent, config.audio_path.stem, keep=preview_path)
             t0 = time.time()
             try:
-                result = render_cuts(
+                segments = compile_timeline(source_duration, ops_for_render)
+                result = render_segments(
                     config.audio_path,
-                    source_duration=source_duration,
-                    deletes=list(deletes),
+                    segments=segments,
                     output=preview_path,
+                    source_duration=source_duration,
+                    move_count=sum(1 for op in ops_for_render if op.op == "move"),
                     crossfade_ms=crossfade_ms,
                     lufs_target=lufs_target,
                     true_peak_ceiling_dbtp=true_peak,
@@ -355,6 +366,8 @@ def create_app(config: ServeConfig) -> FastAPI:
                 "cache_key": cache_key, "wall_sec": time.time() - t0,
                 "duration_in": result.duration_in, "duration_out": result.duration_out,
                 "n_keeps": len(result.keeps),
+                "segments_count": result.segments_count,
+                "move_count": result.move_count,
                 "crossfade_ms_requested": result.crossfade_ms_requested,
                 "crossfade_ms_applied": result.crossfade_ms,
                 "lufs_target": lufs_target, "lufs_out": result.lufs_out,
@@ -379,7 +392,7 @@ def create_app(config: ServeConfig) -> FastAPI:
             "bytes": st.st_size,
             "duration_sec": preview_duration,
             "ops_hash": hashlib.sha256(
-                json.dumps(deletes).encode()
+                json.dumps(ops_blob, sort_keys=True).encode()
             ).hexdigest()[:16],
         }
 

@@ -10,11 +10,15 @@
   const $btnUndo = $('btn-undo');
   const $btnRedo = $('btn-redo');
   const $btnClear = $('btn-clear-sel');
+  const $btnCut = $('btn-cut');
+  const $btnPasteBefore = $('btn-paste-before');
+  const $btnPasteAfter = $('btn-paste-after');
   const $saveStatus = $('save-status');
   const $kpiOps = $('kpi-ops');
   const $kpiCut = $('kpi-cut');
   const $kpiElapsed = $('kpi-elapsed');
   const $skipPill = $('skip-pill');
+  const $clipboardPill = $('clipboard-pill');
   const $kpiTime = $('kpi-time');
   const $btnPlay = $('btn-play');
   const $timeCurrent = $('time-current');
@@ -58,9 +62,9 @@
 
   // ------- state -------
   const state = {
-    ops: [],           // active delete ops
+    ops: [],           // active delete/move ops
     mergedDeletes: [], // normalized [start, end][] cached from ops
-    timeline: [],      // [{sourceStart, sourceEnd, editedStart, editedEnd}] — keep ranges
+    timeline: [],      // [{sourceStart, sourceEnd, editedStart, editedEnd, originOpId}] in edited order
     editedDuration: 0, // sum of keep-range lengths; the "podcast duration after cuts"
     sourceDuration: 0, // unedited audio duration (from /api/audio/info)
     isScrubbing: false,
@@ -72,6 +76,8 @@
     undoStack: [],     // {type:'add'|'remove', op}
     redoStack: [],
     selection: null,   // {anchor: wordIdx, extent: wordIdx} (inclusive)
+    clipboard: null,   // {src_start, src_end, duration_sec}
+    pasteAnchor: null, // wordIdx used by Paste Before/After
     sessionTemplate: null,
     saveStatus: 'idle',
     saveTimer: null,
@@ -80,8 +86,9 @@
   };
 
   function recomputeMergedDeletes() {
-    if (state.ops.length === 0) { state.mergedDeletes = []; return; }
-    const sorted = state.ops.map((o) => [o.start, o.end]).sort((a, b) => a[0] - b[0]);
+    const deletes = state.ops.filter((o) => o.op === 'delete');
+    if (deletes.length === 0) { state.mergedDeletes = []; return; }
+    const sorted = deletes.map((o) => [o.start, o.end]).sort((a, b) => a[0] - b[0]);
     const merged = [sorted[0].slice()];
     for (let i = 1; i < sorted.length; i++) {
       const cur = sorted[i];
@@ -92,29 +99,131 @@
     state.mergedDeletes = merged;
   }
 
+  function renumberSegments(segments) {
+    let edited = 0;
+    const out = [];
+    for (const seg of segments) {
+      const span = seg.sourceEnd - seg.sourceStart;
+      if (span <= 0) continue;
+      out.push({
+        sourceStart: seg.sourceStart,
+        sourceEnd: seg.sourceEnd,
+        editedStart: edited,
+        editedEnd: edited + span,
+        originOpId: seg.originOpId ?? null,
+      });
+      edited += span;
+    }
+    return out;
+  }
+
+  function cutSourceRange(segments, start, end, movedOriginOpId) {
+    const kept = [];
+    const cut = [];
+    for (const seg of segments) {
+      const cs = Math.max(seg.sourceStart, start);
+      const ce = Math.min(seg.sourceEnd, end);
+      if (ce <= cs) {
+        kept.push(seg);
+        continue;
+      }
+      if (seg.sourceStart < cs) {
+        kept.push({
+          sourceStart: seg.sourceStart,
+          sourceEnd: cs,
+          editedStart: seg.editedStart,
+          editedEnd: seg.editedStart + (cs - seg.sourceStart),
+          originOpId: seg.originOpId ?? null,
+        });
+      }
+      cut.push({
+        sourceStart: cs,
+        sourceEnd: ce,
+        editedStart: seg.editedStart + (cs - seg.sourceStart),
+        editedEnd: seg.editedStart + (ce - seg.sourceStart),
+        originOpId: movedOriginOpId ?? seg.originOpId ?? null,
+      });
+      if (ce < seg.sourceEnd) {
+        kept.push({
+          sourceStart: ce,
+          sourceEnd: seg.sourceEnd,
+          editedStart: seg.editedStart + (ce - seg.sourceStart),
+          editedEnd: seg.editedEnd,
+          originOpId: seg.originOpId ?? null,
+        });
+      }
+    }
+    return { kept: renumberSegments(kept), cut };
+  }
+
+  function targetInsideSourceRange(segments, target, sourceStart, sourceEnd) {
+    for (const seg of segments) {
+      if (target >= seg.editedStart && target < seg.editedEnd) {
+        const src = seg.sourceStart + (target - seg.editedStart);
+        return src >= sourceStart && src < sourceEnd;
+      }
+    }
+    return false;
+  }
+
+  function translateTargetAfterCut(target, cut) {
+    let removedBefore = 0;
+    for (const seg of cut) {
+      if (seg.editedEnd <= target) removedBefore += seg.editedEnd - seg.editedStart;
+      else if (seg.editedStart < target && target < seg.editedEnd) removedBefore += target - seg.editedStart;
+    }
+    return Math.max(0, target - removedBefore);
+  }
+
+  function insertSegmentsAt(segments, inserts, target) {
+    const total = segments.reduce((sum, seg) => sum + (seg.sourceEnd - seg.sourceStart), 0);
+    target = Math.max(0, Math.min(target, total));
+    const out = [];
+    let inserted = false;
+    for (const seg of segments) {
+      if (!inserted && target <= seg.editedStart) {
+        out.push(...inserts);
+        inserted = true;
+      }
+      if (!inserted && seg.editedStart < target && target < seg.editedEnd) {
+        const split = seg.sourceStart + (target - seg.editedStart);
+        out.push({ sourceStart: seg.sourceStart, sourceEnd: split, editedStart: seg.editedStart, editedEnd: target, originOpId: seg.originOpId ?? null });
+        out.push(...inserts);
+        out.push({ sourceStart: split, sourceEnd: seg.sourceEnd, editedStart: target, editedEnd: seg.editedEnd, originOpId: seg.originOpId ?? null });
+        inserted = true;
+      } else {
+        out.push(seg);
+      }
+    }
+    if (!inserted) out.push(...inserts);
+    return renumberSegments(out);
+  }
+
+  function compileTimeline(sourceDuration, ops) {
+    if (sourceDuration <= 0) return [];
+    let segments = [{ sourceStart: 0, sourceEnd: sourceDuration, editedStart: 0, editedEnd: sourceDuration, originOpId: null }];
+    for (const op of ops) {
+      if (op.op === 'delete') {
+        segments = cutSourceRange(segments, op.start, op.end, null).kept;
+      } else if (op.op === 'move') {
+        if (targetInsideSourceRange(segments, op.target_edited_t, op.src_start, op.src_end)) continue;
+        const cutResult = cutSourceRange(segments, op.src_start, op.src_end, op.op_id);
+        segments = cutResult.kept;
+        if (cutResult.cut.length) {
+          segments = insertSegmentsAt(segments, cutResult.cut, translateTargetAfterCut(op.target_edited_t, cutResult.cut));
+        }
+      }
+      segments = renumberSegments(segments);
+    }
+    return segments;
+  }
+
   // Virtual timeline: the "edited" timeline is what the user sees on the
   // scrubber and time displays. The audio element keeps playing on the source
   // timeline; sourceToEdited()/editedToSource() bridge between the two.
   function rebuildTimeline() {
-    const keeps = [];
-    let cursor = 0;
-    let edited = 0;
-    const dur = state.sourceDuration;
-    for (const [s, e] of state.mergedDeletes) {
-      if (cursor < s) {
-        const span = s - cursor;
-        keeps.push({ sourceStart: cursor, sourceEnd: s, editedStart: edited, editedEnd: edited + span });
-        edited += span;
-      }
-      cursor = Math.max(cursor, e);
-    }
-    if (cursor < dur) {
-      const span = dur - cursor;
-      keeps.push({ sourceStart: cursor, sourceEnd: dur, editedStart: edited, editedEnd: edited + span });
-      edited += span;
-    }
-    state.timeline = keeps;
-    state.editedDuration = edited;
+    state.timeline = compileTimeline(state.sourceDuration, state.ops);
+    state.editedDuration = state.timeline.reduce((sum, r) => sum + (r.sourceEnd - r.sourceStart), 0);
   }
 
   function editedToSource(t) {
@@ -131,9 +240,10 @@
   function sourceToEdited(t) {
     if (!state.timeline.length) return 0;
     for (const r of state.timeline) {
-      if (t < r.sourceStart) return r.editedStart;  // playhead is in a cut; clamp to next keep
-      if (t <= r.sourceEnd) return r.editedStart + (t - r.sourceStart);
+      if (t >= r.sourceStart && t < r.sourceEnd) return r.editedStart + (t - r.sourceStart);
     }
+    const next = state.timeline.find((r) => t < r.sourceStart);
+    if (next) return next.editedStart;
     return state.editedDuration;
   }
   const words = [];    // [{el, start, end, idx, segIdx}]
@@ -246,6 +356,12 @@
     dragMoved = false;
 
     if (!wasDrag) {
+      if (state.clipboard) {
+        setPasteAnchor(startIdx);
+        clearSelection();
+        logKPI('ui.paste.anchor', { word_idx: startIdx, t: words[startIdx].start });
+        return;
+      }
       // Plain click: seek + play. Selection collapses to this one word so D
       // can still delete a single word if the user wants.
       const w = words[startIdx];
@@ -307,7 +423,27 @@
     for (const w of words) w.el.classList.remove('selected');
     if (r) for (let i = r.ws; i <= r.we; i++) words[i].el.classList.add('selected');
     $btnDelete.disabled = !r;
+    $btnCut.disabled = !r;
     $btnClear.disabled = !r;
+  }
+
+  function renderPasteAnchor() {
+    for (const w of words) w.el.classList.toggle('paste-anchor', state.pasteAnchor === w.idx);
+    const canPaste = !!state.clipboard && state.pasteAnchor != null;
+    $btnPasteBefore.disabled = !canPaste;
+    $btnPasteAfter.disabled = !canPaste;
+    if (state.clipboard) {
+      $clipboardPill.hidden = false;
+      $clipboardPill.textContent = `${fmtMs(state.clipboard.duration_sec)} copied`;
+    } else {
+      $clipboardPill.hidden = true;
+      $clipboardPill.textContent = '';
+    }
+  }
+
+  function setPasteAnchor(i) {
+    state.pasteAnchor = i;
+    renderPasteAnchor();
   }
 
   function clearSelection() {
@@ -340,6 +476,64 @@
     if (!r) return;
     applyDeleteRange(r.start, r.end);
     clearSelection();
+  }
+
+  function cutSelected() {
+    const r = selectionRange();
+    if (!r) return;
+    state.clipboard = { src_start: r.start, src_end: r.end, duration_sec: r.end - r.start };
+    state.pasteAnchor = null;
+    clearSelection();
+    renderPasteAnchor();
+    logKPI('ui.clipboard.cut', { start: r.start, end: r.end, duration: r.end - r.start });
+  }
+
+  function applyMoveRange(srcStart, srcEnd, targetEditedT) {
+    if (srcEnd <= srcStart || targetEditedT < 0) return;
+    if (state.previewMode) revertToSource('apply-move');
+    else state.renderSeq += 1;
+    const op = {
+      op_id: newOpId(),
+      op: 'move',
+      src_start: srcStart,
+      src_end: srcEnd,
+      target_edited_t: targetEditedT,
+      note: null,
+    };
+    state.ops.push(op);
+    state.undoStack.push({ type: 'add', op });
+    state.redoStack = [];
+    kpi.opsCount += 1;
+    if (!kpi.firstOpAt) kpi.firstOpAt = Date.now() / 1000;
+    logKPI('ui.op.move', {
+      op_id: op.op_id,
+      src_start: srcStart,
+      src_end: srcEnd,
+      target_edited_t: targetEditedT,
+      duration: srcEnd - srcStart,
+    });
+    state.clipboard = null;
+    state.pasteAnchor = null;
+    rerenderOps();
+    renderPasteAnchor();
+    refreshButtons();
+    scheduleSave();
+  }
+
+  function findPlayheadWord() {
+    const t = state.previewMode ? editedToSource($player.currentTime) : $player.currentTime;
+    const idx = findActive(t);
+    return idx >= 0 ? idx : 0;
+  }
+
+  function pasteClipboard(where) {
+    if (!state.clipboard) return;
+    const anchorIdx = state.pasteAnchor != null ? state.pasteAnchor : findPlayheadWord();
+    const anchor = words[anchorIdx];
+    if (!anchor) return;
+    const anchorEdited = sourceToEdited(anchor.start);
+    const targetEditedT = where === 'after' ? anchorEdited + (anchor.end - anchor.start) : anchorEdited;
+    applyMoveRange(state.clipboard.src_start, state.clipboard.src_end, targetEditedT);
   }
 
   function undo() {
@@ -402,12 +596,14 @@
       }
     }
     // Tag every word as deleted if it lies entirely within ANY merged delete
-    // range. Strict inclusion avoids half-shading words that only partly fall
-    // in a cut; partial-overlap visualization arrives in W5.
+    // range or if no compiled segment contains it. Strict inclusion avoids
+    // half-shading words that only partly fall in a cut.
     for (const w of words) {
-      const inCut = state.mergedDeletes.some(([s, e]) => w.start >= s && w.end <= e);
+      const inCompiledTimeline = state.timeline.some((r) => w.start >= r.sourceStart && w.end <= r.sourceEnd);
+      const inCut = !inCompiledTimeline || state.mergedDeletes.some(([s, e]) => w.start >= s && w.end <= e);
       w.el.classList.toggle('deleted', inCut);
     }
+    renderPasteAnchor();
     updateStats();
   }
 
@@ -615,6 +811,9 @@
   $btnUndo.addEventListener('click', undo);
   $btnRedo.addEventListener('click', redo);
   $btnClear.addEventListener('click', clearSelection);
+  $btnCut.addEventListener('click', cutSelected);
+  $btnPasteBefore.addEventListener('click', () => pasteClipboard('before'));
+  $btnPasteAfter.addEventListener('click', () => pasteClipboard('after'));
 
   // ------- custom player controls -------
   $btnPlay.addEventListener('click', () => {
@@ -855,6 +1054,18 @@
       if (e.shiftKey) redo(); else undo();
       return;
     }
+    if (mod && (e.key === 'x' || e.key === 'X')) {
+      if (!state.selection) return;
+      e.preventDefault();
+      cutSelected();
+      return;
+    }
+    if (mod && (e.key === 'v' || e.key === 'V')) {
+      if (!state.clipboard) return;
+      e.preventDefault();
+      pasteClipboard('after');
+      return;
+    }
     if (e.key === 'd' || e.key === 'D') {
       // Delete shortcut only fires when there's a selection; never grab plain
       // letters from text inputs (there are none in this UI yet).
@@ -899,5 +1110,6 @@
 
   // ------- initial paint -------
   rerenderOps();
+  renderPasteAnchor();
   refreshButtons();
 })();

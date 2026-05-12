@@ -27,10 +27,14 @@
   <button id="btn-undo" disabled title="Undo (⌘Z)">Undo <kbd>⌘Z</kbd></button>
   <button id="btn-redo" disabled title="Redo (⌘⇧Z)">Redo <kbd>⌘⇧Z</kbd></button>
   <button id="btn-clear-sel" disabled title="Clear selection (Esc)">Clear <kbd>Esc</kbd></button>
+  <button id="btn-cut" disabled title="Cut selected range to clipboard (⌘X)">Cut <kbd>⌘X</kbd></button>
+  <button id="btn-paste-before" disabled title="Paste clipboard before marked word">Paste Before</button>
+  <button id="btn-paste-after" disabled title="Paste clipboard after marked word (⌘V)">Paste After <kbd>⌘V</kbd></button>
   <button id="btn-audition" title="Render preview (sample-precise + crossfade + LUFS)">Audition</button>
   <span class="mode-pill" id="mode-pill">source</span>
   <span class="spacer"></span>
   <span class="skip-pill" id="skip-pill" title="Flashes red while playhead is inside a cut">no cut</span>
+  <span class="clipboard-pill" id="clipboard-pill" hidden></span>
   <span class="stat"><strong id="kpi-time">0.00s</strong></span>
   <span class="stat"><strong id="kpi-ops">0</strong> ops · <strong id="kpi-cut">0.0s</strong> cut · <strong id="kpi-elapsed">0:00</strong></span>
   <span id="save-status" class="save-idle">·</span>

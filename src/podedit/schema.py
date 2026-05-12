@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
+ESS_SCHEMA_VERSION = 2
 
 
 @dataclass(slots=True)

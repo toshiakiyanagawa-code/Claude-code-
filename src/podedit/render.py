@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from .edit import keep_ranges_from_deletes
+from .edit import DeleteOp, TimelineSegment, compile_timeline
 from .seam_eval import SeamAnalysis, analyze_seam
 
 
@@ -30,7 +30,7 @@ class RenderError(RuntimeError):
 
 # Bump when output-affecting render logic changes so cached previews aren't
 # silently reused across upgrades. Server preview cache keys include this.
-RENDERER_VERSION = "w7.0"
+RENDERER_VERSION = "w7.5"
 
 
 # Output formats accepted by ``render_cuts``. Picked from the extension of the
@@ -81,9 +81,17 @@ def _measure_loudnorm(
     output target. We discard the audio (``-f null -``) and just scrape the
     final JSON block.
     """
+    # Same non-monotonic problem as in the apply pass: when move ops put keeps
+    # out of source order, a single -i + atrim chain can't rewind. Detect and
+    # switch to per-segment -ss/-t inputs.
+    use_multi_input = not _is_source_monotonic(keeps)
+
     parts: list[str] = []
     for i, (s, e) in enumerate(keeps):
-        parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
+        if use_multi_input:
+            parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[k{i}]")
+        else:
+            parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
     n = len(keeps)
     if n == 1:
         cur = "[k0]"
@@ -101,10 +109,16 @@ def _measure_loudnorm(
         f"{cur}loudnorm=I={lufs_target}:TP={true_peak_ceiling_dbtp}:LRA=11:print_format=json[out]"
     )
     fc = ";".join(parts)
+    if use_multi_input:
+        input_args: list[str] = []
+        for s, e in keeps:
+            input_args.extend(["-ss", f"{s:.6f}", "-t", f"{(e - s):.6f}", "-i", str(source)])
+    else:
+        input_args = ["-i", str(source)]
     try:
         proc = subprocess.run(
             ["ffmpeg", "-y", "-hide_banner", "-nostats",
-             "-i", str(source),
+             *input_args,
              "-filter_complex", fc, "-map", "[out]",
              "-f", "null", "-"],
             capture_output=True, text=True, check=False,
@@ -160,6 +174,8 @@ class RenderResult:
     output_format: str = "wav"             # "wav" | "mp3" | "flac" | "ogg" | "m4a"
     lufs_two_pass: bool = False            # True when we ran the measure pass first
     lufs_measured_input: float | None = None  # pass-1 integrated LUFS of the input
+    segments_count: int = 0
+    move_count: int = 0
 
 
 def _ebur128_measure(path: Path, *, timeout_sec: float | None = None) -> tuple[float | None, float | None]:
@@ -245,6 +261,20 @@ def _probe_source_sample_rate(source: Path) -> int | None:
         return None
 
 
+def _is_source_monotonic(keeps: list[tuple[float, float]]) -> bool:
+    """True when every keep begins at or after the previous keep ends.
+
+    Single-input + multiple `atrim` only works for monotonic source access:
+    ffmpeg's demuxer advances forward and atrim can't rewind. When move ops
+    are present the segments are in EDITED order and may jump backward in
+    source space, so we need the per-segment ``-ss/-t -i`` workaround below.
+    """
+    for i in range(1, len(keeps)):
+        if keeps[i][0] < keeps[i - 1][1] - 1e-6:
+            return False
+    return True
+
+
 def _build_filtergraph(
     keeps: list[tuple[float, float]],
     seam_xfades_ms: list[float],
@@ -253,6 +283,7 @@ def _build_filtergraph(
     source_sample_rate: int | None,
     *,
     measured: LoudnormStats | None = None,
+    multi_input: bool = False,
 ) -> str:
     """Build the ffmpeg filter graph.
 
@@ -261,12 +292,21 @@ def _build_filtergraph(
     value drives an equal-power ``acrossfade``. Mixing is supported per-seam
     so a transient cut can stay short while an adjacent silence-to-silence
     cut takes the full 50 ms.
+
+    When ``multi_input=True`` each keep range is expected to arrive as its
+    own input stream (``[0:a]`` ... ``[N-1:a]``) — see ``_render_multi_input``
+    — so the head of every chain is just ``asetpts=PTS-STARTPTS`` instead of
+    ``atrim`` on a shared input.
     """
     parts: list[str] = []
     for i, (s, e) in enumerate(keeps):
-        # asetpts=PTS-STARTPTS resets the timestamps so the downstream filter
-        # sees each chunk starting at 0.
-        parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
+        if multi_input:
+            # Caller passes one -ss/-t input per segment, so we already have
+            # the right bytes — just reset PTS to 0 for the chain.
+            parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[k{i}]")
+        else:
+            # Single input + atrim. Only valid for monotonic source order.
+            parts.append(f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]")
 
     n = len(keeps)
     if n == 1:
@@ -336,12 +376,13 @@ def _measure_loudness(path: Path) -> tuple[float | None, float | None]:
     return lufs, peak_dbtp
 
 
-def render_cuts(
+def render_segments(
     source: Path,
-    source_duration: float,
-    deletes: list[tuple[float, float]],
+    segments: list[TimelineSegment],
     output: Path,
     *,
+    source_duration: float | None = None,
+    move_count: int = 0,
     crossfade_ms: float = 10.0,
     lufs_target: float | None = -16.0,
     true_peak_ceiling_dbtp: float = -1.0,
@@ -349,19 +390,21 @@ def render_cuts(
     lufs_two_pass: bool = False,
     ffmpeg_timeout_sec: float | None = None,
 ) -> RenderResult:
-    """Apply ``deletes`` to ``source`` and write a wav with sample-precise cuts.
+    """Render edited-order timeline segments from ``source``.
 
-    Cuts use an equal-power constant-energy crossfade (``acrossfade c1=qsin
+    Seams use an equal-power constant-energy crossfade (``acrossfade c1=qsin
     c2=qsin``); the splice trims ``crossfade_ms`` from each seam. Set
     ``crossfade_ms=0`` for a hard splice, or ``lufs_target=None`` to skip
-    loudness normalization. The output is always PCM s16le wav.
+    loudness normalization.
     """
     if shutil.which("ffmpeg") is None:
         raise RenderError("ffmpeg not found on PATH")
 
-    keeps = keep_ranges_from_deletes(source_duration, deletes)
+    keeps = [(seg.source_start, seg.source_end) for seg in segments]
     if not keeps:
         raise RenderError("All audio is deleted; no output to render.")
+    if source_duration is None:
+        source_duration = max((e for _, e in keeps), default=0.0)
 
     requested_xfade = crossfade_ms
 
@@ -444,16 +487,31 @@ def render_cuts(
             timeout_sec=ffmpeg_timeout_sec,
         )
 
+    # If any move op put segments in non-monotonic source order, a single
+    # ``-i SOURCE`` + atrim can't rewind — ffmpeg's demuxer only goes forward,
+    # so atrim returns empty/truncated streams for ranges earlier than ones
+    # already consumed. Open the file once per segment with ``-ss/-t -i`` and
+    # let acrossfade see them as independent inputs. This is a real W7.5
+    # correctness fix; without it move renders silently drop ~25 s of audio.
+    use_multi_input = not _is_source_monotonic(keeps)
+
     fc = _build_filtergraph(
         keeps, seam_xfades_ms, lufs_target, true_peak_ceiling_dbtp, source_sample_rate,
-        measured=measured,
+        measured=measured, multi_input=use_multi_input,
     )
+
+    if use_multi_input:
+        input_args: list[str] = []
+        for s, e in keeps:
+            input_args.extend(["-ss", f"{s:.6f}", "-t", f"{(e - s):.6f}", "-i", str(source)])
+    else:
+        input_args = ["-i", str(source)]
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-loglevel", "error", "-nostats",
-                "-i", str(source),
+                *input_args,
                 "-filter_complex", fc,
                 "-map", "[out]",
                 *codec_args,
@@ -512,4 +570,40 @@ def render_cuts(
         output_format=output.suffix.lower().lstrip("."),
         lufs_two_pass=lufs_two_pass and measured is not None,
         lufs_measured_input=measured.input_i if measured else None,
+        segments_count=len(keeps),
+        move_count=move_count,
+    )
+
+
+def render_cuts(
+    source: Path,
+    source_duration: float,
+    deletes: list[tuple[float, float]],
+    output: Path,
+    *,
+    crossfade_ms: float = 10.0,
+    lufs_target: float | None = -16.0,
+    true_peak_ceiling_dbtp: float = -1.0,
+    seam_analysis: bool = True,
+    lufs_two_pass: bool = False,
+    ffmpeg_timeout_sec: float | None = None,
+) -> RenderResult:
+    """Backward-compatible delete-only shim over ``render_segments``."""
+    ops = [
+        DeleteOp(op_id=f"render-delete-{i}", op="delete", start=s, end=e)
+        for i, (s, e) in enumerate(deletes)
+    ]
+    segments = compile_timeline(source_duration, ops)
+    return render_segments(
+        source,
+        segments,
+        output,
+        source_duration=source_duration,
+        move_count=0,
+        crossfade_ms=crossfade_ms,
+        lufs_target=lufs_target,
+        true_peak_ceiling_dbtp=true_peak_ceiling_dbtp,
+        seam_analysis=seam_analysis,
+        lufs_two_pass=lufs_two_pass,
+        ffmpeg_timeout_sec=ffmpeg_timeout_sec,
     )

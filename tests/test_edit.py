@@ -1,6 +1,6 @@
 import json
 
-from podedit.edit import EditSession, keep_ranges_from_deletes
+from podedit.edit import EditSession, MoveOp, keep_ranges_from_deletes
 from podedit.schema import AudioRef
 
 
@@ -105,6 +105,38 @@ def test_session_roundtrip_via_dict() -> None:
     assert (loaded.ops[0].start, loaded.ops[0].end) == (10.0, 15.0)
     assert loaded.ops[0].note == "filler"
     assert loaded.ops[1].note is None
+
+
+def test_session_roundtrip_with_move_op() -> None:
+    src = AudioRef(path="ep.m4a", duration_sec=100.0, sample_rate=48000, channels=2, codec="aac")
+    s = EditSession.new(source_audio=src)
+    s.add_delete(10.0, 12.0)
+    move = s.add_move(30.0, 35.0, 5.0, note="move intro")
+
+    loaded = EditSession.from_dict(json.loads(json.dumps(s.to_dict())))
+
+    assert loaded.schema_version == 2
+    assert len(loaded.ops) == 2
+    assert isinstance(loaded.ops[1], MoveOp)
+    assert loaded.ops[1].op_id == move.op_id
+    assert loaded.ops[1].src_start == 30.0
+    assert loaded.ops[1].src_end == 35.0
+    assert loaded.ops[1].target_edited_t == 5.0
+    assert loaded.ops[1].note == "move intro"
+
+
+def test_session_from_dict_upgrades_v1_delete_only_session_to_v2() -> None:
+    src = AudioRef(path="ep.m4a", duration_sec=100.0, sample_rate=48000, channels=2, codec="aac")
+    s = EditSession.new(source_audio=src)
+    s.add_delete(10.0, 15.0)
+    data = s.to_dict()
+    data["schema_version"] = 1
+
+    loaded = EditSession.from_dict(data)
+
+    assert loaded.schema_version == 2
+    assert len(loaded.ops) == 1
+    assert loaded.ops[0].op == "delete"
 
 
 def test_session_from_dict_rejects_wrong_schema_version() -> None:
