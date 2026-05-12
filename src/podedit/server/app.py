@@ -165,6 +165,43 @@ def create_app(config: ServeConfig) -> FastAPI:
             new_session = EditSession.from_dict(body)
         except (KeyError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"invalid session: {e}") from e
+
+        # The incoming session must belong to the audio we're currently serving.
+        # Skipping these checks would let a stray PUT (different episode / wrong
+        # timeline_basis / out-of-range ops) silently overwrite the file on disk.
+        if new_session.timeline_basis != "source_audio_seconds":
+            raise HTTPException(
+                status_code=400,
+                detail=f"timeline_basis must be 'source_audio_seconds', got {new_session.timeline_basis!r}",
+            )
+        expected_src = transcript_data.get("source_audio") or {}
+        expected_sha = expected_src.get("sha256")
+        actual_sha = new_session.source_audio.sha256
+        if expected_sha and actual_sha and expected_sha != actual_sha:
+            raise HTTPException(
+                status_code=400,
+                detail=f"session source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
+            )
+        expected_duration = expected_src.get("duration_sec")
+        if expected_duration is not None:
+            if abs(new_session.source_audio.duration_sec - float(expected_duration)) > DURATION_TOLERANCE_SEC:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"session source duration {new_session.source_audio.duration_sec:.2f}s "
+                        f"doesn't match served audio {float(expected_duration):.2f}s"
+                    ),
+                )
+            for op in new_session.ops:
+                if op.start < 0 or op.end > float(expected_duration) + 1e-3 or op.end <= op.start:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"op {op.op_id} range {op.start}-{op.end} falls outside "
+                            f"[0, {float(expected_duration):.2f}]"
+                        ),
+                    )
+
         with session_lock:
             session = new_session
             _atomic_write_text(

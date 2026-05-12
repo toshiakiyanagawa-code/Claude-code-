@@ -23,8 +23,14 @@
     return `${m}:${r.toFixed(2).padStart(5, '0')}`;
   };
   const fmtMs = (s) => `${s.toFixed(1)}s`;
-  function uuid8() {
-    return 'xxxxxxxx'.replace(/x/g, () => ((Math.random() * 16) | 0).toString(16));
+  function newOpId() {
+    // Prefer crypto.randomUUID where available; fall back to 8-char hex.
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return 'op-' + crypto.randomUUID();
+    }
+    let s = '';
+    for (let i = 0; i < 8; i++) s += ((Math.random() * 16) | 0).toString(16);
+    return 'op-' + s;
   }
   async function fetchJSON(url, init) {
     const r = await fetch(url, init);
@@ -44,14 +50,29 @@
   // ------- state -------
   const state = {
     ops: [],           // active delete ops
+    mergedDeletes: [], // normalized [start, end][] cached from ops; for preview-skip + total
     undoStack: [],     // {type:'add'|'remove', op}
     redoStack: [],
     selection: null,   // {anchor: wordIdx, extent: wordIdx} (inclusive)
-    sessionTemplate: null,  // {schema_version, timeline_basis, source_audio, transcript_ref, created_at, ops}
+    sessionTemplate: null,
     saveStatus: 'idle',
     saveTimer: null,
     saveDirty: false,
+    saveSeq: 0,        // monotonic; only the latest save can claim 'saved'
   };
+
+  function recomputeMergedDeletes() {
+    if (state.ops.length === 0) { state.mergedDeletes = []; return; }
+    const sorted = state.ops.map((o) => [o.start, o.end]).sort((a, b) => a[0] - b[0]);
+    const merged = [sorted[0].slice()];
+    for (let i = 1; i < sorted.length; i++) {
+      const cur = sorted[i];
+      const last = merged[merged.length - 1];
+      if (cur[0] <= last[1]) last[1] = Math.max(last[1], cur[1]);
+      else merged.push(cur.slice());
+    }
+    state.mergedDeletes = merged;
+  }
   const words = [];    // [{el, start, end, idx, segIdx}]
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
 
@@ -145,7 +166,7 @@
   // ------- ops -------
   function applyDeleteRange(start, end) {
     if (end <= start) return;
-    const op = { op_id: 'op-' + uuid8(), op: 'delete', start, end, note: null };
+    const op = { op_id: newOpId(), op: 'delete', start, end, note: null };
     state.ops.push(op);
     state.undoStack.push({ type: 'add', op });
     state.redoStack = [];
@@ -195,11 +216,12 @@
   }
 
   function rerenderOps() {
-    // Tag every word as deleted if it lies entirely within a delete op.
-    // Using strict inclusion (start >= op.start && end <= op.end) avoids
-    // half-shading words that only partly fall in a cut.
+    recomputeMergedDeletes();
+    // Tag every word as deleted if it lies entirely within ANY merged delete
+    // range. Strict inclusion avoids half-shading words that only partly fall
+    // in a cut; partial-overlap visualization arrives in W5.
     for (const w of words) {
-      const inCut = state.ops.some((op) => w.start >= op.start && w.end <= op.end);
+      const inCut = state.mergedDeletes.some(([s, e]) => w.start >= s && w.end <= e);
       w.el.classList.toggle('deleted', inCut);
     }
     updateStats();
@@ -211,7 +233,8 @@
   }
 
   function updateStats() {
-    const cut = state.ops.reduce((s, o) => s + (o.end - o.start), 0);
+    // Use merged ranges so overlapping/duplicate ops don't double-count.
+    const cut = state.mergedDeletes.reduce((s, [a, b]) => s + (b - a), 0);
     $kpiOps.textContent = String(state.ops.length);
     $kpiCut.textContent = fmtMs(cut);
   }
@@ -248,6 +271,7 @@
     state.saveTimer = setTimeout(doSave, 300);
   }
   async function doSave() {
+    const mySeq = ++state.saveSeq;
     setSaveStatus('saving');
     const t = performance.now();
     try {
@@ -257,12 +281,15 @@
         headers: { 'Content-Type': 'application/json' },
         body,
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
       const reply = await r.json();
+      // A newer save started while we were in flight; let it own the final status.
+      if (mySeq !== state.saveSeq) return;
       state.saveDirty = false;
       setSaveStatus('saved');
       logKPI('ui.session.saved', { latency_ms: performance.now() - t, ops: reply.ops });
     } catch (e) {
+      if (mySeq !== state.saveSeq) return;
       setSaveStatus('error:' + e.message);
       logKPI('ui.session.save_error', { error: e.message });
     }
@@ -289,20 +316,18 @@
     }
   }
   function tick() {
-    const t = $player.currentTime;
-
-    // Preview-skip: if the playhead is inside a delete op, jump to its end.
-    // Loop in case adjacent cuts chain.
-    for (let i = 0; i < state.ops.length; i++) {
-      let jumped = false;
-      for (const op of state.ops) {
-        if (t >= op.start && t < op.end) {
-          $player.currentTime = op.end;
-          jumped = true;
-          break;
-        }
+    // Preview-skip: walk the merged (sorted, non-overlapping) delete ranges
+    // and jump over any that the playhead lands inside. mergedDeletes is
+    // sorted so a single linear scan suffices, but recompute `t` after each
+    // jump in case the new position lands inside the next range.
+    let t = $player.currentTime;
+    for (const [s, e] of state.mergedDeletes) {
+      if (t >= s && t < e) {
+        $player.currentTime = e;
+        t = e;
+      } else if (t < s) {
+        break;  // ranges are sorted; remaining ones are further ahead
       }
-      if (!jumped) break;
     }
 
     const idx = findActive($player.currentTime);
@@ -326,6 +351,9 @@
 
   // ------- keyboard shortcuts -------
   document.addEventListener('keydown', (e) => {
+    // Never grab keys while an IME is composing — Japanese/CJK input would
+    // otherwise lose characters mid-conversion.
+    if (e.isComposing || e.keyCode === 229) return;
     const mod = e.metaKey || e.ctrlKey;
     if (mod && (e.key === 'z' || e.key === 'Z')) {
       e.preventDefault();
@@ -349,6 +377,14 @@
     }
     if (e.key === 'Escape') {
       clearSelection();
+    }
+  });
+
+  // ------- guard against losing unsaved work on tab close -------
+  window.addEventListener('beforeunload', (e) => {
+    if (state.saveDirty || state.saveStatus.startsWith('saving') || state.saveStatus.startsWith('error')) {
+      e.preventDefault();
+      e.returnValue = '';
     }
   });
 
