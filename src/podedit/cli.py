@@ -210,6 +210,12 @@ def _parse_range(rng: str) -> tuple[float, float]:
               help="Link this transcript JSON to the session (optional)")
 @click.option("--no-checksum", is_flag=True, default=False,
               help="Skip SHA-256 of source audio (faster, less reproducible)")
+@click.option("--crossfade-ms", default=10.0, show_default=True, type=float,
+              help="Equal-power crossfade across each cut boundary. 0 = hard splice.")
+@click.option("--lufs-target", default=-16.0, show_default=True, type=float,
+              help="Integrated loudness target. Use a sentinel like 999 with --no-lufs to skip.")
+@click.option("--no-lufs", is_flag=True, default=False,
+              help="Skip LUFS normalization entirely.")
 def cut_cmd(
     audio: Path,
     deletes: tuple[str, ...],
@@ -217,10 +223,14 @@ def cut_cmd(
     save_session: Path | None,
     transcript: Path | None,
     no_checksum: bool,
+    crossfade_ms: float,
+    lufs_target: float,
+    no_lufs: bool,
 ) -> None:
     """Apply --delete ranges to AUDIO and write a wav with those ranges removed.
 
-    W2 minimum: no crossfade, no de-click. Cuts are hard ffmpeg atrim+concat splices.
+    W5: sample-precise PCM render with an equal-power crossfade at each cut
+    boundary and optional LUFS normalization (default -16 LUFS for podcasts).
     """
     try:
         ranges = [_parse_range(r) for r in deletes]
@@ -256,7 +266,11 @@ def cut_cmd(
         session.add_delete(s, e)
 
     try:
-        result = render_cuts(audio, info.duration_sec, ranges, out_path)
+        result = render_cuts(
+            audio, info.duration_sec, ranges, out_path,
+            crossfade_ms=crossfade_ms,
+            lufs_target=None if no_lufs else lufs_target,
+        )
     except RenderError as e:
         _fatal(str(e))
 
@@ -264,8 +278,12 @@ def cut_cmd(
         f"[green]✓[/green] {out_path}  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
-        f"{len(result.keeps)} keep ranges)"
+        f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
     )
+    if result.lufs_in is not None:
+        lufs_after = f" → {result.lufs_out:.1f} LUFS" if result.lufs_out is not None else ""
+        peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
+        console.print(f"  Loudness: {result.lufs_in:.1f} LUFS{lufs_after}{peak}")
 
     if save_session:
         save_session.parent.mkdir(parents=True, exist_ok=True)
@@ -282,11 +300,17 @@ def cut_cmd(
               help="Use this audio file instead of the path recorded in the session")
 @click.option("--check-checksum/--no-check-checksum", default=True, show_default=True,
               help="Verify the source SHA-256 matches the session record")
+@click.option("--crossfade-ms", default=10.0, show_default=True, type=float)
+@click.option("--lufs-target", default=-16.0, show_default=True, type=float)
+@click.option("--no-lufs", is_flag=True, default=False, help="Skip LUFS normalization.")
 def render_cmd(
     session_path: Path,
     out_path: Path,
     source_override: Path | None,
     check_checksum: bool,
+    crossfade_ms: float,
+    lufs_target: float,
+    no_lufs: bool,
 ) -> None:
     """Replay a saved EditSession against its source audio and write a wav."""
     try:
@@ -324,7 +348,11 @@ def render_cmd(
     )
 
     try:
-        result = render_cuts(source, info.duration_sec, ranges, out_path)
+        result = render_cuts(
+            source, info.duration_sec, ranges, out_path,
+            crossfade_ms=crossfade_ms,
+            lufs_target=None if no_lufs else lufs_target,
+        )
     except RenderError as e:
         _fatal(str(e))
 
@@ -332,8 +360,12 @@ def render_cmd(
         f"[green]✓[/green] {out_path}  "
         f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
         f"{result.duration_in - result.duration_out:.1f}s cut, "
-        f"{len(result.keeps)} keep ranges)"
+        f"{len(result.keeps)} keep ranges, xfade {result.crossfade_ms:.1f}ms)"
     )
+    if result.lufs_in is not None:
+        lufs_after = f" → {result.lufs_out:.1f} LUFS" if result.lufs_out is not None else ""
+        peak = f", peak {result.true_peak_dbtp:.1f} dBTP" if result.true_peak_dbtp is not None else ""
+        console.print(f"  Loudness: {result.lufs_in:.1f} LUFS{lufs_after}{peak}")
 
 
 @cli.command("serve")

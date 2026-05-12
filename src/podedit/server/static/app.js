@@ -20,6 +20,8 @@
   const $timeCurrent = $('time-current');
   const $timeDuration = $('time-duration');
   const $scrubber = $('scrubber');
+  const $btnAudition = $('btn-audition');
+  const $modePill = $('mode-pill');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -61,6 +63,9 @@
     editedDuration: 0, // sum of keep-range lengths; the "podcast duration after cuts"
     sourceDuration: 0, // unedited audio duration (from /api/audio/info)
     isScrubbing: false,
+    previewMode: false,  // false = audio is the source m4a; true = it's a rendered preview wav
+    previewURL: null,
+    previewCacheKey: null,
     undoStack: [],     // {type:'add'|'remove', op}
     redoStack: [],
     selection: null,   // {anchor: wordIdx, extent: wordIdx} (inclusive)
@@ -310,6 +315,9 @@
   // ------- ops -------
   function applyDeleteRange(start, end) {
     if (end <= start) return;
+    // Any edit invalidates the rendered preview — jump back to the source so
+    // the user isn't auditioning a stale render.
+    if (state.previewMode) revertToSource('apply-delete');
     const op = { op_id: newOpId(), op: 'delete', start, end, note: null };
     state.ops.push(op);
     state.undoStack.push({ type: 'add', op });
@@ -332,6 +340,7 @@
   function undo() {
     const entry = state.undoStack.pop();
     if (!entry) return;
+    if (state.previewMode) revertToSource('undo');
     if (entry.type === 'add') {
       state.ops = state.ops.filter((o) => o.op_id !== entry.op.op_id);
     } else if (entry.type === 'remove') {
@@ -347,6 +356,7 @@
   function redo() {
     const entry = state.redoStack.pop();
     if (!entry) return;
+    if (state.previewMode) revertToSource('redo');
     if (entry.type === 'add') {
       state.ops.push(entry.op);
     } else if (entry.type === 'remove') {
@@ -509,7 +519,9 @@
 
   function tick() {
     const t = $player.currentTime;
-    const edt = sourceToEdited(t);
+    // In preview mode the audio source IS the rendered file, so currentTime
+    // is already in edited space; sourceToEdited would double-map.
+    const edt = state.previewMode ? t : sourceToEdited(t);
     $kpiTime.textContent = `${t.toFixed(2)}s`;
 
     // Mirror the playhead into the edited timeline displays — unless the user
@@ -519,12 +531,14 @@
       $scrubber.value = String(edt);
     }
 
+    // Source-mode-only: edited-end detection and preview-skip. In preview mode
+    // the audio file already has the cuts baked in, so it'll just hit 'ended'.
     // Edited-end detection: if the source playhead has reached the last
     // keep range's sourceEnd, the user's "edited podcast" is over. Pause and
     // pin the playhead. Without this, deleting the tail of the audio would
     // make tick() repeatedly try to skip past the trailing delete and run
     // off the end of the source file.
-    if (!isSkipping && !state.isScrubbing && state.timeline.length > 0) {
+    if (!state.previewMode && !isSkipping && !state.isScrubbing && state.timeline.length > 0) {
       const lastKeep = state.timeline[state.timeline.length - 1];
       if (t >= lastKeep.sourceEnd - 0.001) {
         if (!$player.paused) {
@@ -539,8 +553,9 @@
     }
 
     // Preview-skip: jump out of any merged delete range. Suppressed while the
-    // user is scrubbing so we don't fight their drag.
-    if (!isSkipping && !state.isScrubbing) {
+    // user is scrubbing so we don't fight their drag, and skipped in preview
+    // mode where the file already has the cuts.
+    if (!state.previewMode && !isSkipping && !state.isScrubbing) {
       for (const [s, e] of state.mergedDeletes) {
         if (t >= s && t < e) {
           // If this delete extends to the source end (no keep range after it),
@@ -610,11 +625,84 @@
   });
   $scrubber.addEventListener('change', () => {
     const edt = parseFloat($scrubber.value);
-    const src = editedToSource(edt);
-    $player.currentTime = src;
+    // In preview mode the file is already in edited space; map only when the
+    // source m4a is loaded.
+    const target = state.previewMode ? edt : editedToSource(edt);
+    $player.currentTime = target;
     state.isScrubbing = false;
-    logKPI('ui.scrubber.seek', { edited: edt, source: src });
+    logKPI('ui.scrubber.seek', { edited: edt, target_source: target, mode: state.previewMode ? 'preview' : 'source' });
   });
+
+  // ------- audition (server-side rendered preview) -------
+  function setModePill(mode, text) {
+    $modePill.className = `mode-pill mode-${mode}`;
+    $modePill.textContent = text || mode;
+  }
+  setModePill('source', 'source');
+
+  function switchPlayerSrc(newUrl, newEditedTime, wasPreviewMode) {
+    const wasPlaying = !$player.paused && !$player.ended;
+    $player.pause();
+    $player.src = newUrl;
+    // After changing src the element reloads; seek + resume on loadedmetadata.
+    $player.addEventListener('loadedmetadata', () => {
+      state.previewMode = wasPreviewMode;
+      const target = wasPreviewMode ? newEditedTime : editedToSource(newEditedTime);
+      $player.currentTime = Math.max(0, Math.min(target, $player.duration || target));
+      if (wasPlaying) {
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      }
+    }, { once: true });
+  }
+
+  function revertToSource(reason) {
+    if (!state.previewMode) return;
+    const currentEdited = $player.currentTime;  // already edited-space in preview
+    state.previewURL = null;
+    state.previewCacheKey = null;
+    setModePill('source', 'source');
+    logKPI('ui.audition.revert', { reason });
+    switchPlayerSrc(info.url, currentEdited, false);
+  }
+
+  async function renderAndAudition() {
+    if (state.editedDuration <= 0) {
+      setModePill('error', 'empty');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source', state.previewMode ? 'preview' : 'source'), 1500);
+      return;
+    }
+    setModePill('rendering', 'rendering…');
+    $btnAudition.disabled = true;
+    const t0 = performance.now();
+    try {
+      const r = await fetch('/api/preview/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
+      const reply = await r.json();
+      const latency = performance.now() - t0;
+      state.previewURL = reply.url;
+      state.previewCacheKey = reply.cache_key;
+      logKPI('ui.audition.rendered', {
+        latency_ms: latency, cached: reply.cached, bytes: reply.bytes,
+        cache_key: reply.cache_key,
+      });
+      // Snapshot edited position now so we can land at the same spot in the preview.
+      const curEdited = sourceToEdited($player.currentTime);
+      setModePill('preview', reply.cached ? 'preview (cached)' : 'preview');
+      switchPlayerSrc(reply.url, curEdited, true);
+    } catch (e) {
+      setModePill('error', 'render error');
+      logKPI('ui.audition.error', { error: e.message });
+    } finally {
+      $btnAudition.disabled = false;
+    }
+  }
+
+  $btnAudition.addEventListener('click', renderAndAudition);
 
   // ------- keyboard shortcuts -------
   document.addEventListener('keydown', (e) => {

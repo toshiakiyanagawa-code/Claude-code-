@@ -126,6 +126,15 @@ main {
 .toolbar .skip-pill.active {
   background: #ff5050; color: white;
 }
+.toolbar .mode-pill {
+  display: inline-block; min-width: 60px; text-align: center;
+  padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 600;
+  background: #1a1d28; color: var(--muted);
+}
+.toolbar .mode-pill.mode-source { background: #1f2330; color: var(--muted); }
+.toolbar .mode-pill.mode-preview { background: #2b4663; color: white; }
+.toolbar .mode-pill.mode-rendering { background: #f7c46a; color: #0f1115; }
+.toolbar .mode-pill.mode-error { background: #ff5050; color: white; }
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }

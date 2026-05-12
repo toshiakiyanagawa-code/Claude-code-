@@ -8,8 +8,10 @@ process, configured at startup via ``create_app``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..audio import probe as audio_probe
 from ..edit import EditSession, sha256_of_file
+from ..render import RenderError, render_cuts
 from ..schema import AudioRef
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -287,6 +290,74 @@ def create_app(config: ServeConfig) -> FastAPI:
         record = {"server_ts": time.time(), **event}
         _append_jsonl(config.kpi_log_path, record)
         return {"ok": True}
+
+    # ------- preview render (W5) -------
+    # Renders the current session to a wav using the W5 PCM pipeline. Cached by
+    # the merged deletes hash, so re-clicking with no edits is a free no-op.
+    # Render is synchronous; for the 30-min episode it takes ~75 s.
+    @app.post("/api/preview/render")
+    def render_preview(opts: dict | None = None) -> dict:
+        opts = opts or {}
+        crossfade_ms = float(opts.get("crossfade_ms", 10.0))
+        lufs_target = opts.get("lufs_target", -16.0)
+        if lufs_target is not None:
+            lufs_target = float(lufs_target)
+
+        with session_lock:
+            deletes = sorted(
+                (round(op.start, 3), round(op.end, 3))
+                for op in session.ops if op.op == "delete"
+            )
+            source_duration = session.source_audio.duration_sec
+
+        cache_key = hashlib.sha256(
+            json.dumps([deletes, crossfade_ms, lufs_target], sort_keys=True).encode()
+        ).hexdigest()[:16]
+        preview_path = config.session_path.parent / f"{config.audio_path.stem}.preview.{cache_key}.wav"
+
+        cached = preview_path.exists()
+        if not cached:
+            t0 = time.time()
+            try:
+                result = render_cuts(
+                    config.audio_path,
+                    source_duration=source_duration,
+                    deletes=list(deletes),
+                    output=preview_path,
+                    crossfade_ms=crossfade_ms,
+                    lufs_target=lufs_target,
+                )
+            except RenderError as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+            _append_jsonl(config.kpi_log_path, {
+                "server_ts": time.time(), "type": "server.preview.rendered",
+                "cache_key": cache_key, "wall_sec": time.time() - t0,
+                "duration_in": result.duration_in, "duration_out": result.duration_out,
+                "n_keeps": len(result.keeps), "crossfade_ms": result.crossfade_ms,
+                "lufs_target": lufs_target, "lufs_out": result.lufs_out,
+                "true_peak_dbtp": result.true_peak_dbtp,
+            })
+
+        st = preview_path.stat()
+        tag = f"{int(st.st_mtime)}-{st.st_size}"
+        return {
+            "cache_key": cache_key,
+            "url": f"/api/preview-audio/{cache_key}?v={tag}",
+            "cached": cached,
+            "bytes": st.st_size,
+        }
+
+    _CACHE_KEY_RE = re.compile(r"^[a-f0-9]{1,64}$")
+
+    @app.get("/api/preview-audio/{cache_key}")
+    def preview_audio(cache_key: str) -> FileResponse:
+        if not _CACHE_KEY_RE.match(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache key")
+        p = config.session_path.parent / f"{config.audio_path.stem}.preview.{cache_key}.wav"
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="preview not rendered; POST /api/preview/render first")
+        return FileResponse(p, media_type="audio/wav", filename=p.name,
+                            headers={"Cache-Control": "no-store"})
 
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
