@@ -12,9 +12,13 @@ build/
 
 # Test/sample audio and derived artifacts
 samples/
+.podedit/
 *.transcript.json
 *.16k.wav
 benchmarks.jsonl
+
+# Test cache
+.pytest_cache/
 
 # Local editor / OS
 .DS_Store

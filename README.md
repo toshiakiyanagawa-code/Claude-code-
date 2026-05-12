@@ -2,7 +2,7 @@
 
 Local-first podcast editor for Japanese podcasts. Edit audio by editing its transcript.
 
-**Status: W1 (foundation + one-way ASR PoC + bench harness).**
+**Status: W2 (delete→render minimum CLI on top of W1 ASR).**
 
 ## Requirements
 
@@ -27,15 +27,37 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync
 ```
 
-## Usage (W1)
+## Usage
+
+### Transcribe (W1)
 
 ```bash
-# Transcribe a podcast episode (writes <audio>.transcript.json next to the input)
+# Writes the transcript JSON under .podedit/work/ by default.
 uv run podedit transcribe path/to/episode.mp3 --model small
 
 # Pick a model: tiny | base | small | medium | large-v3 | large-v3-turbo
 uv run podedit transcribe path/to/episode.mp3 --model large-v3-turbo --device auto
+
+# Turn off VAD if Japanese aizuchi/laughter are being dropped.
+uv run podedit transcribe path/to/episode.mp3 --model small --no-vad
 ```
+
+### Cut (W2)
+
+Apply one or more delete ranges to a source audio and write a wav. Hard splices
+only — no crossfade, no de-click (those land in W5).
+
+```bash
+uv run podedit cut path/to/episode.m4a \
+  -d "30-40" \
+  -d "1:00-1:15" \
+  -o out.wav \
+  --save-session out.session.json \
+  --transcript .podedit/work/episode.transcript.json
+```
+
+Ranges accept seconds, `M:SS`, or `H:MM:SS`. The `EditSession` JSON records the
+source audio (with SHA-256) and the ops list so the cut is reproducible.
 
 Each run appends a JSON line to `benchmarks.jsonl`:
 
@@ -53,14 +75,16 @@ src/podedit/
 ├── audio.py      # ffmpeg I/O + 16kHz mono resample
 ├── asr.py        # faster-whisper wrapper, word timestamps, VAD
 ├── schema.py     # Transcript / Segment / Word (timestamps anchored to ORIGINAL audio)
+├── edit.py       # EditSession / DeleteOp / keep_ranges_from_deletes
+├── render.py     # ffmpeg atrim+concat renderer (W2 minimum)
 ├── bench.py      # wall time + peak RSS context manager
-└── cli.py        # `podedit` entry point
+└── cli.py        # `podedit` entry point (transcribe / cut)
 ```
 
 ## Roadmap (MVP, 8-9 weeks)
 
 - **W1 ✅ Foundation**: ASR PoC + bench harness
-- W2 — Word-level alignment, project schema, CLI delete→render minimum
+- **W2 ✅ Edit minimum**: EditSession schema + ffmpeg atrim+concat renderer + `podedit cut`
 - W3 — Local web UI + click-to-seek
 - W4 — Delete ops + preview + Undo/Redo + save/load (KPI measurement starts here)
 - W5 — PCM render + fixed crossfade + wav export

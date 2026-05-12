@@ -22,6 +22,7 @@ class AudioRef:
     sample_rate: int
     channels: int
     codec: str
+    sha256: str | None = None  # populated when audio is the source of truth for an EditSession
 
 
 @dataclass(slots=True)

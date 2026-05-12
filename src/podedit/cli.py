@@ -13,6 +13,8 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 from .asr import ASRConfig, resolve_device, transcribe
 from .audio import AudioProbeError, FFmpegMissingError, probe, to_wav_16k_mono
 from .bench import measure
+from .edit import EditSession, sha256_of_file
+from .render import RenderError, render_cuts
 
 console = Console()
 
@@ -141,6 +143,105 @@ def transcribe_cmd(
 def _fatal(msg: str) -> None:
     console.print(f"[red]Error:[/red] {msg}")
     sys.exit(2)
+
+
+def _parse_time(s: str) -> float:
+    """Parse seconds, 'M:SS', or 'H:MM:SS' into float seconds."""
+    s = s.strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        raise ValueError(f"Invalid time format: {s!r}")
+    return float(s)
+
+
+def _parse_range(rng: str) -> tuple[float, float]:
+    """Parse a 'START-END' range. START and END may be seconds or M:SS / H:MM:SS."""
+    s, _, e = rng.partition("-")
+    if not s or not e:
+        raise ValueError(f"Invalid range {rng!r}; expected START-END")
+    s_sec, e_sec = _parse_time(s), _parse_time(e)
+    if e_sec <= s_sec:
+        raise ValueError(f"Range {rng!r}: END ({e_sec}s) must be greater than START ({s_sec}s)")
+    return s_sec, e_sec
+
+
+@cli.command("cut")
+@click.argument("audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--delete", "-d", "deletes", multiple=True, required=True,
+              help="Delete range 'START-END'. Times in seconds or M:SS / H:MM:SS. Repeatable.")
+@click.option("-o", "--out", "out_path", type=click.Path(path_type=Path), required=True,
+              help="Output wav path")
+@click.option("--save-session", type=click.Path(path_type=Path), default=None,
+              help="Also write the EditSession JSON here")
+@click.option("--transcript", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Link this transcript JSON to the session (optional)")
+@click.option("--no-checksum", is_flag=True, default=False,
+              help="Skip SHA-256 of source audio (faster, less reproducible)")
+def cut_cmd(
+    audio: Path,
+    deletes: tuple[str, ...],
+    out_path: Path,
+    save_session: Path | None,
+    transcript: Path | None,
+    no_checksum: bool,
+) -> None:
+    """Apply --delete ranges to AUDIO and write a wav with those ranges removed.
+
+    W2 minimum: no crossfade, no de-click. Cuts are hard ffmpeg atrim+concat splices.
+    """
+    try:
+        ranges = [_parse_range(r) for r in deletes]
+    except ValueError as e:
+        _fatal(str(e))
+
+    try:
+        info = probe(audio)
+    except FFmpegMissingError as e:
+        _fatal(str(e))
+    except AudioProbeError as e:
+        _fatal(f"Could not probe audio: {e}")
+
+    for s, e in ranges:
+        if s < 0 or e > info.duration_sec:
+            _fatal(f"Range {s}-{e}s falls outside audio duration {info.duration_sec:.2f}s")
+
+    console.print(
+        f"[bold]Source[/bold]: {audio.name}  ({info.duration_sec:.1f}s)  "
+        f"deletes: {len(ranges)}"
+    )
+
+    source_ref = info.to_ref()
+    if not no_checksum:
+        console.print("[dim]Computing source SHA-256…[/dim]")
+        source_ref.sha256 = sha256_of_file(audio)
+
+    session = EditSession.new(
+        source_audio=source_ref,
+        transcript_ref=str(transcript) if transcript else None,
+    )
+    for s, e in ranges:
+        session.add_delete(s, e)
+
+    try:
+        result = render_cuts(audio, info.duration_sec, ranges, out_path)
+    except RenderError as e:
+        _fatal(str(e))
+
+    console.print(
+        f"[green]✓[/green] {out_path}  "
+        f"({result.duration_in:.1f}s → {result.duration_out:.1f}s, "
+        f"{result.duration_in - result.duration_out:.1f}s cut, "
+        f"{len(result.keeps)} keep ranges)"
+    )
+
+    if save_session:
+        save_session.parent.mkdir(parents=True, exist_ok=True)
+        save_session.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
+        console.print(f"  Session: {save_session}")
 
 
 if __name__ == "__main__":
