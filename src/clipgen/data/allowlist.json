@@ -1,0 +1,176 @@
+{
+  "_comment": "切り抜きOKとみなすチャンネルのホワイトリスト。channel_id は YouTube API の channelId。ホワイトリスト/ブラックリストは scripts/refresh_lists.py で随時更新する想定。",
+  "_categories": [
+    "party_official",
+    "parliament_official",
+    "politician_official",
+    "youtube_native_allowed"
+  ],
+  "channels": [
+    {
+      "channel_id": "UC_jimin",
+      "handle": "@jimin",
+      "name": "自民党公式",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@jimin",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "公式チャンネルの公開記者会見・街頭演説アーカイブ。",
+      "permission_scope": "public_press_conferences",
+      "notes": "公開記者会見・街頭演説素材。引用範囲を遵守。"
+    },
+    {
+      "channel_id": "UC_cdp_japan",
+      "handle": "@CDP-Japan",
+      "name": "立憲民主党",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@CDP-Japan",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_ishinnokai",
+      "handle": "@ishinnokai",
+      "name": "日本維新の会",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@ishinnokai",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_dpfp",
+      "handle": "@DPFP",
+      "name": "国民民主党",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@DPFP",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_sansei",
+      "handle": "@sanseito",
+      "name": "参政党",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@sanseito",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開演説。",
+      "permission_scope": "official_speech",
+      "notes": "切り抜きカルチャー強い。"
+    },
+    {
+      "channel_id": "UC_reiwa",
+      "handle": "@reiwashinsengumi",
+      "name": "れいわ新選組",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@reiwashinsengumi",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_komei",
+      "handle": "@komei",
+      "name": "公明党",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@komei",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_jcptv",
+      "handle": "@jcptv",
+      "name": "日本共産党",
+      "category": "party_official",
+      "source_url": "https://www.youtube.com/@jcptv",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "政党公式チャンネルの公開会見・演説。",
+      "permission_scope": "public_press_conferences",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_shugiin",
+      "handle": "@shugiintv",
+      "name": "衆議院インターネット審議中継",
+      "category": "parliament_official",
+      "source_url": "https://www.youtube.com/@shugiintv",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "国会公式中継。",
+      "permission_scope": "parliament_recording",
+      "notes": "国会公式中継。政府著作物。"
+    },
+    {
+      "channel_id": "UC_sangiin",
+      "handle": "@sangiintv",
+      "name": "参議院インターネット審議中継",
+      "category": "parliament_official",
+      "source_url": "https://www.youtube.com/@sangiintv",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "国会公式中継。",
+      "permission_scope": "parliament_recording",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_takaichi",
+      "handle": "@HighTakaichi",
+      "name": "高市早苗 公式",
+      "category": "politician_official",
+      "source_url": "https://www.youtube.com/@HighTakaichi",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "本人公式チャンネルの公開演説。",
+      "permission_scope": "official_speech",
+      "notes": "切り抜き許諾は概要欄で都度確認必須。"
+    },
+    {
+      "channel_id": "UC_tamakiyuichiro",
+      "handle": "@tamakiyuichiro",
+      "name": "玉木雄一郎 公式",
+      "category": "politician_official",
+      "source_url": "https://www.youtube.com/@tamakiyuichiro",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "本人公式チャンネルの公開演説。切り抜きOK明記の動画あり。",
+      "permission_scope": "official_speech",
+      "notes": "切り抜きOK明記の動画あり。要個別確認。"
+    },
+    {
+      "channel_id": "UC_ishimaru",
+      "handle": "@ishimaru-shinji",
+      "name": "石丸伸二",
+      "category": "politician_official",
+      "source_url": "https://www.youtube.com/@ishimaru-shinji",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "本人公式チャンネルの公開演説・議会関連映像。",
+      "permission_scope": "official_speech",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_kamiyasohei",
+      "handle": "@kamiyasohei",
+      "name": "神谷宗幣",
+      "category": "politician_official",
+      "source_url": "https://www.youtube.com/@kamiyasohei",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "本人公式チャンネルの公開演説。",
+      "permission_scope": "official_speech",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_rehacq",
+      "handle": "@ReHacQ",
+      "name": "ReHacQ−リハック−【公式】",
+      "category": "youtube_native_allowed",
+      "source_url": "https://www.youtube.com/@ReHacQ",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "YouTubeネイティブ番組。切り抜き許諾は概要欄要確認。",
+      "permission_scope": "official_speech",
+      "notes": "切り抜き許諾は概要欄要確認。"
+    }
+  ]
+}
