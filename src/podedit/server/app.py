@@ -62,9 +62,11 @@ PREVIEW_GC_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB combined
 
 # Chunked-upload (W12.1) knobs. Single multipart POST hits the Codespaces
 # forwarded-port nginx body limit; chunking around 4 MiB per request avoids it.
-UPLOAD_MAX_BYTES = 500 * 1024 * 1024  # 500 MB hard cap (matches old endpoint)
+UPLOAD_MAX_BYTES = 500 * 1024 * 1024  # 500 MB hard cap on the assembled file
 UPLOAD_CHUNK_SIZE_HINT = 4 * 1024 * 1024  # 4 MiB suggested chunk size
+UPLOAD_CHUNK_SIZE_MAX = 8 * 1024 * 1024  # 8 MiB ceiling enforced server-side
 UPLOAD_SESSION_TTL_SEC = 3600  # drop abandoned sessions after 1 hour idle
+UPLOAD_ORPHAN_PART_AGE_SEC = 3600  # restart-time sweep threshold for .upload-*.part
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -354,6 +356,21 @@ def create_app(config: ServeConfig) -> FastAPI:
             orphan.unlink()
         except OSError:
             pass
+
+    # W12.1 chunked-upload temp parts live one level deeper, under uploads/.
+    # If the process dies mid-upload, the .upload-{uuid}.part file leaks until
+    # the volume is wiped. Sweep them at startup the same way W8 sweeps the
+    # transient hardlinks, but only if they're older than the TTL so a sibling
+    # podedit process (rare) doesn't lose its live state.
+    uploads_dir_for_gc = state.work_dir / "uploads"
+    if uploads_dir_for_gc.is_dir():
+        for orphan in uploads_dir_for_gc.glob(".upload-*.part"):
+            try:
+                if now_ts - orphan.stat().st_mtime < UPLOAD_ORPHAN_PART_AGE_SEC:
+                    continue
+                orphan.unlink()
+            except OSError:
+                pass
     # Per-cache-key render lock. Without it, two concurrent /api/preview/render
     # calls for the same key (e.g. Export + Audition fired in parallel from
     # multiple tabs) both miss `preview_path.exists()` and both run ffmpeg
@@ -963,10 +980,15 @@ def create_app(config: ServeConfig) -> FastAPI:
         uploads_dir = state.work_dir / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
         final_path = uploads_dir / basename
-        # We do NOT fail-fast if final_path already exists — the user might
-        # want to upload anyway and have the commit step report the conflict
-        # at the very end. Empty/zero-size uploads are allowed at init and
-        # will succeed at commit; the file just lands empty.
+        # Fail fast on a name collision so the client doesn't stream 500 MB
+        # only to discover the conflict at commit. The user can rename and
+        # retry. Empty/zero-size uploads are allowed at init and will commit
+        # immediately; the file just lands empty.
+        if final_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{basename!r} already exists in uploads",
+            )
 
         upload_id = uuid.uuid4().hex
         temp_path = uploads_dir / f".upload-{upload_id}.part"
@@ -1033,6 +1055,40 @@ def create_app(config: ServeConfig) -> FastAPI:
                 detail=f"invalid Content-Range bytes {start}-{end}/{total}",
             )
         expected_len = end - start + 1
+
+        # Enforce chunk-size cap BEFORE buffering the body. Without this a
+        # client (or attacker) could send a single 500 MB PUT with a valid
+        # Content-Range, defeating the proxy-bypass goal and bloating memory.
+        if expected_len > UPLOAD_CHUNK_SIZE_MAX:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"chunk size {expected_len} exceeds "
+                    f"{UPLOAD_CHUNK_SIZE_MAX} byte server limit; split your upload smaller"
+                ),
+            )
+        cl_header = request.headers.get("content-length")
+        if cl_header is not None:
+            try:
+                cl_value = int(cl_header)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail="invalid Content-Length") from e
+            if cl_value > UPLOAD_CHUNK_SIZE_MAX:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Content-Length {cl_value} exceeds "
+                        f"{UPLOAD_CHUNK_SIZE_MAX} byte server limit"
+                    ),
+                )
+            if cl_value != expected_len:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Content-Length {cl_value} does not match "
+                        f"Content-Range length {expected_len}"
+                    ),
+                )
 
         body = await request.body()
         if len(body) != expected_len:
@@ -1157,9 +1213,12 @@ def create_app(config: ServeConfig) -> FastAPI:
                 {"ok": True, "status": "not_found"},
                 headers={"Cache-Control": "no-store"},
             )
-        # The session may have an in-flight chunk write; we still cleanup the
-        # temp file but the open file handle will be closed by GC.
-        _close_upload_session(session)
+        # Acquire the per-session lock before tearing down the file handle so
+        # any in-flight chunk write completes first. In a single-event-loop
+        # deployment chunks never await mid-write, so this is mostly a guard
+        # against TestClient / multi-portal threaded execution.
+        async with session.lock:
+            _close_upload_session(session)
         return JSONResponse(
             {"ok": True, "status": "cancelled"},
             headers={"Cache-Control": "no-store"},

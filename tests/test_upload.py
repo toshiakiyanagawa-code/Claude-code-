@@ -10,20 +10,31 @@ each chunk fits under the Codespaces forwarded-port nginx body limit:
 
 These tests cover the happy path plus the error paths the client relies on:
 out-of-order chunk -> 409, incomplete commit -> 409, bad Content-Range -> 400,
-oversize init -> 413, name collision -> 409 with the temp cleaned up.
+chunk size cap -> 413, oversize init -> 413, name-collision-at-init -> 409.
+
+Uses ``with TestClient(app)`` so startup/shutdown lifespans run, and tests
+involving concurrency drive parallel uploads through a thread pool to verify
+the dict + per-session locks isolate sessions correctly.
 """
 from __future__ import annotations
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from podedit.server.app import ServeConfig, create_app
+from podedit.server.app import (
+    UPLOAD_CHUNK_SIZE_MAX,
+    ServeConfig,
+    create_app,
+)
 
 
-def _make_client(tmp_path: Path) -> tuple[TestClient, Path]:
+@pytest.fixture
+def app_client(tmp_path: Path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     library_dir = tmp_path / "library"
@@ -36,10 +47,11 @@ def _make_client(tmp_path: Path) -> tuple[TestClient, Path]:
         library_dir=library_dir,
         work_dir=work_dir,
     )
-    return TestClient(create_app(config)), work_dir
+    with TestClient(create_app(config)) as client:
+        yield client, work_dir
 
 
-def _chunked_put(client: TestClient, upload_id: str, payload: bytes, *, chunk_size: int):
+def _chunked_put(client: TestClient, upload_id: str, payload: bytes, *, chunk_size: int) -> None:
     total = len(payload)
     offset = 0
     while offset < total:
@@ -58,9 +70,9 @@ def _chunked_put(client: TestClient, upload_id: str, payload: bytes, *, chunk_si
         offset = end
 
 
-def test_chunked_upload_roundtrip(tmp_path: Path) -> None:
-    client, work_dir = _make_client(tmp_path)
-    payload = os.urandom(3 * 1024 * 1024 + 17)  # 3 MiB + a few bytes — exercises a non-aligned final chunk
+def test_chunked_upload_roundtrip(app_client) -> None:
+    client, work_dir = app_client
+    payload = os.urandom(3 * 1024 * 1024 + 17)  # exercises a non-aligned final chunk
 
     init = client.post(
         "/api/library/uploads",
@@ -70,10 +82,9 @@ def test_chunked_upload_roundtrip(tmp_path: Path) -> None:
     init_reply = init.json()
     assert init_reply["basename"] == "episode.m4a"
     upload_id = init_reply["upload_id"]
-    chunk_size = init_reply["chunk_size_hint"]
-    assert chunk_size > 0
+    assert init_reply["chunk_size_hint"] > 0
 
-    _chunked_put(client, upload_id, payload, chunk_size=1024 * 1024)  # 1 MiB per chunk
+    _chunked_put(client, upload_id, payload, chunk_size=1024 * 1024)
 
     commit = client.post(f"/api/library/uploads/{upload_id}/commit")
     assert commit.status_code == 200, commit.text
@@ -83,17 +94,14 @@ def test_chunked_upload_roundtrip(tmp_path: Path) -> None:
     final = work_dir / "uploads" / "episode.m4a"
     assert final.read_bytes() == payload
 
-    # Session must be gone after commit.
-    poll = client.get(f"/api/library/uploads/{upload_id}")
-    assert poll.status_code == 404
-
-    # And no .part residue under uploads/.
+    # Session is gone after commit.
+    assert client.get(f"/api/library/uploads/{upload_id}").status_code == 404
     leftovers = [p.name for p in (work_dir / "uploads").iterdir() if p.name.startswith(".upload-")]
     assert leftovers == []
 
 
-def test_init_rejects_oversize(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_init_rejects_oversize(app_client) -> None:
+    client, _ = app_client
     too_big = 500 * 1024 * 1024 + 1
     r = client.post(
         "/api/library/uploads",
@@ -103,8 +111,8 @@ def test_init_rejects_oversize(tmp_path: Path) -> None:
     assert "500" in r.json()["detail"]
 
 
-def test_init_rejects_hidden_or_path_traversal(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_init_rejects_hidden_or_path_traversal(app_client) -> None:
+    client, _ = app_client
     for bad in (".hidden.m4a", "foo/bar.m4a", "../escape.m4a", ".."):
         r = client.post(
             "/api/library/uploads",
@@ -113,8 +121,8 @@ def test_init_rejects_hidden_or_path_traversal(tmp_path: Path) -> None:
         assert r.status_code == 400, (bad, r.text)
 
 
-def test_init_rejects_unsupported_suffix(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_init_rejects_unsupported_suffix(app_client) -> None:
+    client, _ = app_client
     r = client.post(
         "/api/library/uploads",
         json={"filename": "evil.exe", "total_size": 100},
@@ -123,8 +131,22 @@ def test_init_rejects_unsupported_suffix(tmp_path: Path) -> None:
     assert "suffix" in r.json()["detail"]
 
 
-def test_chunk_out_of_order_returns_409_with_state(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_init_fails_fast_on_name_collision(app_client) -> None:
+    """Codex review (W12.1) — fail at init instead of after a 500 MB stream."""
+    client, work_dir = app_client
+    uploads = work_dir / "uploads"
+    uploads.mkdir()
+    (uploads / "dup.wav").write_bytes(b"existing")
+    r = client.post(
+        "/api/library/uploads",
+        json={"filename": "dup.wav", "total_size": 100},
+    )
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"]
+
+
+def test_chunk_out_of_order_returns_409_with_state(app_client) -> None:
+    client, _ = app_client
     payload = b"abcdefghij" * 100  # 1000 bytes
     init = client.post(
         "/api/library/uploads",
@@ -147,8 +169,8 @@ def test_chunk_out_of_order_returns_409_with_state(tmp_path: Path) -> None:
     assert body["received_bytes"] == 0
 
 
-def test_chunk_total_mismatch_returns_409(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_chunk_total_mismatch_returns_409(app_client) -> None:
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 100},
@@ -163,14 +185,15 @@ def test_chunk_total_mismatch_returns_409(tmp_path: Path) -> None:
     assert r.json()["error"] == "total_size_mismatch"
 
 
-def test_chunk_body_length_mismatch_returns_400(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_chunk_body_length_mismatch_returns_400(app_client) -> None:
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 100},
     )
     upload_id = init.json()["upload_id"]
-    # Claim bytes 0-9 (10 bytes) but send only 5.
+    # Claim bytes 0-9 (10 bytes) but send only 5. httpx will set Content-Length
+    # to 5, so the server's CL-vs-range check trips first (still 400).
     r = client.put(
         f"/api/library/uploads/{upload_id}",
         content=b"hello",
@@ -179,8 +202,8 @@ def test_chunk_body_length_mismatch_returns_400(tmp_path: Path) -> None:
     assert r.status_code == 400
 
 
-def test_chunk_invalid_content_range_returns_400(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_chunk_invalid_content_range_returns_400(app_client) -> None:
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 100},
@@ -195,14 +218,34 @@ def test_chunk_invalid_content_range_returns_400(tmp_path: Path) -> None:
         assert r.status_code == 400, (bad, r.text)
 
 
-def test_commit_incomplete_returns_409(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_chunk_size_cap_rejected_with_413(app_client) -> None:
+    """Codex review (W12.1) — the server must reject an oversized chunk BEFORE
+    buffering it, regardless of how generous the client tries to be."""
+    client, _ = app_client
+    total = UPLOAD_CHUNK_SIZE_MAX + 1
+    init = client.post(
+        "/api/library/uploads",
+        json={"filename": "x.wav", "total_size": total},
+    )
+    upload_id = init.json()["upload_id"]
+    # Don't actually send the body — Content-Range claim alone should trip
+    # the 413, before request.body() buffers anything.
+    r = client.put(
+        f"/api/library/uploads/{upload_id}",
+        content=b"",  # body length 0
+        headers={"Content-Range": f"bytes 0-{total - 1}/{total}"},
+    )
+    assert r.status_code == 413
+    assert "exceeds" in r.json()["detail"]
+
+
+def test_commit_incomplete_returns_409(app_client) -> None:
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 100},
     )
     upload_id = init.json()["upload_id"]
-    # Send only the first 50 bytes.
     client.put(
         f"/api/library/uploads/{upload_id}",
         content=b"x" * 50,
@@ -216,34 +259,8 @@ def test_commit_incomplete_returns_409(tmp_path: Path) -> None:
     assert body["total_size"] == 100
 
 
-def test_commit_filename_collision_cleans_up(tmp_path: Path) -> None:
-    client, work_dir = _make_client(tmp_path)
-    uploads = work_dir / "uploads"
-    uploads.mkdir()
-    (uploads / "dup.wav").write_bytes(b"old contents")
-
-    init = client.post(
-        "/api/library/uploads",
-        json={"filename": "dup.wav", "total_size": 4},
-    )
-    upload_id = init.json()["upload_id"]
-    client.put(
-        f"/api/library/uploads/{upload_id}",
-        content=b"new!",
-        headers={"Content-Range": "bytes 0-3/4"},
-    )
-    r = client.post(f"/api/library/uploads/{upload_id}/commit")
-    assert r.status_code == 409
-    assert "already exists" in r.json()["detail"]
-    # Original file is untouched.
-    assert (uploads / "dup.wav").read_bytes() == b"old contents"
-    # No orphan .upload-*.part left behind.
-    leftovers = [p.name for p in uploads.iterdir() if p.name.startswith(".upload-")]
-    assert leftovers == []
-
-
-def test_cancel_removes_session_and_tempfile(tmp_path: Path) -> None:
-    client, work_dir = _make_client(tmp_path)
+def test_cancel_removes_session_and_tempfile(app_client) -> None:
+    client, work_dir = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 1000},
@@ -254,7 +271,6 @@ def test_cancel_removes_session_and_tempfile(tmp_path: Path) -> None:
         content=b"x" * 100,
         headers={"Content-Range": "bytes 0-99/1000"},
     )
-    # Temp file exists pre-cancel.
     parts = list((work_dir / "uploads").glob(".upload-*.part"))
     assert len(parts) == 1
 
@@ -262,20 +278,17 @@ def test_cancel_removes_session_and_tempfile(tmp_path: Path) -> None:
     assert r.status_code == 200
     assert r.json()["status"] == "cancelled"
 
-    # Idempotent: second cancel still 200.
+    # Idempotent: second cancel returns ok+not_found.
     r2 = client.delete(f"/api/library/uploads/{upload_id}")
     assert r2.status_code == 200
     assert r2.json()["status"] == "not_found"
 
-    # Session is gone.
     assert client.get(f"/api/library/uploads/{upload_id}").status_code == 404
-    # Temp file is gone.
-    parts = list((work_dir / "uploads").glob(".upload-*.part"))
-    assert parts == []
+    assert list((work_dir / "uploads").glob(".upload-*.part")) == []
 
 
-def test_status_endpoint_reflects_progress(tmp_path: Path) -> None:
-    client, _ = _make_client(tmp_path)
+def test_status_endpoint_reflects_progress(app_client) -> None:
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 1000},
@@ -293,17 +306,15 @@ def test_status_endpoint_reflects_progress(tmp_path: Path) -> None:
     assert body["total_size"] == 1000
 
 
-def test_zero_byte_file_init_and_commit(tmp_path: Path) -> None:
+def test_zero_byte_file_init_and_commit(app_client) -> None:
     """Zero-byte uploads should be allowed (init succeeds, commit immediately)."""
-    client, work_dir = _make_client(tmp_path)
+    client, work_dir = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "empty.wav", "total_size": 0},
     )
     assert init.status_code == 200
     upload_id = init.json()["upload_id"]
-
-    # No chunks sent — commit right away.
     r = client.post(f"/api/library/uploads/{upload_id}/commit")
     assert r.status_code == 200
     assert r.json()["bytes"] == 0
@@ -312,9 +323,9 @@ def test_zero_byte_file_init_and_commit(tmp_path: Path) -> None:
     assert final.read_bytes() == b""
 
 
-def test_parallel_sessions_do_not_interfere(tmp_path: Path) -> None:
-    """Different upload_ids can be in flight concurrently without crosstalk."""
-    client, work_dir = _make_client(tmp_path)
+def test_parallel_sessions_do_not_interfere(app_client) -> None:
+    """Different upload_ids in flight at once don't cross-write each other's bytes."""
+    client, work_dir = app_client
     a_payload = b"A" * 200
     b_payload = b"B" * 200
     init_a = client.post(
@@ -329,7 +340,6 @@ def test_parallel_sessions_do_not_interfere(tmp_path: Path) -> None:
     bid = init_b.json()["upload_id"]
     assert aid != bid
 
-    # Interleave the writes.
     client.put(
         f"/api/library/uploads/{aid}",
         content=a_payload[:100],
@@ -357,9 +367,45 @@ def test_parallel_sessions_do_not_interfere(tmp_path: Path) -> None:
     assert (work_dir / "uploads" / "b.wav").read_bytes() == b_payload
 
 
-def test_chunk_after_commit_returns_404(tmp_path: Path) -> None:
+def test_concurrent_uploads_through_thread_pool(app_client) -> None:
+    """Codex review (W12.1) — exercise the dict + per-session locks under
+    real parallel pressure (TestClient is thread-safe; we fire N uploads
+    from a pool and verify all complete with the right bytes)."""
+    client, work_dir = app_client
+
+    def _upload(name: str, content: bytes) -> dict:
+        init = client.post(
+            "/api/library/uploads",
+            json={"filename": name, "total_size": len(content)},
+        )
+        assert init.status_code == 200, init.text
+        uid = init.json()["upload_id"]
+        # One chunk per file for simplicity; we're testing inter-session
+        # isolation, not intra-session resumption.
+        r = client.put(
+            f"/api/library/uploads/{uid}",
+            content=content,
+            headers={"Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}"},
+        )
+        assert r.status_code == 200, r.text
+        r = client.post(f"/api/library/uploads/{uid}/commit")
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    files = [(f"par_{i}.wav", os.urandom(100 * 1024)) for i in range(6)]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        replies = list(ex.map(lambda args: _upload(*args), files))
+
+    assert len({r["basename"] for r in replies}) == len(files)
+    for (name, content), reply in zip(files, replies):
+        assert reply["basename"] == name
+        assert reply["bytes"] == len(content)
+        assert (work_dir / "uploads" / name).read_bytes() == content
+
+
+def test_chunk_after_commit_returns_404(app_client) -> None:
     """After commit, the session is gone — additional chunks must 404."""
-    client, _ = _make_client(tmp_path)
+    client, _ = app_client
     init = client.post(
         "/api/library/uploads",
         json={"filename": "x.wav", "total_size": 4},
@@ -371,7 +417,6 @@ def test_chunk_after_commit_returns_404(tmp_path: Path) -> None:
         headers={"Content-Range": "bytes 0-3/4"},
     )
     client.post(f"/api/library/uploads/{upload_id}/commit")
-    # Late chunk — session is gone.
     r = client.put(
         f"/api/library/uploads/{upload_id}",
         content=b"e",
@@ -380,13 +425,13 @@ def test_chunk_after_commit_returns_404(tmp_path: Path) -> None:
     assert r.status_code == 404
 
 
-def test_old_multipart_endpoint_is_removed(tmp_path: Path) -> None:
+def test_old_multipart_endpoint_is_removed(app_client) -> None:
     """The single-shot /api/library/upload no longer exists.
 
-    If we ever bring it back as a compatibility shim, change this test
-    accordingly — until then, its absence prevents accidental reintroduction.
+    Its absence prevents accidental reintroduction. If you intentionally bring
+    it back as a shim, update this test.
     """
-    client, _ = _make_client(tmp_path)
+    client, _ = app_client
     r = client.post(
         "/api/library/upload",
         files={"file": ("x.m4a", b"hello", "audio/m4a")},
