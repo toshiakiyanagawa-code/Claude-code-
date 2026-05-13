@@ -2456,6 +2456,10 @@
       librarySwitching = false;
     }
   }
+  // W12.1: chunked upload. A single multipart POST hits the Codespaces
+  // forwarded-port nginx body limit; uploading ~4 MiB at a time fits under
+  // any proxy limit. Chunks are PUT sequentially with Content-Range; on
+  // any failure we DELETE the half-built session so no orphans remain.
   async function uploadFileToLibrary(file) {
     const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
@@ -2463,26 +2467,78 @@
       return;
     }
     $btnLibraryUpload.disabled = true;
-    const prev = $btnLibraryUpload.textContent;
-    $btnLibraryUpload.textContent = `uploading ${file.name}…`;
+    const prevLabel = $btnLibraryUpload.textContent;
+    let uploadId = null;
     try {
-      const form = new FormData();
-      form.append('file', file, file.name);
-      const r = await fetch('/api/library/upload', { method: 'POST', body: form });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      // Phase 1: init session.
+      $btnLibraryUpload.textContent = `preparing ${file.name}…`;
+      const initRes = await fetch('/api/library/uploads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, total_size: file.size }),
+      });
+      if (!initRes.ok) {
+        const text = await initRes.text();
+        throw new Error(`init failed: HTTP ${initRes.status}: ${text.slice(0, 200)}`);
       }
-      const reply = await r.json();
+      const initReply = await initRes.json();
+      uploadId = initReply.upload_id;
+      const chunkSize = initReply.chunk_size_hint || (4 * 1024 * 1024);
+
+      // Phase 2: send chunks sequentially.
+      let offset = 0;
+      if (file.size === 0) {
+        // Allow zero-byte uploads to skip the chunk loop entirely.
+      }
+      while (offset < file.size) {
+        const end = Math.min(offset + chunkSize, file.size);
+        const blob = file.slice(offset, end);
+        const pct = ((end / file.size) * 100).toFixed(0);
+        $btnLibraryUpload.textContent = `uploading ${file.name}… ${pct}%`;
+        const chunkRes = await fetch(`/api/library/uploads/${uploadId}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes ${offset}-${end - 1}/${file.size}`,
+          },
+          body: blob,
+        });
+        if (!chunkRes.ok) {
+          const text = await chunkRes.text();
+          throw new Error(`chunk ${offset}-${end - 1} failed: HTTP ${chunkRes.status}: ${text.slice(0, 200)}`);
+        }
+        offset = end;
+      }
+
+      // Phase 3: commit (atomic rename to final path).
+      $btnLibraryUpload.textContent = `finalizing ${file.name}…`;
+      const commitRes = await fetch(`/api/library/uploads/${uploadId}/commit`, {
+        method: 'POST',
+      });
+      if (!commitRes.ok) {
+        const text = await commitRes.text();
+        throw new Error(`commit failed: HTTP ${commitRes.status}: ${text.slice(0, 200)}`);
+      }
+      const reply = await commitRes.json();
+      uploadId = null;  // committed — do NOT cancel
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
       setLibraryStatus(`Uploaded ${reply.basename}. Click Transcribe to process.`);
     } catch (e) {
       setLibraryStatus(`Upload failed: ${e.message}`);
+      // Best-effort cancel of the half-built session so the server can free
+      // the temp file immediately rather than waiting for TTL expiry.
+      if (uploadId) {
+        try {
+          await fetch(`/api/library/uploads/${uploadId}`, { method: 'DELETE' });
+        } catch (_) {
+          // Cancellation is best-effort; TTL GC will sweep eventually.
+        }
+      }
     } finally {
       $btnLibraryUpload.disabled = false;
-      $btnLibraryUpload.textContent = prev;
+      $btnLibraryUpload.textContent = prevLabel;
     }
   }
   $btnOpen.addEventListener('click', showLibraryModal);

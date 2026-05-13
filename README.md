@@ -242,6 +242,11 @@ tests/                  # 57 tests: edit / render / timeline / seam_eval / wavef
 | `POST` | `/api/library/select` | Switch active (audio, transcript, session) triple |
 | `POST` | `/api/library/transcribe` | Kick off an ASR job, returns job snapshot |
 | `GET` | `/api/library/transcribe/status` | Poll current/last job state |
+| `POST` | `/api/library/uploads` | Start a chunked upload; returns `upload_id` + `chunk_size_hint` |
+| `PUT` | `/api/library/uploads/{upload_id}` | Append one chunk; requires `Content-Range: bytes A-B/total` |
+| `POST` | `/api/library/uploads/{upload_id}/commit` | Atomic finalize once all bytes are in |
+| `DELETE` | `/api/library/uploads/{upload_id}` | Cancel a session and clean up the temp file |
+| `GET` | `/api/library/uploads/{upload_id}` | Poll session progress (used for resume / debugging) |
 | `POST` | `/api/kpi/event` | Client KPI append (keepalive-safe) |
 
 All static assets are served with `Cache-Control: no-store`, and the endpoints that
@@ -264,6 +269,8 @@ Codespaces-forwarded ports where edge caches can sit between you and the dev ser
 - **W7.8 ✅** ASR speed — beam=1 greedy + WhisperModel cache, 1.65x faster on CPU
 - **W8 ✅** MVP completion — in-UI Export (wav/mp3), reproducibility docs, friction polish
 - **W9 ✅** ASR accuracy — small-model quality preset + JA podcast prompt biasing; tri-state API
+- **W12 ✅** Native file picker + upload via OS dialog
+- **W12.1 ✅** Chunked upload (4 MiB raw PUT + `Content-Range`) so uploads survive Codespaces' forwarded-port nginx body limit
 
 Differentiating bet: **Japanese conversation quality** (aizuchi vs filler distinction,
 prosody-aware cuts). Voice cloning is staged for v1.0.
