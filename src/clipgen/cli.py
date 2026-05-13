@@ -11,9 +11,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .highlights import detect_highlights, parse_srt
 from .pipeline import (
@@ -62,6 +66,36 @@ def _print_table(cands, limit: int = 30) -> None:
         )
 
 
+def _make_audit_logger(path: str | None):
+    from .audit import AuditLogger
+
+    return AuditLogger(Path(path) if path else None)
+
+
+def _audit_call(logger: Any, method_name: str, payload: dict[str, Any]) -> None:
+    if logger is None:
+        return
+    method = getattr(logger, method_name, None)
+    if method is not None:
+        try:
+            method(payload)
+            return
+        except TypeError:
+            try:
+                method(**payload)
+                return
+            except TypeError:
+                pass
+    from . import audit as _audit
+
+    func = getattr(_audit, method_name, None)
+    if func is not None:
+        try:
+            func(logger, payload)
+        except Exception:
+            pass
+
+
 def _discover_once(
     args: argparse.Namespace,
     *,
@@ -108,6 +142,7 @@ def _resolve_out_path(base: str | None, target_format: str, *, suffix: bool) -> 
 def cmd_discover(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc) if args.now is None else datetime.fromisoformat(args.now)
     formats = ["short", "long"] if args.target_format == "both" else [args.target_format]
+    audit = _make_audit_logger(args.audit_log)
 
     for fmt in formats:
         cands = _discover_once(args, target_format=fmt, now=now)
@@ -117,14 +152,24 @@ def cmd_discover(args: argparse.Namespace) -> int:
         out_path = _resolve_out_path(args.out, fmt, suffix=len(formats) > 1)
         if out_path:
             write_json(cands, out_path)
+        _audit_call(
+            audit,
+            "log_discover",
+            {
+                "phase": "discover",
+                "target_format": fmt,
+                "count": len(cands),
+                "out": str(out_path) if out_path else None,
+                "source": args.source,
+                "include_blocked": args.include_blocked,
+            },
+        )
         if not args.quiet:
             print(f"\n## format={fmt}")
             _print_table(cands)
             if not out_path:
-                import json as _json
-
                 print()
-                print(_json.dumps(candidates_to_dict(cands)[:5], ensure_ascii=False, indent=2))
+                print(json.dumps(candidates_to_dict(cands)[:5], ensure_ascii=False, indent=2))
     return 0
 
 
@@ -187,6 +232,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     """discover の出力をもとに、上位候補ごとにハイライト/タイトル/サムネを作る."""
     now = datetime.now(timezone.utc) if args.now is None else datetime.fromisoformat(args.now)
     formats = ["short", "long"] if args.target_format == "both" else [args.target_format]
+    audit = _make_audit_logger(args.audit_log)
 
     srt_text: str | None = None
     if args.srt:
@@ -200,9 +246,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     provider = None
     if getattr(args, "polish", False):
-        import os as _os
-
-        if _os.environ.get("ANTHROPIC_API_KEY"):
+        if os.environ.get("ANTHROPIC_API_KEY"):
             from .llm import AnthropicProvider
 
             provider = AnthropicProvider(model=args.polish_model)
@@ -236,7 +280,18 @@ def cmd_plan(args: argparse.Namespace) -> int:
     out_path = Path(args.out) if args.out else None
     if out_path:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(__import__("json").dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+        out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    _audit_call(
+        audit,
+        "log_polish",
+        {
+            "phase": "plan",
+            "polish_requested": bool(getattr(args, "polish", False)),
+            "provider_enabled": provider is not None,
+            "plans": len(plans),
+            "out": str(out_path) if out_path else None,
+        },
+    )
     if not args.quiet:
         print(f"plans: {len(plans)} (format={args.target_format}, top={args.top})")
         for p in plans:
@@ -261,9 +316,6 @@ def cmd_config_check(args) -> int:
 
 
 def cmd_compliance_check(args) -> int:
-    import json as _json
-    from pathlib import Path
-
     from .compliance import apply_takedown, load_candidates, load_takedown_list, write_compliance_result
 
     candidates = load_candidates(Path(args.input))
@@ -274,19 +326,17 @@ def cmd_compliance_check(args) -> int:
     if args.out:
         write_compliance_result(Path(args.out), passed, blocked)
     else:
-        print(_json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"passed: {len(passed)}, blocked: {len(blocked)}", file=sys.stderr)
     return 0
 
 
 def cmd_extract(args) -> int:
-    import json as _json
-    from pathlib import Path
-
     from .clip_extract import plan_to_extract, write_extract_plan
 
+    audit = _make_audit_logger(args.audit_log)
     plan_path = Path(args.plan)
-    payload = _json.loads(plan_path.read_text(encoding="utf-8"))
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
 
     if isinstance(payload, list):
         plans = payload
@@ -307,6 +357,18 @@ def cmd_extract(args) -> int:
         plan_to_extract(plan, output_root=out_root)
         for plan in plans[: args.top]
     ]
+
+    _audit_call(
+        audit,
+        "log_extract",
+        {
+            "phase": "extract",
+            "plan": str(plan_path),
+            "out_root": str(out_root),
+            "count": len(extracts),
+            "dry_run": args.dry_run,
+        },
+    )
 
     if args.dry_run:
         for extract in extracts:
@@ -329,32 +391,165 @@ def cmd_extract(args) -> int:
     return 0
 
 
+def cmd_run_job(args: argparse.Namespace) -> int:
+    from .jobs import run_daily_job
+
+    provider = None
+    if args.polish:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            from .llm import AnthropicProvider
+
+            provider = AnthropicProvider(model=args.polish_model)
+        else:
+            print(
+                "warning: --polish was requested but ANTHROPIC_API_KEY is not set; continuing without LLM polish",
+                file=sys.stderr,
+            )
+
+    result = run_daily_job(
+        args.date,
+        Path(args.out_root),
+        dry_run=args.dry_run,
+        source=args.source,
+        include_blocked=args.include_blocked,
+        polish_provider=provider,
+        aggressiveness=args.aggressiveness,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("errors") else 0
+
+
+def _load_items_payload(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return {"items": payload}, payload
+    if not isinstance(payload, dict):
+        raise SystemExit("input JSON must be an object or list")
+
+    for key in ("plans", "candidates", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return payload, value
+    return payload, [payload]
+
+
+def _score_as_percent(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if 0.0 <= score <= 1.0:
+        return score * 100.0
+    return score
+
+
+def _review_items(items: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    reviewed = []
+    for item in items:
+        score = _score_as_percent(item.get("score"))
+        reviewed.append(
+            {
+                "video_id": item.get("video_id"),
+                "title": item.get("title"),
+                "channel_title": item.get("channel_title"),
+                "score": score,
+                "usage_status": item.get("usage_status"),
+                "target_format": item.get("target_format"),
+                "passed": score >= threshold,
+                "risk_flags": item.get("risk_flags", []),
+            }
+        )
+    passed = [item for item in reviewed if item["passed"]]
+    return {
+        "score_threshold": threshold,
+        "total": len(reviewed),
+        "passed": len(passed),
+        "items": reviewed,
+    }
+
+
+def _write_review_tsv(path: Path, items: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["video_id", "title", "channel_title", "score", "usage_status", "target_format", "passed"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(items)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    _, items = _load_items_payload(input_path)
+    # Normalize threshold to percent scale (matches _score_as_percent).
+    threshold = args.score_threshold * 100.0 if 0.0 <= args.score_threshold <= 1.0 else args.score_threshold
+    result = _review_items(items, threshold)
+
+    wrote = False
+    if args.out_json:
+        out_json = Path(args.out_json)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        wrote = True
+    if args.out_tsv:
+        _write_review_tsv(Path(args.out_tsv), result["items"])
+        wrote = True
+    if not wrote:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _digest_plans(plans: list[dict[str, Any]], *, date: str, top_n: int) -> dict[str, Any]:
+    ranked = sorted(plans, key=lambda p: _score_as_percent(p.get("score")), reverse=True)[:top_n]
+    items = [
+        {
+            "rank": i,
+            "video_id": plan.get("video_id"),
+            "title": plan.get("title"),
+            "channel_title": plan.get("channel_title"),
+            "score": _score_as_percent(plan.get("score")),
+            "target_format": plan.get("target_format"),
+            "url": plan.get("url"),
+        }
+        for i, plan in enumerate(ranked, start=1)
+    ]
+    return {
+        "date": date,
+        "top_n": top_n,
+        "items": items,
+        "text": "\n".join(
+            f"{item['rank']}. {item.get('title') or '-'} ({item.get('score', 0):.1f})"
+            for item in items
+        ),
+    }
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    from .notify import build_digest, post_slack
+
+    _, plans = _load_items_payload(Path(args.plans))
+    digest = _digest_plans(plans, date=args.date, top_n=args.top_n)
+    digest["text"] = build_digest(plans, date=args.date, top_n=args.top_n)
+
+    if args.dry_run or not args.webhook_url:
+        print(json.dumps(digest, ensure_ascii=False, indent=2))
+        return 0
+
+    posted = post_slack(args.webhook_url, digest["text"])
+    return 0 if posted else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="clipgen", description="政治系切り抜き動画 素材候補抽出ツール")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("discover", help="候補動画を抽出してランキング表示する")
-    d.add_argument("--source", choices=["mock", "live"], default="mock")
-    d.add_argument(
-        "--mock",
-        default="src/clipgen/data/mock_search.json",
-        help="--source mock のときの入力 JSON",
-    )
-    d.add_argument("--out", help="候補リストの JSON 出力先")
-    d.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
-    d.add_argument("--min-views", type=int, default=DEFAULT_MIN_VIEWS)
-    d.add_argument("--include-blocked", action="store_true", help="RIGHTS=BLOCKED の候補も出力する")
-    d.add_argument(
-        "--format",
-        dest="target_format",
-        choices=["short", "long", "both"],
-        default="short",
-        help="出力フォーマット (short=≤60秒, long=≥8分, both=両方)",
-    )
-    d.add_argument("--dry-run", action="store_true", help="live 経路を fixture/スタブで動作させる (M1)")
-    d.add_argument("--now", help="ISO8601 で『現在時刻』を上書き (テスト用)")
-    d.add_argument("--quiet", action="store_true")
-    d.set_defaults(func=cmd_discover)
+    cc = sub.add_parser("config-check", help="設定ファイル・環境変数・出力先を検証")
+    cc.set_defaults(func=cmd_config_check)
+
+    cp = sub.add_parser("compliance-check", help="削除依頼/権利リストで候補を再フィルタ")
+    cp.add_argument("--input", required=True, help="candidates または plans の JSON")
+    cp.add_argument("--takedown-list", required=True, help="JSON または TSV の takedown リスト")
+    cp.add_argument("--out", help="結果 JSON 出力先 (省略時は stdout)")
+    cp.set_defaults(func=cmd_compliance_check)
 
     pp = sub.add_parser("plan", help="候補ごとにハイライト/タイトル/サムネ案を生成する")
     pp.add_argument("--source", choices=["mock", "live"], default="mock")
@@ -388,23 +583,66 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--quiet", action="store_true")
     pp.add_argument("--polish", action="store_true", help="LLM(Claude API)でタイトル品質を向上 (要 ANTHROPIC_API_KEY)")
     pp.add_argument("--polish-model", default="claude-opus-4-7", help="LLM ポリッシュ用モデル")
+    pp.add_argument("--audit-log", help="監査ログ出力先 (JSONL)")
     pp.set_defaults(func=cmd_plan)
 
-    cc = sub.add_parser("config-check", help="設定ファイル・環境変数・出力先を検証")
-    cc.set_defaults(func=cmd_config_check)
-
-    cp = sub.add_parser("compliance-check", help="削除依頼/権利リストで候補を再フィルタ")
-    cp.add_argument("--input", required=True, help="candidates または plans の JSON")
-    cp.add_argument("--takedown-list", required=True, help="JSON または TSV の takedown リスト")
-    cp.add_argument("--out", help="結果 JSON 出力先 (省略時は stdout)")
-    cp.set_defaults(func=cmd_compliance_check)
+    d = sub.add_parser("discover", help="候補動画を抽出してランキング表示する")
+    d.add_argument("--source", choices=["mock", "live"], default="mock")
+    d.add_argument(
+        "--mock",
+        default="src/clipgen/data/mock_search.json",
+        help="--source mock のときの入力 JSON",
+    )
+    d.add_argument("--out", help="候補リストの JSON 出力先")
+    d.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    d.add_argument("--min-views", type=int, default=DEFAULT_MIN_VIEWS)
+    d.add_argument("--include-blocked", action="store_true", help="RIGHTS=BLOCKED の候補も出力する")
+    d.add_argument(
+        "--format",
+        dest="target_format",
+        choices=["short", "long", "both"],
+        default="short",
+        help="出力フォーマット (short=≤60秒, long=≥8分, both=両方)",
+    )
+    d.add_argument("--dry-run", action="store_true", help="live 経路を fixture/スタブで動作させる (M1)")
+    d.add_argument("--now", help="ISO8601 で『現在時刻』を上書き (テスト用)")
+    d.add_argument("--quiet", action="store_true")
+    d.add_argument("--audit-log", help="監査ログ出力先 (JSONL)")
+    d.set_defaults(func=cmd_discover)
 
     d2 = sub.add_parser("extract", help="generate yt-dlp/ffmpeg extraction commands from plan JSON")
     d2.add_argument("--plan", required=True, help="path to plan.json generated by the plan command")
     d2.add_argument("--out-root", default="output/extract", help="output root directory")
     d2.add_argument("--top", type=int, default=5, help="number of plans to process")
     d2.add_argument("--dry-run", action="store_true", help="print commands instead of writing files")
+    d2.add_argument("--audit-log", help="監査ログ出力先 (JSONL)")
     d2.set_defaults(func=cmd_extract)
+
+    rj = sub.add_parser("run-job", help="日次ジョブを実行する")
+    rj.add_argument("--date", required=True, help="対象日 YYYY-MM-DD")
+    rj.add_argument("--out-root", default="output", help="出力ルート")
+    rj.add_argument("--source", default="mock", help='"mock" または mock JSON の path')
+    rj.add_argument("--include-blocked", action="store_true")
+    rj.add_argument("--aggressiveness", type=int, choices=[0, 1, 2, 3], default=None)
+    rj.add_argument("--polish", action="store_true")
+    rj.add_argument("--polish-model", default="claude-opus-4-7")
+    rj.add_argument("--dry-run", action="store_true")
+    rj.set_defaults(func=cmd_run_job)
+
+    rv = sub.add_parser("review", help="candidates/plans JSON をレビューする")
+    rv.add_argument("--input", required=True, help="candidates または plans JSON")
+    rv.add_argument("--out-json", help="JSON 出力先")
+    rv.add_argument("--out-tsv", help="TSV 出力先")
+    rv.add_argument("--score-threshold", type=float, default=60.0)
+    rv.set_defaults(func=cmd_review)
+
+    dg = sub.add_parser("digest", help="plans JSON から日次 digest を生成/投稿する")
+    dg.add_argument("--plans", required=True, help="plan JSON、または run-job 出力の plan.json")
+    dg.add_argument("--date", required=True, help="対象日 YYYY-MM-DD")
+    dg.add_argument("--top-n", type=int, default=5)
+    dg.add_argument("--webhook-url", help="Slack incoming webhook URL")
+    dg.add_argument("--dry-run", action="store_true")
+    dg.set_defaults(func=cmd_digest)
 
     return p
 
