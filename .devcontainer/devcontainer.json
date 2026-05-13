@@ -4,7 +4,8 @@
   "features": {
     "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
   },
-  "postCreateCommand": "bash .devcontainer/init-podedit.sh",
+  "postCreateCommand": "sudo mkdir -p /home/vscode/.claude && sudo chown -R vscode:vscode /home/vscode/.claude && bash .devcontainer/init-podedit.sh",
+  "waitFor": "postCreateCommand",
   "forwardPorts": [8765],
   "portsAttributes": {
     "8765": {
