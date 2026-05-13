@@ -2583,9 +2583,14 @@
       const reply = await finalize.json();
       logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
+      logKPI('ui.library.upload.auto_transcribe_started', { basename: reply.basename, path: reply.path });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
-      setLibraryStatus(`${reply.basename} をアップロードしました。「文字起こし」をクリックして処理してください。`);
+      startTranscribe({ name: reply.basename, path: reply.path }).catch((err) => {
+        logKPI('ui.library.upload.auto_transcribe_failed', { message: String(err && err.message ? err.message : err) });
+        console.log('auto_transcribe_failed', err);
+      });
+      setLibraryStatus(`${reply.basename} をアップロードしました。文字起こしを開始しています…`);
     } catch (e) {
       logKPI('ui.library.upload.fetch_failed', { message: e.message, name: e.name });
       console.log('ui.library.upload.fetch_failed', { message: e.message, name: e.name, stack: e.stack }, e);
