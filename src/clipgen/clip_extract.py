@@ -199,10 +199,10 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def write_extract_plan(extract: ExtractPlan, root: Path) -> Path:
+    # `extract.output_dir` already contains the joined path
+    # (`output_root / f"{video_id}_{target_format}"`). The `root` argument is
+    # kept for API compatibility but joining again would duplicate the prefix.
     output_dir = Path(extract.output_dir)
-    if not output_dir.is_absolute():
-        output_dir = root / output_dir
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if extract.blocked_reason is not None:
