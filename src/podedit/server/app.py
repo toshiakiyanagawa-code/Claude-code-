@@ -887,7 +887,12 @@ def create_app(config: ServeConfig) -> FastAPI:
         filename_match = re.search(r'(?:^|;)\s*filename="([^"]*)"', disposition)
         if not filename_match:
             raise HTTPException(status_code=400, detail="multipart file filename is required")
-        return filename_match.group(1)
+        filename = filename_match.group(1)
+        try:
+            return filename.encode("latin1").decode("utf-8")
+        except UnicodeError:
+            # Keep legacy behavior for non-UTF-8 multipart filenames.
+            return filename
 
     def _validate_upload_basename(filename: str) -> str:
         raw_filename = (filename or "").strip()
