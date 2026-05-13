@@ -64,6 +64,22 @@
     if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
     return r.json();
   }
+  async function fetchJSONDetailed(url, init) {
+    const r = await fetch(url, init);
+    const text = await r.text();
+    let body = null;
+    if (text) {
+      try { body = JSON.parse(text); } catch (_) { body = { detail: text }; }
+    }
+    if (!r.ok) {
+      const detail = body && body.detail ? body.detail : `HTTP ${r.status}`;
+      const err = new Error(`${url} -> HTTP ${r.status}: ${detail}`);
+      err.status = r.status;
+      err.detail = detail;
+      throw err;
+    }
+    return body;
+  }
   async function fetchJSONWithTimeout(url, init, timeoutMs) {
     if (typeof AbortController === 'undefined') return fetchJSON(url, init);
     const controller = new AbortController();
@@ -238,6 +254,7 @@
 
   // ------- state -------
   const state = {
+    hasActive: true,
     ops: [],           // active delete/move ops
     mergedDeletes: [], // normalized [start, end][] cached from ops
     timeline: [],      // [{sourceStart, sourceEnd, editedStart, editedEnd, originOpId}] in edited order
@@ -429,19 +446,31 @@
   const t0 = performance.now();
   let info, tx, session;
   try {
-    [info, tx, session] = await Promise.all([
+    tx = await fetchJSONDetailed('/api/transcript');
+    [info, session] = await Promise.all([
       fetchJSON('/api/audio/info'),
-      fetchJSON('/api/transcript'),
       fetchJSON('/api/session'),
     ]);
   } catch (e) {
-    $tx.innerHTML = `<div class="status error">Failed to load: ${e.message}</div>`;
-    return;
+    if (e && e.status === 503) {
+      state.hasActive = false;
+      info = { name: 'No audio loaded', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
+      tx = { segments: [] };
+      session = { ops: [] };
+      $tx.innerHTML = '<div class="status empty">No audio loaded.<br>Click Open above (O) to pick a file from Codespace or upload one.</div>';
+    } else {
+      $tx.innerHTML = `<div class="status error">Failed to load: ${e.message}</div>`;
+      return;
+    }
   }
   state.sessionTemplate = session;
   state.ops = session.ops || [];
   state.sourceDuration = info.duration_sec;
-  logKPI('ui.loaded', { latency_ms: performance.now() - t0, has_existing_session: state.ops.length > 0 });
+  logKPI('ui.loaded', {
+    latency_ms: performance.now() - t0,
+    has_existing_session: state.ops.length > 0,
+    has_active: state.hasActive,
+  });
 
   $name.textContent = info.name;
   $meta.textContent = [
@@ -451,7 +480,7 @@
     info.codec,
     tx.model_config && `· model: ${tx.model_config.model}`,
   ].filter(Boolean).join(' · ');
-  $player.src = info.url;
+  if (state.hasActive) $player.src = info.url;
 
   // Diagnostic logging: if seeks are silently ignored, we still see seeking/
   // seeked/error events in the KPI log.
@@ -463,7 +492,7 @@
   $player.addEventListener('stalled', () => logKPI('ui.audio.stalled', { t: $player.currentTime }));
 
   // ------- render -------
-  $tx.innerHTML = '';
+  if (state.hasActive) $tx.innerHTML = '';
   let idx = 0;
   tx.segments.forEach((seg, segIdx) => {
     const div = document.createElement('div');
@@ -891,9 +920,9 @@
     const r = selectionRange();
     for (const w of words) w.el.classList.remove('selected');
     if (r) for (let i = r.ws; i <= r.we; i++) words[i].el.classList.add('selected');
-    $btnDelete.disabled = !r;
-    $btnCut.disabled = !r;
-    $btnClear.disabled = !r;
+    $btnDelete.disabled = !state.hasActive || !r;
+    $btnCut.disabled = !state.hasActive || !r;
+    $btnClear.disabled = !state.hasActive || !r;
   }
 
   function setSelection(anchor, extent) {
@@ -903,7 +932,7 @@
 
   function renderPasteAnchor() {
     for (const w of words) w.el.classList.toggle('paste-anchor', state.pasteAnchor === w.idx);
-    const canPaste = !!state.clipboard && state.pasteAnchor != null;
+    const canPaste = state.hasActive && !!state.clipboard && state.pasteAnchor != null;
     $btnPasteBefore.disabled = !canPaste;
     $btnPasteAfter.disabled = !canPaste;
     if (state.clipboard) {
@@ -1179,8 +1208,14 @@
   }
 
   function refreshButtons() {
-    $btnUndo.disabled = state.undoStack.length === 0;
-    $btnRedo.disabled = state.redoStack.length === 0;
+    $btnUndo.disabled = !state.hasActive || state.undoStack.length === 0;
+    $btnRedo.disabled = !state.hasActive || state.redoStack.length === 0;
+    $btnAudition.disabled = !state.hasActive;
+    $btnExport.disabled = !state.hasActive;
+    $btnCopyTranscript.disabled = !state.hasActive;
+    $btnPlay.disabled = !state.hasActive;
+    $scrubber.disabled = !state.hasActive;
+    $exportFormat.disabled = !state.hasActive;
   }
 
   function updateStats() {
@@ -1213,9 +1248,11 @@
     $saveStatus.title = s;
   }
   function buildSessionJSON() {
+    if (!state.hasActive) return { ops: [] };
     return { ...state.sessionTemplate, ops: state.ops };
   }
   function scheduleSave() {
+    if (!state.hasActive) return;
     state.saveDirty = true;
     setSaveStatus('idle');
     clearTimeout(state.saveTimer);
@@ -1250,6 +1287,7 @@
   // latest ops, not a 300ms-stale view that's still sitting in the timer.
   // Safe to call when nothing is dirty — it returns immediately.
   async function flushSave() {
+    if (!state.hasActive) return;
     if (!state.saveDirty && !state.saveTimer) return;
     clearTimeout(state.saveTimer);
     state.saveTimer = null;
@@ -1398,6 +1436,7 @@
 
   // ------- custom player controls -------
   $btnPlay.addEventListener('click', () => {
+    if (!state.hasActive) return;
     if ($player.paused) {
       const p = $player.play();
       if (p && typeof p.catch === 'function') p.catch(() => {});
@@ -1464,6 +1503,7 @@
   }
 
   async function renderAndAudition() {
+    if (!state.hasActive) return;
     if (state.editedDuration <= 0) {
       setModePill('error', 'empty');
       setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source', state.previewMode ? 'preview' : 'source'), 1500);
@@ -1523,6 +1563,7 @@
   // matches the current ops_hash via cache_key reuse on the server), the
   // server short-circuits with `cached: true` and we pay just the round trip.
   async function exportEditedAudio() {
+    if (!state.hasActive) return;
     if (state.editedDuration <= 0) {
       setModePill('error', 'empty');
       setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
@@ -1644,6 +1685,7 @@
   }
 
   $btnCopyTranscript.addEventListener('click', () => {
+    if (!state.hasActive) return;
     copyEditedTranscript().catch((e) => {
       setSaveStatus('error:' + e.message);
     });
@@ -1768,13 +1810,15 @@
     waveformBaseCanvas = null;  // force re-render on next paint
   });
 
-  fetchJSON('/api/waveform?points=2000').then((wf) => {
-    waveformData = wf;
-    paintWaveform();
-    logKPI('ui.waveform.loaded', { points: wf.target_points, duration_sec: wf.duration_sec });
-  }).catch((e) => {
-    logKPI('ui.waveform.error', { error: e.message });
-  });
+  if (state.hasActive) {
+    fetchJSON('/api/waveform?points=2000').then((wf) => {
+      waveformData = wf;
+      paintWaveform();
+      logKPI('ui.waveform.loaded', { points: wf.target_points, duration_sec: wf.duration_sec });
+    }).catch((e) => {
+      logKPI('ui.waveform.error', { error: e.message });
+    });
+  }
 
   // ------- keyboard shortcuts -------
   document.addEventListener('keydown', (e) => {
@@ -1853,6 +1897,7 @@
       const t = document.activeElement;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       if (mod) return;  // don't grab Ctrl+E / Cmd+E
+      if (!state.hasActive) return;
       e.preventDefault();
       exportEditedAudio();
       return;
@@ -1861,6 +1906,7 @@
       const t = document.activeElement;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       if (mod) return;
+      if (!state.hasActive) return;
       e.preventDefault();
       copyEditedTranscript().catch((err) => {
         setSaveStatus('error:' + err.message);
@@ -1876,6 +1922,7 @@
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')
           && t !== $scrubber) return;
       e.preventDefault();
+      if (!state.hasActive) return;
       if ($player.paused) {
         const p = $player.play();
         if (p && typeof p.catch === 'function') p.catch(() => {});
@@ -2455,7 +2502,11 @@
   });
 
   // ------- initial paint -------
-  rerenderOps();
+  if (state.hasActive) rerenderOps();
+  else {
+    syncTimelineUI();
+    updateStats();
+  }
   renderPasteAnchor();
   refreshButtons();
 })();

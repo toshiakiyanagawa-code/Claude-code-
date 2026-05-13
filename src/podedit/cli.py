@@ -535,9 +535,9 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
 
 
 @cli.command("serve")
-@click.option("--audio", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True,
+@click.option("--audio", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
               help="Source audio to stream to the UI")
-@click.option("--transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True,
+@click.option("--transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
               help="Transcript JSON to render")
 @click.option("--session", "session_path", type=click.Path(path_type=Path), default=None,
               help="EditSession JSON path. Auto-loaded if exists, auto-saved on UI changes. "
@@ -552,8 +552,8 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, show_default=True, type=int)
 def serve_cmd(
-    audio: Path,
-    transcript: Path,
+    audio: Path | None,
+    transcript: Path | None,
     session_path: Path | None,
     kpi_log: Path | None,
     library_dir: Path | None,
@@ -566,8 +566,16 @@ def serve_cmd(
 
     from .server.app import AudioTranscriptMismatch, ServeConfig, create_app
 
-    session_path = session_path or transcript.parent / f"{audio.stem}.session.json"
-    kpi_log = kpi_log or transcript.parent / f"{audio.stem}.kpi.jsonl"
+    if (audio is None) != (transcript is None):
+        _fatal("either both --audio and --transcript, or neither")
+
+    if audio is not None and transcript is not None:
+        session_path = session_path or transcript.parent / f"{audio.stem}.session.json"
+        kpi_log = kpi_log or transcript.parent / f"{audio.stem}.kpi.jsonl"
+    else:
+        work_dir = work_dir or Path(".podedit/work")
+        session_path = session_path or work_dir / "empty.session.json"
+        kpi_log = kpi_log or work_dir / "empty.kpi.jsonl"
 
     try:
         app = create_app(ServeConfig(
@@ -582,11 +590,18 @@ def serve_cmd(
         _fatal(str(e))
     except FileNotFoundError as e:
         _fatal(str(e))
-    console.print(
-        f"[green]podedit UI[/green] serving "
-        f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
-        f"at [link]http://{host}:{port}[/link]"
-    )
+    if audio is not None and transcript is not None:
+        console.print(
+            f"[green]podedit UI[/green] serving "
+            f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
+            f"at [link]http://{host}:{port}[/link]"
+        )
+    else:
+        console.print(
+            f"[green]podedit UI[/green] serving empty state "
+            f"at [link]http://{host}:{port}[/link]"
+        )
+        console.print("  Open the UI and use Open (O) to upload or select audio.")
     console.print(f"  Session: {session_path}  ({'exists' if session_path.exists() else 'will be created'})")
     console.print(f"  KPI log: {kpi_log}")
     uvicorn.run(app, host=host, port=port, log_level="info")

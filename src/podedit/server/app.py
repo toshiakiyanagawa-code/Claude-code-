@@ -68,9 +68,9 @@ class AudioTranscriptMismatch(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ServeConfig:
-    audio_path: Path
-    transcript_path: Path
-    session_path: Path  # JSON; auto-loaded if exists, auto-saved on UI changes
+    audio_path: Path | None
+    transcript_path: Path | None
+    session_path: Path | None  # JSON; auto-loaded if exists, auto-saved on UI changes
     kpi_log_path: Path  # JSONL; one line per UI event
     library_dir: Path | None = None  # parent dir for the library file picker; defaults to audio_path's parent
     work_dir: Path | None = None  # parent dir for transcripts/sessions; defaults to session_path's parent
@@ -85,19 +85,37 @@ class ServeState:
     """
 
     def __init__(self, config: ServeConfig) -> None:
-        self.library_dir: Path = (config.library_dir or config.audio_path.parent).resolve()
-        self.work_dir: Path = (config.work_dir or config.session_path.parent).resolve()
+        default_work_dir = config.work_dir or (
+            config.session_path.parent if config.session_path is not None else Path(".podedit/work")
+        )
+        default_library_dir = config.library_dir or (
+            config.audio_path.parent if config.audio_path is not None else Path.cwd()
+        )
+        self.library_dir: Path = default_library_dir.resolve()
+        self.work_dir: Path = default_work_dir.resolve()
         # All these get filled in by load_active() below.
-        self.audio_path: Path = config.audio_path
-        self.transcript_path: Path = config.transcript_path
-        self.session_path: Path = config.session_path
+        self.audio_path: Path | None = None
+        self.transcript_path: Path | None = None
+        self.session_path: Path | None = config.session_path
         self.kpi_log_path: Path = config.kpi_log_path
-        self.serve_audio_path: Path = config.audio_path
+        self.serve_audio_path: Path | None = None
         self.transcript_data: dict = {}
         self.session: EditSession | None = None
         self.session_lock = Lock()
 
+    def has_active(self) -> bool:
+        return (
+            self.audio_path is not None
+            and self.transcript_path is not None
+            and self.session_path is not None
+            and self.serve_audio_path is not None
+            and self.session is not None
+            and bool(self.transcript_data)
+        )
+
     def serve_audio_tag(self) -> str:
+        if self.serve_audio_path is None:
+            raise RuntimeError("no audio loaded")
         st = self.serve_audio_path.stat()
         return f"{int(st.st_mtime)}-{st.st_size}"
 
@@ -278,7 +296,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def create_app(config: ServeConfig) -> FastAPI:
     state = ServeState(config)
-    state.load_active(config.audio_path, config.transcript_path)
+    if config.audio_path is not None and config.transcript_path is not None:
+        state.load_active(config.audio_path, config.transcript_path)
     transcription_jobs = TranscriptionJobManager(work_dir=state.work_dir)
     # Opportunistic startup cleanup of W8 transient hardlinks. BackgroundTask
     # usually deletes these on response end, but if the process died mid-
@@ -327,6 +346,11 @@ def create_app(config: ServeConfig) -> FastAPI:
     # stem now. The bootstrap config still pins down library_dir / work_dir.
 
     app = FastAPI(title="podedit", docs_url="/api/docs", redoc_url=None)
+    no_audio_detail = "no audio loaded yet — pick a file via the Open dialog"
+
+    def require_active() -> None:
+        if not state.has_active():
+            raise HTTPException(status_code=503, detail=no_audio_detail)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -334,11 +358,15 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/transcript")
     def transcript() -> JSONResponse:
+        require_active()
         return JSONResponse(state.transcript_data)
 
     @app.get("/api/audio/info")
     def audio_info() -> dict:
+        require_active()
         src = state.transcript_data.get("source_audio") or {}
+        assert state.audio_path is not None
+        assert state.serve_audio_path is not None
         return {
             "name": Path(src.get("path", str(state.audio_path))).name,
             "duration_sec": src.get("duration_sec"),
@@ -352,6 +380,8 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/audio")
     def audio() -> FileResponse:
+        require_active()
+        assert state.serve_audio_path is not None
         media_type = _guess_media_type(state.serve_audio_path)
         return FileResponse(
             state.serve_audio_path, media_type=media_type, filename=state.serve_audio_path.name,
@@ -360,11 +390,14 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/session")
     def get_session() -> dict:
+        require_active()
         with state.session_lock:
+            assert state.session is not None
             return state.session.to_dict()
 
     @app.put("/api/session")
     def put_session(body: dict) -> dict:
+        require_active()
         # Shape-validate the payload outside the lock — it's CPU-only.
         try:
             new_session = EditSession.from_dict(body)
@@ -382,6 +415,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         # decide which transcript/session_path applies all the way through
         # the atomic write.
         with state.session_lock:
+            assert state.session_path is not None
             transcript_data = state.transcript_data
             target_session_path = state.session_path
             expected_src = transcript_data.get("source_audio") or {}
@@ -442,6 +476,7 @@ def create_app(config: ServeConfig) -> FastAPI:
     # Render is synchronous; for the 30-min episode it takes ~75 s.
     @app.post("/api/preview/render")
     def render_preview(opts: dict | None = None) -> dict:
+        require_active()
         opts = opts or {}
         crossfade_ms = float(opts.get("crossfade_ms", 10.0))
         lufs_target = opts.get("lufs_target", -16.0)
@@ -454,6 +489,8 @@ def create_app(config: ServeConfig) -> FastAPI:
         # still writes to the snapshot's preview path, references the snapshot's
         # audio file, and logs the snapshot's KPI path — never a mix.
         with state.session_lock:
+            assert state.session is not None
+            assert state.audio_path is not None
             ops_for_render = list(state.session.ops)
             ops_blob = state.session.to_dict().get("ops", [])
             source_duration = state.session.source_audio.duration_sec
@@ -546,11 +583,13 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/preview-audio/{cache_key}")
     def preview_audio(cache_key: str) -> FileResponse:
+        require_active()
         if not _CACHE_KEY_RE.match(cache_key):
             raise HTTPException(status_code=400, detail="invalid cache key")
         # Snapshot active state under the lock so a racing library/select
         # can't swap stem/work_dir while we resolve the path.
         with state.session_lock:
+            assert state.audio_path is not None
             snap_work_dir = state.work_dir
             snap_stem = state.audio_path.stem
         p = snap_work_dir / f"{snap_stem}.preview.{cache_key}.wav"
@@ -585,6 +624,7 @@ def create_app(config: ServeConfig) -> FastAPI:
     # cached as ``<stem>.preview.<key>.mp3`` so re-downloads are free.
     @app.get("/api/export/{cache_key}")
     def export_audio(cache_key: str, fmt: str = "wav") -> FileResponse:
+        require_active()
         if not _CACHE_KEY_RE.match(cache_key):
             raise HTTPException(status_code=400, detail="invalid cache key")
         if fmt not in ("wav", "mp3"):
@@ -593,6 +633,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         # /api/library/select can't swap the audio stem / work_dir / kpi log
         # mid-export. Codex flagged this in the W8 review.
         with state.session_lock:
+            assert state.audio_path is not None
             snap_work_dir = state.work_dir
             snap_stem = state.audio_path.stem
             snap_kpi_log = state.kpi_log_path
@@ -760,8 +801,10 @@ def create_app(config: ServeConfig) -> FastAPI:
     # recomputed when the source mtime changes or the schema bumps.
     @app.get("/api/waveform")
     def waveform(points: int = 4000) -> JSONResponse:
+        require_active()
         if points <= 0 or points > 20_000:
             raise HTTPException(status_code=400, detail="points must be in (0, 20000]")
+        assert state.audio_path is not None
         cache_path = state.work_dir / f"{state.audio_path.stem}.waveform.{points}.json"
         try:
             wf = get_or_compute_waveform(state.audio_path, cache_path, target_points=points)
@@ -789,14 +832,14 @@ def create_app(config: ServeConfig) -> FastAPI:
     @app.get("/api/library")
     def library() -> JSONResponse:
         entries = scan_library(state.library_dir, state.work_dir)
-        active_name = state.audio_path.name
+        active_name = state.audio_path.name if state.audio_path is not None else None
         return JSONResponse({
             "library_dir": str(state.library_dir),
             "path": str(state.library_dir),
             "parent": None,
             "work_dir": str(state.work_dir),
             "active": active_name,
-            "active_path": str(state.audio_path.resolve()),
+            "active_path": str(state.audio_path.resolve()) if state.audio_path is not None else None,
             "entries": [e.to_dict() for e in entries],
         }, headers={"Cache-Control": "no-store"})
 
@@ -815,8 +858,8 @@ def create_app(config: ServeConfig) -> FastAPI:
             raise HTTPException(status_code=403, detail=f"permission denied: {candidate_dir}") from e
         payload["library_dir"] = str(state.library_dir)
         payload["work_dir"] = str(state.work_dir)
-        payload["active"] = state.audio_path.name
-        payload["active_path"] = str(state.audio_path.resolve())
+        payload["active"] = state.audio_path.name if state.audio_path is not None else None
+        payload["active_path"] = str(state.audio_path.resolve()) if state.audio_path is not None else None
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     def _multipart_boundary(content_type: str) -> bytes:

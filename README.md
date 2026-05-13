@@ -1,8 +1,51 @@
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/toshiakiyanagawa-code/Claude-code-)
+
 # podedit
 
 Local-first podcast editor for Japanese podcasts. Edit audio by editing its transcript.
 
 **Status: MVP complete — transcribe, edit, audition, render — all in the browser or from the CLI.**
+
+## Try it in 5 minutes
+
+### Codespaces (1 click, recommended)
+
+Click the **Open in GitHub Codespaces** badge above. The devcontainer installs
+Python 3.12, `ffmpeg`, and `uv`, then runs `uv sync` for you.
+
+```bash
+uv run podedit serve
+```
+
+Open the forwarded port `8765`, click **Open** in the UI, upload an audio file,
+click **Transcribe**, choose the **Balanced** preset, then select the file and edit.
+
+### Docker
+
+```bash
+docker compose up
+```
+
+Open `http://localhost:8765`, click **Open**, upload or select an audio file,
+transcribe it, then edit. Uploaded files and derived artifacts persist under
+`.podedit/work` on the host.
+
+### Local clone
+
+Prerequisites: Python 3.12, `ffmpeg`/`ffprobe`, and `uv`.
+
+```bash
+git clone https://github.com/toshiakiyanagawa-code/Claude-code-.git
+cd Claude-code-
+sudo apt-get install -y ffmpeg  # or: brew install ffmpeg
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv sync
+uv run podedit serve
+```
+
+Open `http://127.0.0.1:8765`, click **Open**, upload or pick an audio file,
+transcribe it, then edit.
 
 ## What works today
 
@@ -59,39 +102,6 @@ Local-first podcast editor for Japanese podcasts. Edit audio by editing its tran
   (`POST /api/library/transcribe` accepts optional `model`, `beam_size`,
   `initial_prompt`, `hotwords`; explicit empty string for `initial_prompt`
   disables biasing for ablation).
-
-## Setup
-
-```bash
-sudo apt-get install -y ffmpeg                          # or: brew install ffmpeg
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-uv sync
-```
-
-## Quickstart
-
-```bash
-# 1. Transcribe one episode from the CLI so the server has something to load.
-uv run podedit transcribe samples/episode1.m4a --model tiny
-
-# 2. Start the local UI on the audio folder. The Open dialog will list every
-#    audio file in --library-dir; files without a transcript get an in-modal
-#    Transcribe button.
-uv run podedit serve \
-  --audio samples/episode1.m4a \
-  --transcript .podedit/work/episode1.transcript.json \
-  --library-dir samples \
-  --work-dir .podedit/work
-
-# 3. Edit in the browser at http://127.0.0.1:8765 (or your Codespace forwarded
-#    port). Sessions autosave to .podedit/work/<stem>.session.json.
-
-# 4. When you're done editing, press E in the browser to export wav or mp3
-#    directly (recommended). For batch/CI workflows, you can also render from
-#    the CLI against the autosaved session:
-uv run podedit render .podedit/work/episode1.session.json -o final.mp3
-```
 
 ## Usage details
 
