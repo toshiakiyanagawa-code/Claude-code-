@@ -2477,7 +2477,24 @@
       librarySwitching = false;
     }
   }
-  async function uploadFileToLibrary(file) {
+  function showOverwritePrompt(file) {
+    $libraryStatus.hidden = false;
+    $libraryStatus.textContent = `同名ファイルが既にあります: ${file.name}　`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '上書きしてアップロード';
+    btn.className = 'library-action';
+    btn.style.marginLeft = '6px';
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      uploadFileToLibrary(file, { overwrite: true });
+    });
+    $libraryStatus.appendChild(btn);
+  }
+
+  async function uploadFileToLibrary(file, opts) {
+    opts = opts || {};
+    const overwrite = !!opts.overwrite;
     const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
       setLibraryStatus(`ファイルが大きすぎます: ${(file.size / 1024 / 1024).toFixed(1)} MB (上限 500 MB)`);
@@ -2488,9 +2505,9 @@
       const text = await r.text();
       try {
         const reply = JSON.parse(text);
-        return reply && reply.detail ? String(reply.detail) : text.slice(0, 200);
+        return { detail: reply && reply.detail ? String(reply.detail) : text.slice(0, 200), status: r.status };
       } catch (_) {
-        return text.slice(0, 200);
+        return { detail: text.slice(0, 200), status: r.status };
       }
     }
 
@@ -2498,15 +2515,24 @@
     const prev = $btnLibraryUpload.textContent;
     $btnLibraryUpload.textContent = `${file.name} をアップロード中…`;
     try {
-      logKPI('ui.library.upload.fetch_started', { name: file.name, bytes: file.size });
+      logKPI('ui.library.upload.fetch_started', { name: file.name, bytes: file.size, overwrite });
 
       const init = await fetch('/api/library/upload/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ basename: file.name, size: file.size }),
+        body: JSON.stringify({ basename: file.name, size: file.size, overwrite }),
       });
       if (!init.ok) {
-        throw new Error(await readUploadError(init));
+        const err = await readUploadError(init);
+        if (init.status === 409 && /^already_exists:/.test(err.detail)) {
+          // Surface a friendly status and let the user retry with overwrite.
+          showOverwritePrompt(file);
+          logKPI('ui.library.upload.fetch_failed', {
+            message: err.detail, name: file.name, status: 409, reason: 'already_exists',
+          });
+          return;
+        }
+        throw new Error(err.detail);
       }
       const started = await init.json();
       logKPI('ui.library.upload.init_ok', {
@@ -2533,7 +2559,7 @@
           body: file.slice(start, end),
         });
         if (!chunk.ok) {
-          throw new Error(await readUploadError(chunk));
+          throw new Error((await readUploadError(chunk)).detail);
         }
         const progress = await chunk.json();
         bytesReceived = progress.bytes_received;
@@ -2552,7 +2578,7 @@
         body: JSON.stringify({ chunks }),
       });
       if (!finalize.ok) {
-        throw new Error(await readUploadError(finalize));
+        throw new Error((await readUploadError(finalize)).detail);
       }
       const reply = await finalize.json();
       logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });
