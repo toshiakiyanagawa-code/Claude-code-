@@ -9,7 +9,7 @@
 <body>
 <header>
   <div class="title-row">
-    <h1 id="audio-name">Loading…</h1>
+    <h1 id="audio-name">読み込み中…</h1>
     <div class="meta" id="audio-meta"></div>
   </div>
   <audio id="player" preload="metadata"></audio>
@@ -23,7 +23,7 @@
 </header>
 
 <div class="toolbar">
-  <button id="btn-open" title="Switch to a different audio file (O)">Open <kbd>O</kbd></button>
+  <button id="btn-open" title="別の音声ファイルに切り替え (O)">音声を開く <kbd>O</kbd></button>
   <button id="btn-delete" disabled title="Delete selected range (D)">Delete <kbd>D</kbd></button>
   <button id="btn-undo" disabled title="Undo (⌘Z)">Undo <kbd>⌘Z</kbd></button>
   <button id="btn-redo" disabled title="Redo (⌘⇧Z)">Redo <kbd>⌘⇧Z</kbd></button>
@@ -47,40 +47,39 @@
   <span id="save-status" class="save-idle">·</span>
 </div>
 
-<main id="transcript"><div class="status">Loading transcript…</div></main>
+<main id="transcript"><div class="status">文字起こしを読み込み中…</div></main>
 
 <!-- Open-file modal. Hidden until the user clicks the toolbar button. -->
 <div id="library-modal" class="modal-backdrop" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="library-title">
     <div class="modal-header">
-      <h2 id="library-title">Open audio</h2>
-      <button id="btn-library-close" class="modal-close" title="Close (Esc)">×</button>
+      <h2 id="library-title">音声を開く</h2>
+      <button id="btn-library-close" class="modal-close" title="閉じる (Esc)">×</button>
     </div>
     <div class="modal-body">
       <div class="library-preset-row">
-        <label for="transcribe-preset">Transcribe quality:</label>
-        <select id="transcribe-preset" aria-label="Transcribe preset">
-          <option value="fast">Fast (tiny · ~3 min)</option>
-          <option value="balanced" selected>Balanced (small · ~12-15 min)</option>
-          <option value="quality">Quality (small/beam=5 · ~25-30 min)</option>
+        <label for="transcribe-preset">文字起こしの品質:</label>
+        <select id="transcribe-preset" aria-label="文字起こしプリセット">
+          <option value="fast">高速 (tiny · 約3分)</option>
+          <option value="balanced" selected>バランス (small · 約12〜15分)</option>
+          <option value="quality">高品質 (small/beam=5 · 約25〜30分)</option>
         </select>
         <span class="library-preset-hint" id="transcribe-preset-hint">
-          small model + greedy decode + JA podcast prompt
+          smallモデル + 貪欲デコード + 日本語ポッドキャスト用プロンプト
         </span>
       </div>
-      <div id="library-status" class="status">Loading library…</div>
+      <div id="library-status" class="status">ライブラリを読み込み中…</div>
       <div class="library-upload-row">
-        <button id="btn-library-upload" type="button" title="Upload an audio file from your computer">PC からファイルを選択</button>
+        <button id="btn-library-upload" type="button" title="お使いのPCから音声ファイルをアップロード">PC からファイルを選択</button>
         <span class="library-upload-hint" id="library-upload-hint">最大 500 MB · m4a/mp3/wav/flac/aac/ogg/opus/mp4</span>
       </div>
       <input id="library-file-input" type="file" accept="audio/*,.m4a,.mp3,.wav,.flac,.aac,.ogg,.opus,.mp4" hidden />
-      <div id="library-breadcrumbs" class="library-breadcrumbs" aria-label="Current path"></div>
+      <div id="library-breadcrumbs" class="library-breadcrumbs" aria-label="現在のパス"></div>
       <ul id="library-list" class="library-list"></ul>
       <div class="library-hint">
-        Scanned from <code id="library-dir-hint">—</code>. Current path
-        <code id="library-current-path">—</code>. The Transcribe
-        button on each entry uses the preset above. CLI <code>podedit transcribe</code>
-        also works and produces a transcript here that the picker will show.
+        スキャン元: <code id="library-dir-hint">—</code> / 現在のパス:
+        <code id="library-current-path">—</code>。各行の「文字起こし」ボタンは上のプリセットを使用します。
+        CLI <code>podedit transcribe</code> でも文字起こしを生成でき、このピッカーに表示されます。
       </div>
     </div>
   </div>

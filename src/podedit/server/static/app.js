@@ -160,7 +160,7 @@
       if (active()) setLibraryStatus(message, extra);
       else writeLibraryDiag('stale-status-skipped', { seq, message, extra });
     };
-    setActiveLibraryStatus('step 1: fetching /api/library (timeout 10s)…');
+    setActiveLibraryStatus('ステップ 1: /api/library を取得中 (タイムアウト 10秒)…');
     writeLibraryDiag('fetch-start', { seq, url });
     console.log('[podedit] library step 1: fetching /api/library (timeout 10s)…', { seq, url });
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -180,14 +180,14 @@
       const r = await fetch(url, init);
       const contentType = r.headers.get('content-type') || '(none)';
       setActiveLibraryStatus(
-        `step 2: response status=${r.status} content-type=${contentType} size=reading...`,
+        `ステップ 2: 応答 status=${r.status} content-type=${contentType} size=読み込み中…`,
         `ok=${r.ok} redirected=${r.redirected} type=${r.type} url=${r.url}`,
       );
       const text = await r.text();
       const elapsedMs = Math.round(performance.now() - startedAt);
       const size = text.length;
       setActiveLibraryStatus(
-        `step 2: response status=${r.status} content-type=${contentType} size=${size}`,
+        `ステップ 2: 応答 status=${r.status} content-type=${contentType} size=${size}`,
         `ok=${r.ok} redirected=${r.redirected} type=${r.type} elapsed=${elapsedMs}ms url=${r.url}`,
       );
       console.log('[podedit] library step 2: response', {
@@ -215,7 +215,7 @@
       if (!/application\/json/i.test(contentType)) {
         throw new Error(`Expected JSON but got content-type=${contentType}; body starts ${bodyPreview(text)}`);
       }
-      setActiveLibraryStatus('step 3: parsing JSON…');
+      setActiveLibraryStatus('ステップ 3: JSON を解析中…');
       console.log('[podedit] library step 3: parsing JSON', { seq, size });
       writeLibraryDiag('fetch-body', { seq, bodyBytes: text.length, preview: text.slice(0, 240) });
       if (!r.ok) {
@@ -454,12 +454,12 @@
   } catch (e) {
     if (e && e.status === 503) {
       state.hasActive = false;
-      info = { name: 'No audio loaded', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
+      info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
       tx = { segments: [] };
       session = { ops: [] };
-      $tx.innerHTML = '<div class="status empty">No audio loaded.<br>Click Open above (O) to pick a file from Codespace or upload one.</div>';
+      $tx.innerHTML = '<div class="status empty">音声が読み込まれていません。<br>上の「音声を開く」(O) をクリックして、Codespace 内のファイルを選ぶか、アップロードしてください。</div>';
     } else {
-      $tx.innerHTML = `<div class="status error">Failed to load: ${e.message}</div>`;
+      $tx.innerHTML = `<div class="status error">読み込みに失敗しました: ${e.message}</div>`;
       return;
     }
   }
@@ -1956,7 +1956,7 @@
   async function fetchFsBrowse(path, seq) {
     const suffix = path ? `?path=${encodeURIComponent(path)}` : '';
     const url = `/api/fs/browse${suffix}`;
-    setLibraryStatus('Fetching directory…', path || 'default library path');
+    setLibraryStatus('ディレクトリを取得中…', path || '既定のライブラリパス');
     writeLibraryDiag('fs-browse-start', { seq, url, path });
     const r = await fetch(url, {
       cache: 'no-store',
@@ -1987,7 +1987,7 @@
       lastTranscribedLibrary = data;
       populateLibrary(data);
       const entries = Array.isArray(data && data.entries) ? data.entries : [];
-      setLibraryStatus('Directory loaded.', `entries=${entries.length} path=${libraryBrowsePath || '—'}`);
+      setLibraryStatus('ディレクトリを読み込みました。', `entries=${entries.length} path=${libraryBrowsePath || '—'}`);
     } catch (e) {
       if (!libraryOpen || seq !== libraryLoadSeq) return;
       setLibraryError(e);
@@ -2003,12 +2003,12 @@
       libraryReturnFocus = document.activeElement;
       $libraryModal.hidden = false;
       $libraryList.innerHTML = '';
-      $libraryDirHint.textContent = 'checking...';
-      if ($libraryCurrentPath) $libraryCurrentPath.textContent = 'checking...';
+      $libraryDirHint.textContent = '確認中…';
+      if ($libraryCurrentPath) $libraryCurrentPath.textContent = '確認中…';
       if ($libraryBreadcrumbs) $libraryBreadcrumbs.innerHTML = '';
       libraryBrowsePath = null;
       libraryBrowseMode = false;
-      setLibraryStatus('step 0: modal opened', `seq=${seq}`);
+      setLibraryStatus('ステップ 0: ダイアログを開きました', `seq=${seq}`);
       writeLibraryDiag('modal-open', { seq });
       console.log('[podedit] library modal opened', { seq });
       // Move keyboard focus into the dialog so Esc works without an extra click.
@@ -2019,13 +2019,13 @@
           return;
         }
         const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
-        setLibraryStatus('step 1: fetching /api/library (timeout 10s)…', `elapsed=${elapsedSec}s seq=${seq}`);
+        setLibraryStatus('ステップ 1: /api/library を取得中 (タイムアウト 10秒)…', `elapsed=${elapsedSec}s seq=${seq}`);
       }, 1000);
       const watchdog = setTimeout(() => {
         if (!libraryOpen || seq !== libraryLoadSeq) return;
         setLibraryStatus(
-          'diagnostic timeout: library fetch has not completed',
-          'Fetch is still pending after 11s. Check localStorage["podedit.libraryDiagnostics"] for the last recorded step.',
+          '診断タイムアウト: ライブラリの取得が完了していません',
+          '11秒経過しても取得が保留中です。直近の進行ステップは localStorage["podedit.libraryDiagnostics"] を確認してください。',
         );
         writeLibraryDiag('watchdog-timeout', { seq });
       }, 11000);
@@ -2041,7 +2041,7 @@
           lastTranscribedLibrary = data;
           const entries = Array.isArray(data && data.entries) ? data.entries : [];
           const libraryDir = data && data.library_dir ? data.library_dir : '—';
-          setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `library_dir=${libraryDir}`);
+          setLibraryStatus(`ステップ 4: ${entries.length} 件の項目を描画中…`, `library_dir=${libraryDir}`);
           console.log('[podedit] library step 4: rendering entries', { seq, entries: entries.length, libraryDir });
           // If a transcription is already running (kicked off in a previous
           // modal-open or before a page reload), pick up its state before we
@@ -2061,7 +2061,7 @@
             // Status poll is best-effort — the main library list still renders.
           }
           populateLibrary(data);
-          setLibraryStatus('Library loaded.', `entries=${entries.length} library_dir=${libraryDir}`);
+          setLibraryStatus('ライブラリを読み込みました。', `entries=${entries.length} library_dir=${libraryDir}`);
           writeLibraryDiag('render-complete', { seq, entries: entries.length, libraryDir });
         } catch (e) {
           if (!libraryOpen || seq !== libraryLoadSeq) {
@@ -2123,14 +2123,14 @@
     const parentPath = data && data.parent ? data.parent : null;
     const active = data && data.active ? data.active : '';
     const activePath = data && data.active_path ? data.active_path : '';
-    setLibraryStatus(`step 4: rendering ${entries.length} entries…`, `path=${currentPath}`);
+    setLibraryStatus(`ステップ 4: ${entries.length} 件の項目を描画中…`, `path=${currentPath}`);
     console.log('[podedit] populateLibrary start', { entries: entries.length, libraryDir, currentPath, active });
     $libraryDirHint.textContent = libraryDir;
     if ($libraryCurrentPath) $libraryCurrentPath.textContent = currentPath;
     renderLibraryBreadcrumbs(currentPath);
     $libraryList.innerHTML = '';
     if (!entries.length && !parentPath) {
-      $libraryStatus.textContent = `No audio files found in ${currentPath}.`;
+      $libraryStatus.textContent = `${currentPath} に音声ファイルが見つかりません。`;
       $libraryStatus.hidden = false;
       console.log('[podedit] populateLibrary empty', { currentPath });
       return;
@@ -2152,7 +2152,7 @@
       name.textContent = '..';
       const meta = document.createElement('span');
       meta.className = 'library-meta';
-      meta.textContent = 'parent directory';
+      meta.textContent = '親ディレクトリ';
       li.append(name, meta);
       li.addEventListener('click', () => navigateLibraryTo(parentPath));
       $libraryList.appendChild(li);
@@ -2166,7 +2166,7 @@
         name.textContent = e.name;
         const meta = document.createElement('span');
         meta.className = 'library-meta';
-        meta.textContent = 'directory';
+        meta.textContent = 'ディレクトリ';
         li.append(name, meta);
         li.addEventListener('click', () => navigateLibraryTo(e.path));
         $libraryList.appendChild(li);
@@ -2193,10 +2193,10 @@
         ? `${Math.floor(e.duration_sec / 60)}:${String(Math.round(e.duration_sec) % 60).padStart(2, '0')}`
         : '—';
       const tBadge = e.has_transcript
-        ? '<span class="badge ok">transcript</span>'
-        : '<span class="badge missing">no transcript</span>';
-      const sBadge = e.has_session ? '<span class="badge session">session</span>' : '';
-      const activeBadge = isActive ? '<span class="badge ok">active</span>' : '';
+        ? '<span class="badge ok">文字起こし済み</span>'
+        : '<span class="badge missing">文字起こしなし</span>';
+      const sBadge = e.has_session ? '<span class="badge session">セッションあり</span>' : '';
+      const activeBadge = isActive ? '<span class="badge ok">使用中</span>' : '';
       meta.innerHTML = `${dur}${tBadge}${sBadge}${activeBadge}`;
       li.append(name, meta);
       // Per-entry action button area: Transcribe for entries without a
@@ -2211,7 +2211,7 @@
         const btn = document.createElement('button');
         btn.className = 'library-action library-transcribe-btn';
         btn.type = 'button';
-        btn.textContent = 'Transcribe';
+        btn.textContent = '文字起こし';
         // Stop click from bubbling to the row's selectable handler (which
         // we wouldn't have attached here anyway, but it's cheap insurance
         // against future regressions).
@@ -2224,7 +2224,7 @@
         // too, but it's nicer UX to grey out preemptively.
         if (transcribeJob && (transcribeJob.status === 'running' || transcribeJob.status === 'queued')) {
           btn.disabled = true;
-          btn.title = 'Another transcription is in progress';
+          btn.title = '別の文字起こしが進行中です';
         }
         li.append(btn);
       }
@@ -2266,17 +2266,17 @@
   let transcribePollInFlight = false;  // setInterval can overlap if a tick is slower than the 2s period — guard it
   let lastTranscribedLibrary = null;  // cached library payload so we can re-render with new progress
   function formatTranscribeProgress(job) {
-    if (!job) return 'transcribing…';
+    if (!job) return '文字起こし中…';
     const covered = job.progress_audio_sec || 0;
     const total = job.duration_sec || 0;
-    const coveredStr = `${covered.toFixed(0)}s`;
-    const totalStr = total ? ` / ${Math.round(total)}s` : '';
+    const coveredStr = `${covered.toFixed(0)}秒`;
+    const totalStr = total ? ` / ${Math.round(total)}秒` : '';
     const elapsed = job.elapsed_sec || 0;
     const mm = Math.floor(elapsed / 60);
     const ss = Math.floor(elapsed % 60).toString().padStart(2, '0');
-    const rtf = job.rtf ? ` · ${job.rtf.toFixed(1)}x RTF` : '';
+    const rtf = job.rtf ? ` · RTF ${job.rtf.toFixed(1)}x` : '';
     const model = job.model ? ` · ${job.model}` : '';
-    return `transcribing… ${coveredStr}${totalStr} covered · elapsed ${mm}:${ss}${rtf}${model}`;
+    return `文字起こし中… ${coveredStr}${totalStr} 処理済み · 経過 ${mm}:${ss}${rtf}${model}`;
   }
   // ----- transcribe quality preset (W9) -----
   // Mapping from preset name to the (model, beam_size) tuple the server
@@ -2299,7 +2299,7 @@
   function updatePresetHint() {
     if (!$transcribePresetHint) return;
     const cur = TRANSCRIBE_PRESETS[currentTranscribePreset()];
-    $transcribePresetHint.textContent = `${cur.label} + JA podcast prompt`;
+    $transcribePresetHint.textContent = `${cur.label} + 日本語ポッドキャスト用プロンプト`;
   }
   if ($transcribePreset) {
     // Restore last choice; ignore unknown values (e.g. preset renamed).
@@ -2347,7 +2347,7 @@
       if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
       schedulePoll();
     } catch (e) {
-      setLibraryStatus(`Could not start transcribe: ${e.message}`);
+      setLibraryStatus(`文字起こしを開始できませんでした: ${e.message}`);
     }
   }
   function schedulePoll() {
@@ -2401,8 +2401,8 @@
               lastTranscribedLibrary = refreshed;
               populateLibrary(refreshed);
               setLibraryStatus(
-                `Transcribed ${transcribeJob.name}.`,
-                `${transcribeJob.segments} segments in ${transcribeJob.elapsed_sec.toFixed(0)}s`,
+                `文字起こしが完了しました: ${transcribeJob.name}`,
+                `${transcribeJob.segments} セグメント · ${transcribeJob.elapsed_sec.toFixed(0)}秒`,
               );
             } catch (err) {
               if (libraryOpen) setLibraryError(err);
@@ -2410,8 +2410,8 @@
           }
         } else if (transcribeJob && transcribeJob.status === 'error') {
           setLibraryStatus(
-            `Transcribe failed: ${transcribeJob.name}`,
-            transcribeJob.error || 'no error detail',
+            `文字起こしに失敗しました: ${transcribeJob.name}`,
+            transcribeJob.error || 'エラー詳細なし',
           );
           logKPI('ui.library.transcribe.failed', {
             name: transcribeJob.name,
@@ -2434,7 +2434,7 @@
     const name = entry && entry.name ? entry.name : String(entry || '');
     const path = entry && (entry.path || entry.audio_path) ? (entry.path || entry.audio_path) : null;
     librarySwitching = true;
-    $libraryStatus.textContent = `Switching to ${name}…`;
+    $libraryStatus.textContent = `${name} に切り替え中…`;
     $libraryStatus.hidden = false;
     try {
       const payload = path ? { path } : { name };
@@ -2452,19 +2452,19 @@
       // beforeunload above will warn if there's unsaved work.
       window.location.reload();
     } catch (e) {
-      $libraryStatus.textContent = `Could not switch: ${e.message}`;
+      $libraryStatus.textContent = `切り替えに失敗しました: ${e.message}`;
       librarySwitching = false;
     }
   }
   async function uploadFileToLibrary(file) {
     const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
-      setLibraryStatus(`File too large: ${(file.size / 1024 / 1024).toFixed(1)} MB (max 500 MB)`);
+      setLibraryStatus(`ファイルが大きすぎます: ${(file.size / 1024 / 1024).toFixed(1)} MB (上限 500 MB)`);
       return;
     }
     $btnLibraryUpload.disabled = true;
     const prev = $btnLibraryUpload.textContent;
-    $btnLibraryUpload.textContent = `uploading ${file.name}…`;
+    $btnLibraryUpload.textContent = `${file.name} をアップロード中…`;
     try {
       const form = new FormData();
       form.append('file', file, file.name);
@@ -2477,9 +2477,9 @@
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
-      setLibraryStatus(`Uploaded ${reply.basename}. Click Transcribe to process.`);
+      setLibraryStatus(`${reply.basename} をアップロードしました。「文字起こし」をクリックして処理してください。`);
     } catch (e) {
-      setLibraryStatus(`Upload failed: ${e.message}`);
+      setLibraryStatus(`アップロードに失敗しました: ${e.message}`);
     } finally {
       $btnLibraryUpload.disabled = false;
       $btnLibraryUpload.textContent = prev;

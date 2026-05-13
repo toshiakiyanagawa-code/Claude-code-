@@ -197,7 +197,7 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   background: #1a1d28; padding: 1px 4px; border-radius: 3px;
   font-family: ui-monospace, monospace;
 }
-.library-dir-entry .library-name::before { content: "dir "; color: var(--accent); }
+.library-dir-entry .library-name::before { content: "フォルダ "; color: var(--accent); }
 .library-nav-entry .library-name { color: var(--accent); }
 /* W7.7: Transcribe action button on entries without a transcript. */
 .library-action {
