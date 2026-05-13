@@ -1,0 +1,10 @@
+services:
+  podedit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./samples:/app/samples
+      - ./.podedit/work:/app/.podedit/work
