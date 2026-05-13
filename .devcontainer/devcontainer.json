@@ -1,9 +1,6 @@
 {
   "name": "podedit",
   "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
-  "features": {
-    "ghcr.io/devcontainers/features/common-utils:2": {}
-  },
   "postCreateCommand": "bash .devcontainer/init-podedit.sh",
   "forwardPorts": [8765],
   "portsAttributes": {
