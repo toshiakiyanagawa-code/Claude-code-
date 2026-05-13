@@ -1,6 +1,9 @@
 {
   "name": "podedit",
   "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
   "postCreateCommand": "bash .devcontainer/init-podedit.sh",
   "forwardPorts": [8765],
   "portsAttributes": {
@@ -9,6 +12,9 @@
       "onAutoForward": "notify"
     }
   },
+  "mounts": [
+    "source=claude-history-${devcontainerId},target=/home/vscode/.claude,type=volume"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
