@@ -1,0 +1,76 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feat/*"
+
+jobs:
+  podedit-tests:
+    name: podedit pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run podedit tests
+        run: |
+          uv run pytest \
+            tests/test_edit.py \
+            tests/test_render.py \
+            tests/test_seam_eval.py \
+            tests/test_timeline.py \
+            tests/test_waveform.py
+
+  clipgen-tests:
+    name: clipgen pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run clipgen tests
+        run: |
+          if [ -d tests/clipgen ]; then
+            uv run pytest tests/clipgen
+          else
+            echo "tests/clipgen not found; skipping clipgen tests"
+          fi
