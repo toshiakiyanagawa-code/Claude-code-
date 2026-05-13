@@ -38,6 +38,7 @@
   const $libraryFileInput = $('library-file-input');
   const $libraryUploadHint = $('library-upload-hint');
   const $libraryBreadcrumbs = $('library-breadcrumbs');
+  const $libraryEnvBanner = $('library-env-banner');
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
@@ -1994,6 +1995,25 @@
     }
   }
 
+  let cachedHealth = null;
+  async function ensureEnvBanner() {
+    if (!$libraryEnvBanner) return;
+    if (!cachedHealth) {
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store' });
+        if (r.ok) cachedHealth = await r.json();
+      } catch (_) { /* non-fatal */ }
+    }
+    if (cachedHealth && cachedHealth.is_codespaces) {
+      const kb = Math.round((cachedHealth.chunked_upload_chunk_size || 524288) / 1024);
+      $libraryEnvBanner.innerHTML =
+        `<strong>Codespaces で動作中</strong> · ` +
+        `アップロードは ${kb}KB ずつの分割転送で、最大 500MB まで対応します。` +
+        `転送中はボタンに進捗 % が表示されます。`;
+      $libraryEnvBanner.hidden = false;
+    }
+  }
+
   function showLibraryModal() {
     try {
       if (libraryOpen) return;
@@ -2002,6 +2022,7 @@
       const startedAt = performance.now();
       libraryReturnFocus = document.activeElement;
       $libraryModal.hidden = false;
+      ensureEnvBanner();
       $libraryList.innerHTML = '';
       $libraryDirHint.textContent = '確認中…';
       if ($libraryCurrentPath) $libraryCurrentPath.textContent = '確認中…';
@@ -2462,24 +2483,87 @@
       setLibraryStatus(`ファイルが大きすぎます: ${(file.size / 1024 / 1024).toFixed(1)} MB (上限 500 MB)`);
       return;
     }
+
+    async function readUploadError(r) {
+      const text = await r.text();
+      try {
+        const reply = JSON.parse(text);
+        return reply && reply.detail ? String(reply.detail) : text.slice(0, 200);
+      } catch (_) {
+        return text.slice(0, 200);
+      }
+    }
+
     $btnLibraryUpload.disabled = true;
     const prev = $btnLibraryUpload.textContent;
     $btnLibraryUpload.textContent = `${file.name} をアップロード中…`;
     try {
-      const form = new FormData();
-      form.append('file', file, file.name);
-      const r = await fetch('/api/library/upload', { method: 'POST', body: form });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      logKPI('ui.library.upload.fetch_started', { name: file.name, bytes: file.size });
+
+      const init = await fetch('/api/library/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ basename: file.name, size: file.size }),
+      });
+      if (!init.ok) {
+        throw new Error(await readUploadError(init));
       }
-      const reply = await r.json();
+      const started = await init.json();
+      logKPI('ui.library.upload.init_ok', {
+        upload_id: started.upload_id,
+        chunk_size: started.chunk_size,
+        name: file.name,
+        bytes: file.size,
+      });
+
+      const uploadId = encodeURIComponent(started.upload_id);
+      const chunkSize = started.chunk_size;
+      if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+        throw new Error('invalid chunk_size from server');
+      }
+      const chunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkSize);
+      let bytesReceived = 0;
+
+      for (let index = 0; index < chunks; index += 1) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const chunk = await fetch(`/api/library/upload/${uploadId}/chunk`, {
+          method: 'PUT',
+          headers: { 'X-Chunk-Index': String(index) },
+          body: file.slice(start, end),
+        });
+        if (!chunk.ok) {
+          throw new Error(await readUploadError(chunk));
+        }
+        const progress = await chunk.json();
+        bytesReceived = progress.bytes_received;
+        const pct = file.size ? Math.floor((bytesReceived / file.size) * 100) : 100;
+        $btnLibraryUpload.textContent = `${file.name} を ${pct}%...`;
+        logKPI('ui.library.upload.chunk_progress', {
+          chunk_index: index,
+          bytes_received: bytesReceived,
+          total_bytes: file.size,
+        });
+      }
+
+      const finalize = await fetch(`/api/library/upload/${uploadId}/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunks }),
+      });
+      if (!finalize.ok) {
+        throw new Error(await readUploadError(finalize));
+      }
+      const reply = await finalize.json();
+      logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
       setLibraryStatus(`${reply.basename} をアップロードしました。「文字起こし」をクリックして処理してください。`);
     } catch (e) {
-      setLibraryStatus(`アップロードに失敗しました: ${e.message}`);
+      logKPI('ui.library.upload.fetch_failed', { message: e.message, name: e.name });
+      console.log('ui.library.upload.fetch_failed', { message: e.message, name: e.name, stack: e.stack }, e);
+      setLibraryStatus(`アップロードに失敗しました: ${String(e && e.message ? e.message : e)}`);
     } finally {
       $btnLibraryUpload.disabled = false;
       $btnLibraryUpload.textContent = prev;
@@ -2488,9 +2572,13 @@
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
   if ($btnLibraryUpload && $libraryFileInput) {
-    $btnLibraryUpload.addEventListener('click', () => $libraryFileInput.click());
+    $btnLibraryUpload.addEventListener('click', () => {
+      logKPI('ui.library.upload.button_clicked');
+      $libraryFileInput.click();
+    });
     $libraryFileInput.addEventListener('change', async () => {
       const f = $libraryFileInput.files && $libraryFileInput.files[0];
+      logKPI('ui.library.upload.change_fired', { has_file: !!f, name: f ? f.name : null, bytes: f ? f.size : null });
       if (!f) return;
       await uploadFileToLibrary(f);
       $libraryFileInput.value = '';
