@@ -949,7 +949,19 @@ def create_app(config: ServeConfig) -> FastAPI:
             pass
 
     def _gc_upload_sessions_locked() -> None:
-        """Caller must hold ``upload_sessions_lock``. Drop idle sessions."""
+        """Caller must hold ``upload_sessions_lock``. Drop idle sessions.
+
+        Intentionally does NOT acquire each session's ``asyncio.Lock`` before
+        closing — this runs from a synchronous context (inside the threading
+        dict lock) and can't ``await``. The single-event-loop assumption is
+        what keeps this safe: chunk and commit handlers hold ``session.lock``
+        only across SYNC critical sections (no ``await`` inside the lock), so
+        GC cannot race a live writer; and any handler currently paused at
+        ``await request.body()`` checks ``file_handle is None`` after the
+        await resumes. If the server is ever refactored to do an await
+        inside ``session.lock``, this GC needs to be reworked to be async.
+        Codex W12.1 review flagged the assumption — preserve it explicitly.
+        """
         now = time.time()
         expired = [
             sid for sid, s in upload_sessions.items()

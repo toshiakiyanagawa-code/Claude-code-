@@ -145,6 +145,43 @@ def test_init_fails_fast_on_name_collision(app_client) -> None:
     assert "already exists" in r.json()["detail"]
 
 
+def test_commit_collision_when_final_race_created(app_client) -> None:
+    """init wins the existence check, then something else races to create the
+    final file before commit. Commit must 409 AND clean up the temp + session.
+
+    Models the case where a sibling process / external tool drops the same
+    filename into uploads/ between our init and our commit.
+    """
+    client, work_dir = app_client
+    uploads = work_dir / "uploads"
+    init = client.post(
+        "/api/library/uploads",
+        json={"filename": "race.wav", "total_size": 4},
+    )
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["upload_id"]
+    client.put(
+        f"/api/library/uploads/{upload_id}",
+        content=b"abcd",
+        headers={"Content-Range": "bytes 0-3/4"},
+    )
+
+    # Simulate the race: drop the final file just before commit.
+    (uploads / "race.wav").write_bytes(b"raced-in")
+
+    r = client.post(f"/api/library/uploads/{upload_id}/commit")
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"]
+
+    # The raced-in file is untouched.
+    assert (uploads / "race.wav").read_bytes() == b"raced-in"
+    # The session is gone (committed handler popped it).
+    assert client.get(f"/api/library/uploads/{upload_id}").status_code == 404
+    # The temp file is cleaned up.
+    leftovers = [p.name for p in uploads.iterdir() if p.name.startswith(".upload-")]
+    assert leftovers == []
+
+
 def test_chunk_out_of_order_returns_409_with_state(app_client) -> None:
     client, _ = app_client
     payload = b"abcdefghij" * 100  # 1000 bytes
