@@ -8,6 +8,7 @@ process, configured at startup via ``create_app``.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -17,9 +18,11 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+from typing import BinaryIO
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -57,6 +60,14 @@ from .jobs import TranscriptionJobManager
 PREVIEW_GC_MAX_FILES = 3
 PREVIEW_GC_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB combined
 
+# Chunked-upload (W12.1) knobs. Single multipart POST hits the Codespaces
+# forwarded-port nginx body limit; chunking around 4 MiB per request avoids it.
+UPLOAD_MAX_BYTES = 500 * 1024 * 1024  # 500 MB hard cap on the assembled file
+UPLOAD_CHUNK_SIZE_HINT = 4 * 1024 * 1024  # 4 MiB suggested chunk size
+UPLOAD_CHUNK_SIZE_MAX = 8 * 1024 * 1024  # 8 MiB ceiling enforced server-side
+UPLOAD_SESSION_TTL_SEC = 3600  # drop abandoned sessions after 1 hour idle
+UPLOAD_ORPHAN_PART_AGE_SEC = 3600  # restart-time sweep threshold for .upload-*.part
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 DURATION_TOLERANCE_SEC = 0.5
@@ -74,6 +85,26 @@ class ServeConfig:
     kpi_log_path: Path  # JSONL; one line per UI event
     library_dir: Path | None = None  # parent dir for the library file picker; defaults to audio_path's parent
     work_dir: Path | None = None  # parent dir for transcripts/sessions; defaults to session_path's parent
+
+
+@dataclass
+class UploadSession:
+    """In-flight chunked upload state. One per ongoing upload.
+
+    Sequential, append-only protocol: each PUT chunk must start at
+    ``received_bytes``. Duplicates / out-of-order chunks are rejected with
+    409 so the client can adjust. Lock serializes chunk writes per session;
+    different sessions can upload concurrently.
+    """
+    upload_id: str
+    basename: str
+    final_path: Path
+    temp_path: Path
+    total_size: int
+    received_bytes: int
+    last_activity: float
+    file_handle: BinaryIO | None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class ServeState:
@@ -325,6 +356,21 @@ def create_app(config: ServeConfig) -> FastAPI:
             orphan.unlink()
         except OSError:
             pass
+
+    # W12.1 chunked-upload temp parts live one level deeper, under uploads/.
+    # If the process dies mid-upload, the .upload-{uuid}.part file leaks until
+    # the volume is wiped. Sweep them at startup the same way W8 sweeps the
+    # transient hardlinks, but only if they're older than the TTL so a sibling
+    # podedit process (rare) doesn't lose its live state.
+    uploads_dir_for_gc = state.work_dir / "uploads"
+    if uploads_dir_for_gc.is_dir():
+        for orphan in uploads_dir_for_gc.glob(".upload-*.part"):
+            try:
+                if now_ts - orphan.stat().st_mtime < UPLOAD_ORPHAN_PART_AGE_SEC:
+                    continue
+                orphan.unlink()
+            except OSError:
+                pass
     # Per-cache-key render lock. Without it, two concurrent /api/preview/render
     # calls for the same key (e.g. Export + Audition fired in parallel from
     # multiple tabs) both miss `preview_path.exists()` and both run ffmpeg
@@ -862,33 +908,6 @@ def create_app(config: ServeConfig) -> FastAPI:
         payload["active_path"] = str(state.audio_path.resolve()) if state.audio_path is not None else None
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
-    def _multipart_boundary(content_type: str) -> bytes:
-        match = re.search(r'(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))', content_type)
-        if not match:
-            raise HTTPException(status_code=400, detail="multipart boundary is required")
-        boundary = (match.group(1) or match.group(2) or "").strip()
-        if not boundary:
-            raise HTTPException(status_code=400, detail="multipart boundary is required")
-        return ("--" + boundary).encode("ascii", "strict")
-
-    def _filename_from_multipart_headers(header_bytes: bytes) -> str:
-        try:
-            header_text = header_bytes.decode("latin1")
-        except UnicodeDecodeError as e:
-            raise HTTPException(status_code=400, detail="invalid multipart headers") from e
-        disposition = ""
-        for line in header_text.split("\r\n")[1:]:
-            if line.lower().startswith("content-disposition:"):
-                disposition = line
-                break
-        name_match = re.search(r'(?:^|;)\s*name="([^"]*)"', disposition)
-        if not name_match or name_match.group(1) != "file":
-            raise HTTPException(status_code=400, detail="multipart field must be named 'file'")
-        filename_match = re.search(r'(?:^|;)\s*filename="([^"]*)"', disposition)
-        if not filename_match:
-            raise HTTPException(status_code=400, detail="multipart file filename is required")
-        return filename_match.group(1)
-
     def _validate_upload_basename(filename: str) -> str:
         raw_filename = (filename or "").strip()
         basename = os.path.basename(raw_filename)
@@ -905,97 +924,335 @@ def create_app(config: ServeConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"unsupported audio suffix {Path(basename).suffix!r}")
         return basename
 
-    @app.post("/api/library/upload")
-    async def library_upload(request: Request) -> JSONResponse:
-        max_bytes = 500 * 1024 * 1024
-        boundary = _multipart_boundary(request.headers.get("content-type", ""))
-        marker = b"\r\n" + boundary
-        keep_bytes = len(marker) + 4  # boundary plus possible "--\r\n"
+    # ---- Chunked upload (W12.1) ------------------------------------------
+    # Codespaces' forwarded-port nginx rejects a single multipart POST above
+    # its (non-configurable, ~1 MB / ~100 MB depending on plan) body limit
+    # with HTTP 413. We split each upload into ~4 MiB raw PUT chunks with
+    # Content-Range, which all fit comfortably under any proxy limit, and
+    # reassemble on the server.
 
-        stream = request.stream().__aiter__()
-        header_buffer = b""
-        while b"\r\n\r\n" not in header_buffer:
+    upload_sessions: dict[str, UploadSession] = {}
+    upload_sessions_lock = Lock()  # protects the dict only; per-session lock is asyncio
+
+    def _close_upload_session(session: UploadSession) -> None:
+        """Best-effort cleanup of an upload session's file handle + temp file."""
+        if session.file_handle is not None:
             try:
-                chunk = await stream.__anext__()
-            except StopAsyncIteration as e:
-                raise HTTPException(status_code=400, detail="multipart body is empty") from e
-            header_buffer += chunk
-            if len(header_buffer) > 64 * 1024 and b"\r\n\r\n" not in header_buffer:
-                raise HTTPException(status_code=400, detail="multipart headers too large")
+                session.file_handle.close()
+            finally:
+                session.file_handle = None
+        try:
+            session.temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
-        header_bytes, file_buffer = header_buffer.split(b"\r\n\r\n", 1)
-        if not header_bytes.startswith(boundary + b"\r\n"):
-            raise HTTPException(status_code=400, detail="multipart file part is required")
-        basename = _validate_upload_basename(_filename_from_multipart_headers(header_bytes))
+    def _gc_upload_sessions_locked() -> None:
+        """Caller must hold ``upload_sessions_lock``. Drop idle sessions.
+
+        Intentionally does NOT acquire each session's ``asyncio.Lock`` before
+        closing — this runs from a synchronous context (inside the threading
+        dict lock) and can't ``await``. The single-event-loop assumption is
+        what keeps this safe: chunk and commit handlers hold ``session.lock``
+        only across SYNC critical sections (no ``await`` inside the lock), so
+        GC cannot race a live writer; and any handler currently paused at
+        ``await request.body()`` checks ``file_handle is None`` after the
+        await resumes. If the server is ever refactored to do an await
+        inside ``session.lock``, this GC needs to be reworked to be async.
+        Codex W12.1 review flagged the assumption — preserve it explicitly.
+        """
+        now = time.time()
+        expired = [
+            sid for sid, s in upload_sessions.items()
+            if now - s.last_activity > UPLOAD_SESSION_TTL_SEC
+        ]
+        for sid in expired:
+            stale = upload_sessions.pop(sid)
+            _close_upload_session(stale)
+
+    @app.post("/api/library/uploads")
+    async def library_upload_init(request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        raw_name = body.get("filename")
+        raw_size = body.get("total_size")
+        if not isinstance(raw_name, str):
+            raise HTTPException(status_code=400, detail="filename (str) is required")
+        if not isinstance(raw_size, int) or isinstance(raw_size, bool) or raw_size < 0:
+            raise HTTPException(status_code=400, detail="total_size (non-negative int) is required")
+        if raw_size > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"total_size exceeds {UPLOAD_MAX_BYTES // (1024 * 1024)} MB limit",
+            )
+        basename = _validate_upload_basename(raw_name)
+
         uploads_dir = state.work_dir / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
         final_path = uploads_dir / basename
-        tmp_path: str | None = None
-        total = 0
-        pending = b""
-        found_boundary = False
+        # Fail fast on a name collision so the client doesn't stream 500 MB
+        # only to discover the conflict at commit. The user can rename and
+        # retry. Empty/zero-size uploads are allowed at init and will commit
+        # immediately; the file just lands empty.
+        if final_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{basename!r} already exists in uploads",
+            )
 
-        def write_capped(dst, data: bytes) -> None:
-            nonlocal total
-            if not data:
-                return
-            total += len(data)
-            if total > max_bytes:
-                raise HTTPException(status_code=413, detail="upload exceeds 500 MB limit")
-            dst.write(data)
-
-        def consume(dst, data: bytes) -> None:
-            nonlocal pending, found_boundary
-            if found_boundary:
-                return
-            combined = pending + data
-            idx = combined.find(marker)
-            if idx >= 0:
-                write_capped(dst, combined[:idx])
-                pending = b""
-                found_boundary = True
-                return
-            if len(combined) > keep_bytes:
-                write_capped(dst, combined[:-keep_bytes])
-                pending = combined[-keep_bytes:]
-            else:
-                pending = combined
-
+        upload_id = uuid.uuid4().hex
+        temp_path = uploads_dir / f".upload-{upload_id}.part"
         try:
-            with tempfile.NamedTemporaryFile(dir=uploads_dir, delete=False) as tmp:
-                tmp_path = tmp.name
-                consume(tmp, file_buffer)
-                while not found_boundary:
-                    try:
-                        chunk = await stream.__anext__()
-                    except StopAsyncIteration:
-                        break
-                    consume(tmp, chunk)
-                if not found_boundary:
-                    raise HTTPException(status_code=400, detail="multipart closing boundary not found")
+            fh = open(temp_path, "wb")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"could not create temp file: {e}") from e
+
+        now = time.time()
+        with upload_sessions_lock:
+            _gc_upload_sessions_locked()
+            upload_sessions[upload_id] = UploadSession(
+                upload_id=upload_id,
+                basename=basename,
+                final_path=final_path,
+                temp_path=temp_path,
+                total_size=raw_size,
+                received_bytes=0,
+                last_activity=now,
+                file_handle=fh,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "upload_id": upload_id,
+                "basename": basename,
+                "total_size": raw_size,
+                "chunk_size_hint": UPLOAD_CHUNK_SIZE_HINT,
+                "max_total_size": UPLOAD_MAX_BYTES,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.put("/api/library/uploads/{upload_id}")
+    async def library_upload_chunk(upload_id: str, request: Request) -> JSONResponse:
+        with upload_sessions_lock:
+            _gc_upload_sessions_locked()
+            session = upload_sessions.get(upload_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="upload session not found or expired")
+
+        cr_header = request.headers.get("content-range", "").strip()
+        cr_match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", cr_header)
+        if not cr_match:
+            raise HTTPException(
+                status_code=400,
+                detail="Content-Range header is required, format: 'bytes A-B/total'",
+            )
+        start, end, total = int(cr_match.group(1)), int(cr_match.group(2)), int(cr_match.group(3))
+
+        if total != session.total_size:
+            return JSONResponse(
+                {
+                    "error": "total_size_mismatch",
+                    "expected_total": session.total_size,
+                    "received_bytes": session.received_bytes,
+                },
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        if end < start or end >= total:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid Content-Range bytes {start}-{end}/{total}",
+            )
+        expected_len = end - start + 1
+
+        # Enforce chunk-size cap BEFORE buffering the body. Without this a
+        # client (or attacker) could send a single 500 MB PUT with a valid
+        # Content-Range, defeating the proxy-bypass goal and bloating memory.
+        if expected_len > UPLOAD_CHUNK_SIZE_MAX:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"chunk size {expected_len} exceeds "
+                    f"{UPLOAD_CHUNK_SIZE_MAX} byte server limit; split your upload smaller"
+                ),
+            )
+        cl_header = request.headers.get("content-length")
+        if cl_header is not None:
             try:
-                os.link(tmp_path, final_path)
-            except FileExistsError as e:
-                raise HTTPException(status_code=409, detail=f"{basename!r} already exists in uploads") from e
-        finally:
-            if tmp_path is not None:
+                cl_value = int(cl_header)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail="invalid Content-Length") from e
+            if cl_value > UPLOAD_CHUNK_SIZE_MAX:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Content-Length {cl_value} exceeds "
+                        f"{UPLOAD_CHUNK_SIZE_MAX} byte server limit"
+                    ),
+                )
+            if cl_value != expected_len:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Content-Length {cl_value} does not match "
+                        f"Content-Range length {expected_len}"
+                    ),
+                )
+
+        body = await request.body()
+        if len(body) != expected_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"body length {len(body)} does not match Content-Range length {expected_len}",
+            )
+
+        async with session.lock:
+            if start != session.received_bytes:
+                # Out of order or duplicate. Return current state so the
+                # client can resync without guessing.
+                return JSONResponse(
+                    {
+                        "error": "out_of_order",
+                        "expected_start": session.received_bytes,
+                        "received_bytes": session.received_bytes,
+                        "total_size": session.total_size,
+                    },
+                    status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if session.file_handle is None:
+                raise HTTPException(status_code=410, detail="upload session is no longer writable")
+            try:
+                session.file_handle.write(body)
+                session.file_handle.flush()
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"chunk write failed: {e}") from e
+            session.received_bytes += len(body)
+            session.last_activity = time.time()
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "received_bytes": session.received_bytes,
+                "total_size": session.total_size,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/library/uploads/{upload_id}/commit")
+    async def library_upload_commit(upload_id: str) -> JSONResponse:
+        with upload_sessions_lock:
+            _gc_upload_sessions_locked()
+            session = upload_sessions.get(upload_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="upload session not found or expired")
+
+        async with session.lock:
+            if session.received_bytes != session.total_size:
+                return JSONResponse(
+                    {
+                        "error": "incomplete",
+                        "received_bytes": session.received_bytes,
+                        "total_size": session.total_size,
+                    },
+                    status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if session.file_handle is not None:
                 try:
-                    os.unlink(tmp_path)
+                    session.file_handle.flush()
+                    os.fsync(session.file_handle.fileno())
+                except OSError:
+                    pass
+                try:
+                    session.file_handle.close()
+                finally:
+                    session.file_handle = None
+
+            try:
+                os.link(str(session.temp_path), str(session.final_path))
+                final_path = session.final_path
+                basename = session.basename
+                total_size = session.total_size
+            except FileExistsError as e:
+                # Atomic publish fails because another file already exists.
+                # Leave the temp around for inspection? No — clean it up;
+                # the user must rename the source and retry.
+                _close_upload_session(session)
+                with upload_sessions_lock:
+                    upload_sessions.pop(upload_id, None)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{session.basename!r} already exists in uploads",
+                ) from e
+            else:
+                # Successfully linked. Remove temp + drop session.
+                try:
+                    session.temp_path.unlink()
                 except FileNotFoundError:
                     pass
+                except OSError:
+                    pass
+                with upload_sessions_lock:
+                    upload_sessions.pop(upload_id, None)
 
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(),
             "type": "server.library.uploaded",
             "basename": basename,
-            "bytes": total,
+            "bytes": total_size,
         })
-        return JSONResponse({
-            "ok": True,
-            "path": str(final_path),
-            "basename": basename,
-            "bytes": total,
-        }, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {
+                "ok": True,
+                "path": str(final_path),
+                "basename": basename,
+                "bytes": total_size,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete("/api/library/uploads/{upload_id}")
+    async def library_upload_cancel(upload_id: str) -> JSONResponse:
+        with upload_sessions_lock:
+            session = upload_sessions.pop(upload_id, None)
+        if session is None:
+            # Idempotent — already gone (committed, cancelled, or expired).
+            return JSONResponse(
+                {"ok": True, "status": "not_found"},
+                headers={"Cache-Control": "no-store"},
+            )
+        # Acquire the per-session lock before tearing down the file handle so
+        # any in-flight chunk write completes first. In a single-event-loop
+        # deployment chunks never await mid-write, so this is mostly a guard
+        # against TestClient / multi-portal threaded execution.
+        async with session.lock:
+            _close_upload_session(session)
+        return JSONResponse(
+            {"ok": True, "status": "cancelled"},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/library/uploads/{upload_id}")
+    async def library_upload_status(upload_id: str) -> JSONResponse:
+        with upload_sessions_lock:
+            _gc_upload_sessions_locked()
+            session = upload_sessions.get(upload_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="upload session not found or expired")
+        return JSONResponse(
+            {
+                "ok": True,
+                "upload_id": session.upload_id,
+                "basename": session.basename,
+                "received_bytes": session.received_bytes,
+                "total_size": session.total_size,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _audio_from_library_request(body: dict, *, require_string_name: bool = False) -> tuple[Path, str]:
         body = body or {}
