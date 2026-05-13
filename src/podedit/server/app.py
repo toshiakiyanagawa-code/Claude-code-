@@ -1129,11 +1129,50 @@ def create_app(config: ServeConfig) -> FastAPI:
         if size > MAX_FILE_BYTES:
             raise HTTPException(status_code=413, detail="upload exceeds 500 MB limit")
 
+        overwrite = bool(payload.get("overwrite"))
         uploads_dir = state.work_dir / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
         final_path = uploads_dir / basename
-        if final_path.exists():
-            raise HTTPException(status_code=409, detail=f"{basename!r} already exists in uploads")
+        # Use lstat to inspect the target without following symlinks. exists()
+        # would follow the link and let us silently delete the wrong file.
+        try:
+            entry_stat = os.lstat(final_path)
+        except FileNotFoundError:
+            entry_stat = None
+        if entry_stat is not None:
+            if not overwrite:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"already_exists:{basename}",
+                )
+            # Refuse anything that isn't a regular file owned by the server
+            # process. This blocks symlinks (which we never create), dirs,
+            # special files, and any leftover from another user that happens
+            # to live in the uploads dir.
+            import stat as _stat
+            if not _stat.S_ISREG(entry_stat.st_mode):
+                raise HTTPException(status_code=400, detail="cannot overwrite non-file")
+            if entry_stat.st_uid != os.getuid():
+                raise HTTPException(status_code=400, detail="cannot overwrite file owned by another user")
+            # Belt-and-braces containment check: resolve must stay inside
+            # uploads_dir (final_path is built from validated basename, so
+            # this is mostly redundant, but cheap).
+            try:
+                resolved = final_path.resolve(strict=True)
+                resolved.relative_to(uploads_dir.resolve())
+            except (OSError, ValueError) as e:
+                raise HTTPException(status_code=400, detail="cannot overwrite this path") from e
+            # Atomic-ish: unlink uses the un-resolved path so we're operating
+            # on the same dirent we just lstat'd. A concurrent rename between
+            # lstat and unlink could in principle target a different dirent;
+            # this is acceptable under the trusted-uploads-dir assumption
+            # (single server process owns this directory).
+            try:
+                final_path.unlink()
+            except FileNotFoundError:
+                pass  # someone else cleaned up; proceed to fresh upload
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"failed to remove existing file: {e}") from e
 
         upload_id = secrets.token_urlsafe(32)
         tmp_path = _chunk_tmp_path(upload_id)
