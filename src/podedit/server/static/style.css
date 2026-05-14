@@ -231,6 +231,12 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 
 main {
+  /* Drag-to-select is owned by the app, not the browser. Disable the
+     native text selection layer so it can't grey/blue-highlight or start
+     a "drag image" while the user is extending an edit selection — this
+     was a real source of stuck drags on Safari/Codespaces. */
+  user-select: none;
+  -webkit-user-select: none;
   padding: 12px 16px; max-width: 920px; width: 100%; margin: 0 auto;
   /* line-height: 1.4 had ~5px extra gap per line on a 14px font; user
      wanted ~half that. 1.25 is the comfortable spot — slightly more

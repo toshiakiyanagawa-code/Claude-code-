@@ -864,7 +864,15 @@
   }
 
   function wordFromPoint(x, y) {
-    let el = document.elementFromPoint(x, y);
+    // Clamp to viewport interior so a pointer dragged just past the bottom
+    // (or top) edge still hit-tests the boundary-most visible word.
+    // Without this, document.elementFromPoint returns null whenever y
+    // exceeds window.innerHeight, freezing the selection at whatever was
+    // on screen when the cursor crossed the edge — the codex review
+    // flagged this as the next likely cause after the mouseleave fix.
+    const cx = Math.max(1, Math.min(window.innerWidth - 1, x));
+    const cy = Math.max(1, Math.min(window.innerHeight - 1, y));
+    let el = document.elementFromPoint(cx, cy);
     while (el && !el.classList?.contains('word')) el = el.parentElement;
     if (el && el.classList.contains('word')) {
       const i = parseInt(el.dataset.idx, 10);
