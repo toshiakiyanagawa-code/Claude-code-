@@ -805,10 +805,19 @@
     }
   }
 
-  function finishSelectionDrag() {
+  function finishSelectionDrag(reason) {
     if (dragAnchor === null) return;
     const wasDrag = dragMoved;
     const startIdx = dragAnchor;
+    const r0 = selectionRange();
+    logKPI('ui.drag.finish_debug', {
+      reason: reason || 'pointerup',
+      start_idx: startIdx,
+      had_drag: wasDrag,
+      extent: r0 ? r0.we : null,
+      anchor: r0 ? r0.ws : null,
+      duration_sec: r0 ? r0.end - r0.start : null,
+    });
     dragAnchor = null;
     dragMoved = false;
     releaseActivePointerCapture();
@@ -1048,20 +1057,45 @@
       finishMoveDrag(e.clientX, e.clientY);
       return;
     }
-    finishSelectionDrag();
+    finishSelectionDrag('pointerup');
   });
 
   document.addEventListener('pointercancel', (e) => {
     if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    logKPI('ui.drag.pointercancel', { pointerId: e.pointerId, dragAnchor });
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
+    if (dragAnchor !== null) finishSelectionDrag('pointercancel');
   });
 
-  // Drag can be aborted by leaving the window mid-drag; treat it as cancel for
-  // move-drag and as release for selection-drag so dragAnchor never sticks.
+  // Selection drag intentionally does NOT end on mouseleave: the user
+  // routinely drags their pointer past the viewport edge to keep
+  // extending the selection while the transcript auto-scrolls. Pointer
+  // capture + pointerup/pointercancel handle legitimate drag-end.
+  // Killing the drag here was the REAL "30 sec wall" — the moment
+  // pointer y crossed the document edge, dragAnchor went null and the
+  // rAF tick stopped doing anything. Move-drag still cancels because
+  // dropping into another window can't pick a meaningful target.
   document.addEventListener('mouseleave', () => {
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
+  });
+  // setPointerCapture can be released implicitly (DOM mutation, OS
+  // gesture, focus-stealing extension). We log it for diagnostics but
+  // DO NOT end the selection drag — document-level pointermove keeps
+  // firing without capture, so the rAF tick can continue extending the
+  // selection. Only move-drag (which renders a ghost element pinned
+  // to the cursor) actually needs capture; cancel that one explicitly.
+  // Early return when nothing is active to avoid logging unrelated
+  // pointer releases from elsewhere in the page.
+  document.addEventListener('lostpointercapture', (e) => {
+    if (dragAnchor === null && !moveDrag) return;
+    if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    logKPI('ui.drag.pointer_capture_lost', {
+      pointerId: e.pointerId,
+      dragAnchor,
+      hasMoveDrag: !!moveDrag,
+    });
+    if (moveDrag) cancelMoveDrag();
+    // Intentionally do NOT call finishSelectionDrag here — see header.
   });
 
   // Backstop for sensitivity: track pointer position during selection drag and
@@ -1072,6 +1106,7 @@
   // Without this, drag-to-select can't pull the transcript past whatever's
   // visible — the user reported being capped around 30 seconds because
   // wordFromPoint can only see what's already painted on screen.
+  let _dragDebugLastEmitAt = 0;
   function dragMoveTick() {
     if (pendingDragMove && dragAnchor !== null && !moveDrag) {
       const x = pendingDragMove.x;
@@ -1082,9 +1117,39 @@
       } else if (y > window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
         velocity = ((y - (window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX)) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
       }
+      const beforeTxTop = $tx.scrollTop;
+      const beforeWinY = window.scrollY;
       if (velocity !== 0) scrollViewportBy(velocity);
       const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
+      // Debug telemetry: throttled to ~5Hz so the server log stays
+      // readable. Lets us see, from server-side KPI alone, where the
+      // pointer is, whether the scroller is moving, and which word (if
+      // any) we picked. Indispensable for diagnosing the 30sec wall on
+      // user environments we can't open DevTools on.
+      const now = performance.now();
+      if (now - _dragDebugLastEmitAt > 200) {
+        _dragDebugLastEmitAt = now;
+        logKPI('ui.drag.tick_debug', {
+          x, y,
+          innerH: window.innerHeight,
+          innerW: window.innerWidth,
+          edge_zone: MOVE_DRAG_AUTOSCROLL_EDGE_PX,
+          velocity,
+          tx_top_before: beforeTxTop,
+          tx_top_after: $tx.scrollTop,
+          tx_scroll_height: $tx.scrollHeight,
+          tx_client_height: $tx.clientHeight,
+          win_y_before: beforeWinY,
+          win_y_after: window.scrollY,
+          doc_height: document.documentElement.scrollHeight,
+          hit_word_idx: w ? w.idx : null,
+          extent: state.selection ? state.selection.extent : null,
+          anchor: state.selection ? state.selection.anchor : null,
+          drag_anchor: dragAnchor,
+          paint_we: state.selectionPainted ? state.selectionPainted.we : null,
+        });
+      }
       // Intentionally NOT clearing pendingDragMove: a stationary pointer
       // at the edge must keep auto-scrolling. extendSelectionDrag is
       // idempotent for the same extent thanks to the no-op guard.
