@@ -885,7 +885,14 @@ def create_app(config: ServeConfig) -> FastAPI:
     # served straight from the preview cache (already 2-pass loudnorm'd, true-
     # peak-limited, sample-precise). mp3 is transcoded once via ffmpeg LAME and
     # cached as ``<stem>.preview.<key>.mp3`` so re-downloads are free.
-    @app.get("/api/export/{cache_key}")
+    #
+    # GET and HEAD share the same handler: the UI's Export button HEAD-prechecks
+    # before kicking off the browser download flow so a transcode failure
+    # surfaces as a real error instead of the browser's generic download error.
+    # FastAPI's @app.get registers GET only, which used to send HEAD into the
+    # "/" StaticFiles mount → 404, making every export look like it failed even
+    # when the GET that followed succeeded.
+    @app.api_route("/api/export/{cache_key}", methods=["GET", "HEAD"])
     def export_audio(cache_key: str, fmt: str = "wav") -> FileResponse:
         require_active()
         if not _CACHE_KEY_RE.match(cache_key):
