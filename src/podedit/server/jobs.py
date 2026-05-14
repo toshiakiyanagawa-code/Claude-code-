@@ -41,6 +41,7 @@ from ..asr_dictionary import (
 )
 from ..audio import probe as audio_probe, to_wav_16k_mono
 from ..edit import sha256_of_file
+from ..glossary import load_terms
 
 
 # Subdirectory under work_dir for derived 16k mono wavs. We deliberately namespace
@@ -51,6 +52,49 @@ ASR_DERIVED_SUBDIR = "_podedit_asr"
 
 
 JobStatus = Literal["queued", "running", "done", "error"]
+
+
+DEFAULT_JA_PODCAST_PROMPT = "日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。"
+
+
+def resolve_prompt_and_hotwords(
+    *,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    glossary_terms: list[str],
+    default_prompt: str = DEFAULT_JA_PODCAST_PROMPT,
+) -> tuple[str, str | None, int]:
+    """Combine caller inputs with the editor-curated glossary.
+
+    Rules (P0-H):
+      * ``initial_prompt is None`` → use ``default_prompt`` and, if the
+        glossary has terms, append a ``"固有名詞: ..."`` suffix.
+      * ``initial_prompt == ""`` → caller asked for raw decoding; do not
+        inject glossary into the prompt.
+      * Any other string → use the caller's prompt verbatim; glossary does
+        not get appended.
+      * Hotwords: only auto-fill from glossary when *both* ``initial_prompt``
+        and ``hotwords`` were absent — if the caller customised either
+        signal, treat that as an opt-out from auto-biasing.
+
+    Returns ``(effective_prompt, effective_hotwords, glossary_terms_used)``.
+    ``glossary_terms_used`` is for logging.
+    """
+    from ..glossary import render_hotwords, render_prompt_suffix
+
+    glossary_count = 0
+    if initial_prompt is None:
+        effective_prompt = default_prompt
+        suffix = render_prompt_suffix(glossary_terms)
+        if suffix:
+            effective_prompt = f"{effective_prompt} {suffix}"
+            glossary_count = len(glossary_terms)
+    else:
+        effective_prompt = initial_prompt  # may be ""
+    effective_hotwords = hotwords
+    if effective_hotwords is None and initial_prompt is None and glossary_terms:
+        effective_hotwords = render_hotwords(glossary_terms)
+    return effective_prompt, effective_hotwords, glossary_count
 
 
 @dataclass
@@ -128,7 +172,10 @@ class TranscriptionJobManager:
     # to avoid over-biasing toward a single topic; podcast-shaped so the
     # decoder favors conversational form (です/ます, aizuchi) over news-
     # script form. Empty string means "let faster-whisper default win".
-    DEFAULT_JA_PODCAST_PROMPT = "日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。"
+    # Single source of truth lives at module scope; class attribute kept as
+    # an alias so existing callers (e.g. ``self.DEFAULT_JA_PODCAST_PROMPT``)
+    # keep working without churn.
+    DEFAULT_JA_PODCAST_PROMPT: str = DEFAULT_JA_PODCAST_PROMPT  # type: ignore[misc]
 
     def start(
         self,
@@ -284,14 +331,18 @@ class TranscriptionJobManager:
             #     The ladder is only entered for segments that fail
             #     compression-ratio/logprob thresholds, so steady-state
             #     throughput is unchanged.
-            # Tri-state prompt resolution (see start() docstring):
-            #   None  → default JA podcast prompt (cheap quality bump)
-            #   ""    → caller explicitly asked for raw decoding; honor it
-            #   "..." → caller-supplied prompt, use verbatim
-            if initial_prompt is None:
-                effective_prompt = self.DEFAULT_JA_PODCAST_PROMPT
-            else:
-                effective_prompt = initial_prompt  # may be ""
+            # Tri-state prompt resolution (see start() docstring), plus the
+            # editor-curated glossary (P0-H) when applicable. See
+            # ``resolve_prompt_and_hotwords`` for the exact rules — extracted
+            # into a pure function so it can be unit-tested without spinning
+            # up an ASR worker.
+            glossary_terms: list[str] = load_terms(self._work_dir / "glossary.txt")
+            effective_prompt, effective_hotwords, glossary_count = resolve_prompt_and_hotwords(
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                glossary_terms=glossary_terms,
+                default_prompt=self.DEFAULT_JA_PODCAST_PROMPT,
+            )
 
             cfg = ASRConfig(
                 model=model, language=language,
@@ -302,15 +353,18 @@ class TranscriptionJobManager:
                 # Use the dataclass default (full ladder) — explicit for clarity.
                 temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                 initial_prompt=effective_prompt,
-                hotwords=hotwords,
+                hotwords=effective_hotwords,
             )
             if initial_prompt is None:
-                prompt_tag = "default-prompt"
+                if glossary_count:
+                    prompt_tag = f"default-prompt+glossary({glossary_count})"
+                else:
+                    prompt_tag = "default-prompt"
             elif initial_prompt == "":
                 prompt_tag = "no-prompt"
             else:
                 prompt_tag = f"user-prompt ({len(initial_prompt)} chars)"
-            hw_tag = f", hw={len(hotwords)} chars" if hotwords else ""
+            hw_tag = f", hw={len(effective_hotwords)} chars" if effective_hotwords else ""
             self._append_log(job, f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag})")
             tx, gen = transcribe(info, asr_wav, cfg, model_handle=whisper_model)
 

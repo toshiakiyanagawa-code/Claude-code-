@@ -4239,6 +4239,84 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && $dictionaryModal && !$dictionaryModal.hidden) hideDictionaryModal();
   });
+
+  // ------- glossary modal (P0-H: proper-noun list for ASR prompt + hotwords) -------
+  const $btnGlossary = $('btn-glossary');
+  const $glossaryModal = $('glossary-modal');
+  const $btnGlossaryClose = $('btn-glossary-close');
+  const $glossaryTextarea = $('glossary-textarea');
+  const $glossaryStatus = $('glossary-status');
+  const $btnGlossarySave = $('btn-glossary-save');
+
+  function setGlossaryStatus(msg, isError) {
+    if (!$glossaryStatus) return;
+    $glossaryStatus.textContent = msg || '·';
+    $glossaryStatus.classList.toggle('error', !!isError);
+  }
+  async function loadGlossary() {
+    setGlossaryStatus('読み込み中…');
+    try {
+      const r = await fetch('/api/glossary');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const terms = data.terms || [];
+      $glossaryTextarea.value = terms.join('\n');
+      setGlossaryStatus(`${terms.length} 語`);
+    } catch (e) {
+      setGlossaryStatus(`読み込みに失敗: ${e.message}`, true);
+    }
+  }
+  async function saveGlossary() {
+    const lines = ($glossaryTextarea.value || '').split(/\r?\n/);
+    setGlossaryStatus('保存中…');
+    $btnGlossarySave.disabled = true;
+    try {
+      const r = await fetch('/api/glossary', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ terms: lines }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const data = await r.json();
+      const cleaned = data.terms || [];
+      $glossaryTextarea.value = cleaned.join('\n');
+      logKPI('ui.glossary.save', { terms: cleaned.length });
+      const dropped = lines.filter((l) => l.trim()).length - cleaned.length;
+      if (dropped > 0) {
+        setGlossaryStatus(`保存しました (${cleaned.length} 語、重複・長すぎなど ${dropped} 件は除外)`);
+      } else {
+        setGlossaryStatus(`保存しました (${cleaned.length} 語)`);
+      }
+    } catch (e) {
+      setGlossaryStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnGlossarySave.disabled = false;
+    }
+  }
+  function showGlossaryModal() {
+    if (!$glossaryModal) return;
+    $glossaryModal.hidden = false;
+    loadGlossary();
+    setTimeout(() => $glossaryTextarea && $glossaryTextarea.focus(), 50);
+    logKPI('ui.glossary.modal_open');
+  }
+  function hideGlossaryModal() {
+    if ($glossaryModal) $glossaryModal.hidden = true;
+  }
+  if ($btnGlossary) $btnGlossary.addEventListener('click', showGlossaryModal);
+  if ($btnGlossaryClose) $btnGlossaryClose.addEventListener('click', hideGlossaryModal);
+  if ($glossaryModal) {
+    $glossaryModal.addEventListener('click', (ev) => {
+      if (ev.target === $glossaryModal) hideGlossaryModal();
+    });
+  }
+  if ($btnGlossarySave) $btnGlossarySave.addEventListener('click', saveGlossary);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $glossaryModal && !$glossaryModal.hidden) hideGlossaryModal();
+  });
   if ($btnLibraryUpload && $libraryFileInput) {
     $btnLibraryUpload.addEventListener('click', () => {
       logKPI('ui.library.upload.button_clicked');

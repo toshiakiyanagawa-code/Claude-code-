@@ -262,6 +262,58 @@ def kpi_summary_cmd(kpi_jsonl: Path, audio_duration_sec: float | None) -> None:
     console.print(f"Summary written: {out_path}")
 
 
+@cli.command("dict-eval")
+@click.argument("transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--dictionary", "dictionary_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              required=True, help="Path to dictionary.json to apply")
+@click.option("--show", default=10, type=click.IntRange(min=0), help="Show up to N before/after samples")
+def dict_eval_cmd(transcript: Path, dictionary_path: Path, show: int) -> None:
+    """Apply a dictionary to an existing transcript and report replacement effect.
+
+    Lets editors test how many replacements a candidate dictionary would
+    make against a real ASR output, without re-running transcription.
+    Does NOT mutate the transcript file on disk.
+    """
+    from .asr_dictionary import apply_dictionary, load_dictionary
+
+    tx = json.loads(transcript.read_text(encoding="utf-8"))
+    dictionary = load_dictionary(dictionary_path)
+    if not dictionary.entries:
+        _fatal(f"Dictionary has no entries: {dictionary_path}")
+
+    new_tx, ops = apply_dictionary(tx, dictionary)
+    orig_words = sum(len(s.get("words") or []) for s in (tx.get("segments") or []))
+    new_words = sum(len(s.get("words") or []) for s in (new_tx.get("segments") or []))
+
+    by_entry: dict[str, int] = {}
+    for op in ops:
+        by_entry[op["entry_id"]] = by_entry.get(op["entry_id"], 0) + 1
+
+    console.print(f"Transcript : {transcript}")
+    console.print(f"Dictionary : {dictionary_path} ({len(dictionary.entries)} entries)")
+    console.print("")
+    console.print(f"Replacements    : {len(ops)}")
+    console.print(f"Words before    : {orig_words}")
+    console.print(f"Words after     : {new_words}")
+    console.print(f"Words collapsed : {orig_words - new_words}")
+    console.print("")
+    if not ops:
+        console.print("No matches — every entry in the dictionary is either disabled or unmatched.")
+        return
+
+    console.print("Replacements per entry:")
+    for entry_id, count in sorted(by_entry.items(), key=lambda kv: -kv[1]):
+        console.print(f"  {entry_id}: {count}")
+    console.print("")
+    console.print(f"Samples (up to {show}):")
+    for op in ops[:show]:
+        before = "".join(w.get("text", "") for w in op["before_words"])
+        after = "".join(w.get("text", "") for w in op["after_words"])
+        start = op.get("start")
+        loc = f"{start:.2f}s" if isinstance(start, (int, float)) else "?"
+        console.print(f"  [{loc}] {before!r} → {after!r}  ({op['note']})")
+
+
 @cli.command("transcribe")
 @click.argument("audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("-o", "--out", "out_path", type=click.Path(path_type=Path), default=None,

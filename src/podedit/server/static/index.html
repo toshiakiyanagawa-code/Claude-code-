@@ -36,6 +36,7 @@
   <button id="btn-audition" title="Render preview (sample-precise + crossfade + LUFS)">Audition</button>
   <button id="btn-snapshots" title="編集状態を名前付きで保存 / 過去の保存に戻す">スナップショット</button>
   <button id="btn-dictionary" title="ASRの誤認識を自動で置き換える辞書を編集">辞書</button>
+  <button id="btn-glossary" title="固有名詞リスト。次回以降の文字起こしのプロンプトに自動結合">固有名詞</button>
   <button id="btn-export" class="btn-primary" title="編集済みの音源をレンダリングしてダウンロード (E)">編集済み音源をダウンロード <kbd>E</kbd></button>
   <button id="btn-export-clip" disabled title="選択範囲だけを音源ファイルとしてダウンロード">選択範囲だけDL</button>
   <select id="export-format" title="Export format" aria-label="Export format">
@@ -172,6 +173,29 @@
         </thead>
         <tbody id="dictionary-tbody"></tbody>
       </table>
+    </div>
+  </div>
+</div>
+
+<!-- Glossary modal: editable proper-noun list fed into ASR's initial_prompt + hotwords. -->
+<div id="glossary-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="glossary-title">
+    <div class="modal-header">
+      <h2 id="glossary-title">固有名詞リスト</h2>
+      <button id="btn-glossary-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="glossary-hint">
+        1 行 1 語。次回以降の文字起こし時に Whisper のプロンプトと hotwords に
+        自動結合され、「クロード」「Anthropic」のような案件特有の語の誤認識を
+        予防します。先頭から約 1000 文字までが使われます。
+      </div>
+      <textarea id="glossary-textarea" rows="14" placeholder="例:&#10;クロード&#10;Anthropic&#10;認知バイアス" aria-label="固有名詞リスト"></textarea>
+      <div class="glossary-actions-row">
+        <span id="glossary-status" class="save-idle">·</span>
+        <span class="spacer"></span>
+        <button id="btn-glossary-save" class="btn-primary" type="button">保存</button>
+      </div>
     </div>
   </div>
 </div>

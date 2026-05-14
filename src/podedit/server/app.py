@@ -57,6 +57,7 @@ from ..asr_dictionary import (
     save_dictionary,
 )
 from ..audio import probe as audio_probe
+from ..glossary import GLOSSARY_VERSION, MAX_TERM_LEN, load_terms, save_terms
 from ..edit import EditSession, TimelineSegment, compile_timeline, sha256_of_file
 from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
@@ -2048,6 +2049,54 @@ def create_app(config: ServeConfig) -> FastAPI:
             "entries": len(entries),
         })
         return JSONResponse(_dict_to_payload(d), headers={"Cache-Control": "no-store"})
+
+    # ----- P0-H: glossary management -----
+    # Plain-text glossary at <work_dir>/glossary.txt (1 term per line). The
+    # transcribe worker auto-appends these to the default JA prompt and feeds
+    # them as hotwords when the caller didn't supply its own. Editing API is
+    # JSON-shaped for UI convenience.
+
+    def _glossary_path() -> Path:
+        return state.work_dir / "glossary.txt"
+
+    @app.get("/api/glossary")
+    def get_glossary() -> JSONResponse:
+        terms = load_terms(_glossary_path())
+        return JSONResponse(
+            {"version": GLOSSARY_VERSION, "terms": terms},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.put("/api/glossary")
+    def put_glossary(body: dict) -> JSONResponse:
+        body = body or {}
+        version = body.get("version")
+        if version is not None and version != GLOSSARY_VERSION:
+            raise HTTPException(status_code=400, detail=f"unsupported version {version!r}")
+        raw_terms = body.get("terms")
+        if not isinstance(raw_terms, list):
+            raise HTTPException(status_code=400, detail="terms must be a list")
+        if len(raw_terms) > 2000:
+            raise HTTPException(status_code=400, detail="too many terms (max 2000)")
+        for i, t in enumerate(raw_terms):
+            if not isinstance(t, str):
+                raise HTTPException(status_code=400, detail=f"term {i}: must be a string")
+            if "\n" in t or "\r" in t:
+                # 1 line = 1 term on disk; embedded newlines would silently
+                # split into multiple terms on the next GET. Reject explicitly.
+                raise HTTPException(status_code=400, detail=f"term {i}: must not contain newlines")
+            if len(t) > MAX_TERM_LEN * 4:  # raw upper bound; clean step strips later
+                raise HTTPException(status_code=400, detail=f"term {i}: too long (max {MAX_TERM_LEN * 4})")
+        cleaned = save_terms(_glossary_path(), list(raw_terms))
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.glossary.saved",
+            "terms": len(cleaned),
+        })
+        return JSONResponse(
+            {"version": GLOSSARY_VERSION, "terms": cleaned},
+            headers={"Cache-Control": "no-store"},
+        )
 
     app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app

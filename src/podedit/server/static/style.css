@@ -513,3 +513,17 @@ main {
 .dictionary-table .row-empty {
   color: var(--muted); text-align: center; padding: 18px 0;
 }
+
+/* Glossary modal (P0-H): single textarea, comma-/newline-separated terms. */
+.glossary-hint { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+#glossary-textarea {
+  width: 100%; box-sizing: border-box; min-height: 240px;
+  background: var(--panel); color: inherit;
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px 10px; font-family: inherit; font-size: 13px; line-height: 1.5;
+  resize: vertical;
+}
+.glossary-actions-row {
+  display: flex; align-items: center; gap: 8px; margin-top: 10px;
+}
+.glossary-actions-row .spacer { flex: 1; }
