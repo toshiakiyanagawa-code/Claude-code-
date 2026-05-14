@@ -746,21 +746,61 @@ def create_app(config: ServeConfig) -> FastAPI:
         if lufs_target is not None:
             lufs_target = float(lufs_target)
         true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
+        # Optional: render a specific saved snapshot instead of the live session.
+        # Lets the UI add a per-row "音源DL" button without forcing the user
+        # through restore→Export→re-restore. Same cache_key derivation as the
+        # live path, so two callers that pass the same ops still hit the cache.
+        snapshot_id_raw = opts.get("snapshot_id")
+        snapshot_session: EditSession | None = None
+        if snapshot_id_raw is not None:
+            if not isinstance(snapshot_id_raw, str) or not SNAPSHOT_ID_RE.match(snapshot_id_raw):
+                raise HTTPException(status_code=400, detail=f"invalid snapshot id: {snapshot_id_raw!r}")
+            snap_path = _snapshot_path(snapshot_id_raw)
+            with state.snapshots_lock:
+                if not snap_path.exists():
+                    raise HTTPException(status_code=404, detail="snapshot not found")
+                payload = _load_snapshot_payload(snap_path)
+            session_dict = payload.get("session")
+            if not isinstance(session_dict, dict):
+                raise HTTPException(status_code=400, detail="snapshot missing session payload")
+            try:
+                snapshot_session = EditSession.from_dict(session_dict)
+            except (KeyError, ValueError) as e:
+                raise HTTPException(status_code=400, detail=f"invalid session in snapshot: {e}") from e
 
         # Snapshot every piece of active state the render depends on inside one
         # lock acquisition. If library/select races in mid-render, the render
         # still writes to the snapshot's preview path, references the snapshot's
         # audio file, and logs the snapshot's KPI path — never a mix.
         with state.session_lock:
-            assert state.session is not None
             assert state.audio_path is not None
-            ops_for_render = list(state.session.ops)
-            ops_blob = state.session.to_dict().get("ops", [])
-            source_duration = state.session.source_audio.duration_sec
             snap_audio_path = state.audio_path
             snap_work_dir = state.work_dir
             snap_kpi_log = state.kpi_log_path
             snap_audio_stem = state.audio_path.stem
+            if snapshot_session is not None:
+                # Sha guard: snapshot from a different audio file would silently
+                # align ops to the wrong timeline (same as /restore).
+                expected_src = (state.transcript_data or {}).get("source_audio") or {}
+                expected_sha = expected_src.get("sha256")
+                actual_sha = snapshot_session.source_audio.sha256
+                if not expected_sha or not actual_sha:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="cannot verify snapshot source_audio sha256 (missing on either snapshot or served audio)",
+                    )
+                if expected_sha != actual_sha:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"snapshot source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
+                    )
+                source_session = snapshot_session
+            else:
+                assert state.session is not None
+                source_session = state.session
+            ops_for_render = list(source_session.ops)
+            ops_blob = source_session.to_dict().get("ops", [])
+            source_duration = source_session.source_audio.duration_sec
 
         # Cache key covers every parameter that can change the bytes on disk.
         # Including RENDERER_VERSION means a code change automatically

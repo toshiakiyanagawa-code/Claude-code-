@@ -3343,6 +3343,11 @@
         btnLoad.textContent = '読み込み';
         btnLoad.title = 'この編集状態を現在の編集に上書きする';
         btnLoad.addEventListener('click', () => restoreSnapshot(s.id, s.name));
+        const btnDownload = document.createElement('button');
+        btnDownload.type = 'button';
+        btnDownload.textContent = '音源DL';
+        btnDownload.title = 'このスナップショットの編集を音源ファイルとしてダウンロード';
+        btnDownload.addEventListener('click', () => downloadSnapshotAudio(s.id, s.name, btnDownload));
         const btnRename = document.createElement('button');
         btnRename.type = 'button';
         btnRename.textContent = '名前変更';
@@ -3352,7 +3357,7 @@
         btnDelete.className = 'danger';
         btnDelete.textContent = '削除';
         btnDelete.addEventListener('click', () => deleteSnapshot(s.id, s.name));
-        li.append(name, meta, btnLoad, btnRename, btnDelete);
+        li.append(name, meta, btnLoad, btnDownload, btnRename, btnDelete);
         $snapshotsList.appendChild(li);
       }
     } catch (e) {
@@ -3433,6 +3438,57 @@
       await refreshSnapshotsList();
     } catch (e) {
       setSnapshotsStatus(`名前変更に失敗: ${e.message}`, true);
+    }
+  }
+  async function downloadSnapshotAudio(id, name, btnEl) {
+    // Same flow as the live Export button, but with snapshot_id in the
+    // preview/render body — the server hashes the snapshot's ops into the
+    // cache_key so two callers asking for the same draft share the cache.
+    // We pick fmt from the toolbar's existing export-format select so the
+    // editor doesn't have to choose twice.
+    const fmt = $exportFormat.value === 'wav' ? 'wav' : 'mp3';
+    const prevLabel = btnEl ? btnEl.textContent : null;
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = fmt === 'mp3' ? 'render+mp3…' : 'render…'; }
+    try {
+      const r = await fetch('/api/preview/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshot_id: id }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const reply = await r.json();
+      const cacheKey = reply.cache_key;
+      if (btnEl) btnEl.textContent = fmt === 'mp3' ? 'transcoding…' : 'downloading…';
+      const url = `/api/export/${encodeURIComponent(cacheKey)}?fmt=${encodeURIComponent(fmt)}`;
+      const head = await fetch(url, { method: 'HEAD' });
+      if (!head.ok) {
+        let detail = `HTTP ${head.status}`;
+        try {
+          const probe = await fetch(url);
+          const txt = await probe.text();
+          detail = `${head.status}: ${txt.slice(0, 200)}`;
+        } catch (_) { /* ignore */ }
+        throw new Error(`export ${detail}`);
+      }
+      const a = document.createElement('a');
+      a.href = url;
+      a.rel = 'noopener';
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      logKPI('ui.snapshot.download', { id, name, fmt, cache_key: cacheKey, render_cached: reply.cached });
+      // Clear any stale error from a prior attempt so the user gets feedback
+      // that this run succeeded. Status falls back to the row count.
+      setSnapshotsStatus('ダウンロードを開始しました。');
+    } catch (e) {
+      setSnapshotsStatus(`「${name}」のダウンロードに失敗: ${e.message}`, true);
+      logKPI('ui.snapshot.download_error', { id, error: e.message });
+    } finally {
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = prevLabel || '音源DL'; }
     }
   }
   async function deleteSnapshot(id, name) {
