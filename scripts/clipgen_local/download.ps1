@@ -1,4 +1,4 @@
-# clipgen Windows fetcher
+﻿# clipgen Windows fetcher
 # C:\clipgen\queue\urls.txt の URL を yt-dlp で取得し OneDrive にアップロード
 $ErrorActionPreference = "Continue"
 $Root = "C:\clipgen"
