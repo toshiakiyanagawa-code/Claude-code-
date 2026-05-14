@@ -764,22 +764,45 @@
     }
   }
 
+  // Track the previous plain click so a second click on the same word
+  // within DOUBLE_CLICK_MS becomes a "double-click = play" gesture.
+  // Single click only seeks + selects; the user explicitly asked for
+  // playback to require a deliberate double-click.
+  let lastPlainClickIdx = -1;
+  let lastPlainClickAt = 0;
+  const DOUBLE_CLICK_MS = 400;
+
   function handlePlainWordClick(startIdx) {
     if (state.clipboard) {
       setPasteAnchor(startIdx);
       clearSelection();
+      // Reset double-click tracking so a later normal click on the same
+      // word doesn't see the paste-anchor click as the first half of a
+      // double-click and unexpectedly start playback.
+      lastPlainClickIdx = -1;
+      lastPlainClickAt = 0;
       logKPI('ui.paste.anchor', { word_idx: startIdx, t: words[startIdx].start });
       return;
     }
-    // Plain click: seek + play. Selection collapses to this one word so D
-    // can still delete a single word if the user wants.
+    const now = performance.now();
+    const isDouble = lastPlainClickIdx === startIdx && (now - lastPlainClickAt) < DOUBLE_CLICK_MS;
+    lastPlainClickIdx = startIdx;
+    lastPlainClickAt = now;
+    // Selection collapses to this one word so <kbd>D</kbd> can still
+    // delete a single word if the user wants.
     state.selection = { anchor: startIdx, extent: startIdx };
     renderSelection();
     const w = words[startIdx];
     $player.currentTime = w.start;
-    const p = $player.play();
-    if (p && typeof p.catch === 'function') p.catch(() => {});
-    logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+    if (isDouble) {
+      const p = $player.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      logKPI('ui.dblclick.word', { word_idx: startIdx, t: w.start });
+    } else {
+      // Single click: seek (so the player UI shows where the user is)
+      // but do NOT start playback. Double-click within 400ms plays.
+      logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+    }
   }
 
   function finishSelectionDrag() {
