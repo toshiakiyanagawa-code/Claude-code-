@@ -24,7 +24,7 @@
 
 <div class="toolbar">
   <button id="btn-open" title="別の音声ファイルに切り替え (O)">音声を開く <kbd>O</kbd></button>
-  <button id="btn-add-fillers" disabled title="推奨フィラー候補を削除候補に追加">フィラー削除 <span id="filler-count">0</span></button>
+  <button id="btn-add-fillers" disabled title="推奨フィラー候補を一覧で確認してから削除する">フィラー削除レビュー <span id="filler-count">0</span></button>
   <button id="btn-delete" disabled title="選択範囲を削除 (D)。広い範囲は Shift+クリックで指定">Delete <kbd>D</kbd></button>
   <span class="hint-pill" title="始点をクリック → 終点を Shift+クリックすると 2分以上の範囲も選べる">Shift+クリックで広範囲選択</span>
   <button id="btn-undo" disabled title="Undo (⌘Z)">Undo <kbd>⌘Z</kbd></button>
@@ -86,6 +86,30 @@
         スキャン元: <code id="library-dir-hint">—</code> / 現在のパス:
         <code id="library-current-path">—</code>。各行の「文字起こし」ボタンは上のプリセットを使用します。
         CLI <code>podedit transcribe</code> でも文字起こしを生成でき、このピッカーに表示されます。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Filler review modal: per-candidate approve/reject before applying. -->
+<div id="fillers-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="fillers-title">
+    <div class="modal-header">
+      <h2 id="fillers-title">フィラー削除レビュー</h2>
+      <button id="btn-fillers-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="fillers-actions-row">
+        <button id="btn-fillers-select-all" type="button">全選択</button>
+        <button id="btn-fillers-clear" type="button">全解除</button>
+        <span class="fillers-selected-count" id="fillers-selected-count">0 件選択中</span>
+        <span class="spacer"></span>
+        <button id="btn-fillers-apply" class="btn-primary" type="button" disabled>選択を削除</button>
+      </div>
+      <div id="fillers-status" class="status">候補を読み込み中…</div>
+      <ul id="fillers-list" class="fillers-list"></ul>
+      <div class="library-hint">
+        チェックを入れた候補だけが削除されます。前後の文脈で本当に消していい音かを確認してください。
       </div>
     </div>
   </div>

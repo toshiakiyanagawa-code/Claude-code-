@@ -1780,19 +1780,215 @@
   }
 
   function addRecommendedFillers() {
-    const candidates = addableFillerAnnotations();
-    if (!candidates.length) return;
+    // Replaces the old "apply all at once" behaviour with a per-candidate
+    // review modal. Editors specifically asked to see what would be cut
+    // before committing — auto-deleting 30+ ranges blind is too scary.
+    showFillersReviewModal();
+  }
+  function applySelectedFillerAnnotations(annIds) {
+    // Re-derive addableFillerAnnotations() so ops applied while the modal
+    // was open are naturally excluded; intersect with the user's checked set.
+    const want = new Set(annIds);
+    const candidates = addableFillerAnnotations().filter((a) => want.has(a.id));
+    if (!candidates.length) return 0;
     const ranges = candidates.map((ann) => ({
       start: ann.start,
       end: ann.end,
       note: `filler:${ann.id}`,
     }));
-    const added = applyDeleteRanges(ranges, 'annotation.filler');
+    const added = applyDeleteRanges(ranges, 'annotation.filler.reviewed');
     if (added > 0) {
       clearSelection();
-      logKPI('ui.annotation.fillers.added', { count: added });
+      logKPI('ui.annotation.fillers.added', { count: added, source: 'review' });
     }
+    return added;
   }
+
+  // ------- filler review modal -------
+  const $fillersModal = $('fillers-modal');
+  const $btnFillersClose = $('btn-fillers-close');
+  const $fillersList = $('fillers-list');
+  const $fillersStatus = $('fillers-status');
+  const $fillersSelectedCount = $('fillers-selected-count');
+  const $btnFillersApply = $('btn-fillers-apply');
+  const $btnFillersSelectAll = $('btn-fillers-select-all');
+  const $btnFillersClear = $('btn-fillers-clear');
+  let fillersReturnFocus = null;
+  let fillersApplyInFlight = false;
+
+  function fillerContextText(ann, before = 4, after = 4) {
+    // Build the "…前 [対象] 後…" snippet by walking the word list around
+    // the annotation's first/last word. Full bounds check on word.idx
+    // (integer in [0, words.length)) so we never index out of range.
+    const ids = Array.isArray(ann.word_ids) ? ann.word_ids : [];
+    let firstIdx = -1, lastIdx = -1;
+    for (const rawId of ids) {
+      const w = wordById.get(String(rawId));
+      if (w && Number.isInteger(w.idx) && w.idx >= 0 && w.idx < words.length) {
+        if (firstIdx < 0 || w.idx < firstIdx) firstIdx = w.idx;
+        if (lastIdx < 0 || w.idx > lastIdx) lastIdx = w.idx;
+      }
+    }
+    if (firstIdx < 0) {
+      // time-based fallback: strict overlap (not touching) so we don't pick
+      // up the neighbour word just because its boundary happens to align.
+      for (let i = 0; i < words.length; i++) {
+        if (words[i].end > ann.start + 1e-6 && words[i].start < ann.end - 1e-6) {
+          if (firstIdx < 0) firstIdx = i;
+          lastIdx = i;
+        }
+      }
+    }
+    if (firstIdx < 0) return { before: '', target: '(該当語が見つかりません)', after: '' };
+    const lo = Math.max(0, firstIdx - before);
+    const hi = Math.min(words.length - 1, lastIdx + after);
+    let beforeStr = '';
+    for (let i = lo; i < firstIdx; i++) beforeStr += (words[i].el?.textContent || '');
+    let targetStr = '';
+    for (let i = firstIdx; i <= lastIdx; i++) targetStr += (words[i].el?.textContent || '');
+    let afterStr = '';
+    for (let i = lastIdx + 1; i <= hi; i++) afterStr += (words[i].el?.textContent || '');
+    return { before: beforeStr.trim(), target: targetStr.trim(), after: afterStr.trim() };
+  }
+
+  function refreshFillersSelectedCount() {
+    const checked = $fillersList.querySelectorAll('input[type="checkbox"]:checked').length;
+    $fillersSelectedCount.textContent = `${checked} 件選択中`;
+    $btnFillersApply.disabled = fillersApplyInFlight || checked === 0;
+  }
+
+  function renderFillersList() {
+    // DocumentFragment so 30+ rows don't trigger 30+ layout passes.
+    $fillersList.innerHTML = '';
+    const candidates = addableFillerAnnotations();
+    if (candidates.length === 0) {
+      $fillersStatus.textContent = '推奨フィラー候補はありません。';
+      $btnFillersApply.disabled = true;
+      $fillersSelectedCount.textContent = '0 件選択中';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    const seenIds = new Set();
+    let renderedCount = 0;
+    for (const ann of candidates) {
+      // Defence in depth: if two annotations share an id, skip the duplicate
+      // so a single checkbox toggle can never apply two ranges.
+      if (!ann.id || seenIds.has(ann.id)) continue;
+      seenIds.add(ann.id);
+      renderedCount += 1;
+      const li = document.createElement('li');
+      const label = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;  // default-on: matches the old "apply all" behaviour
+      cb.dataset.annId = ann.id;
+      cb.addEventListener('change', refreshFillersSelectedCount);
+      const time = document.createElement('span');
+      time.className = 'filler-time';
+      time.textContent = fmt(ann.start);
+      const ctx = fillerContextText(ann);
+      const text = document.createElement('span');
+      text.className = 'filler-text';
+      const beforeSpan = document.createElement('span');
+      beforeSpan.className = 'filler-context';
+      beforeSpan.textContent = ctx.before ? `…${ctx.before} ` : '';
+      const targetSpan = document.createElement('span');
+      targetSpan.className = 'filler-target';
+      targetSpan.textContent = ctx.target;
+      const afterSpan = document.createElement('span');
+      afterSpan.className = 'filler-context';
+      afterSpan.textContent = ctx.after ? ` ${ctx.after}…` : '';
+      text.append(beforeSpan, targetSpan, afterSpan);
+      const conf = document.createElement('span');
+      conf.className = 'filler-conf';
+      conf.textContent = `${Math.round((ann.confidence || 0) * 100)}%`;
+      label.append(cb, time, text, conf);
+      const btnPreview = document.createElement('button');
+      btnPreview.type = 'button';
+      btnPreview.className = 'preview';
+      btnPreview.textContent = '聞く';
+      btnPreview.title = 'この候補の開始位置を再生';
+      btnPreview.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        $player.currentTime = ann.start;
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+        logKPI('ui.annotation.fillers.preview', { id: ann.id, t: ann.start });
+      });
+      li.append(label, btnPreview);
+      frag.appendChild(li);
+    }
+    $fillersList.appendChild(frag);
+    // Report what we actually rendered (post-dedup), not raw candidates.
+    if (renderedCount === 0) {
+      $fillersStatus.textContent = '推奨フィラー候補はありません。';
+      $btnFillersApply.disabled = true;
+      $fillersSelectedCount.textContent = '0 件選択中';
+      return;
+    }
+    $fillersStatus.textContent = `${renderedCount} 件の候補`;
+    refreshFillersSelectedCount();
+  }
+
+  function showFillersReviewModal() {
+    if (!$fillersModal) return;
+    fillersReturnFocus = document.activeElement;
+    $fillersModal.hidden = false;
+    fillersApplyInFlight = false;
+    renderFillersList();
+    setTimeout(() => $btnFillersClose && $btnFillersClose.focus(), 50);
+    logKPI('ui.annotation.fillers.review_open');
+  }
+  function hideFillersReviewModal() {
+    if ($fillersModal) $fillersModal.hidden = true;
+    if (fillersReturnFocus && typeof fillersReturnFocus.focus === 'function') {
+      try { fillersReturnFocus.focus(); } catch (_) {}
+    }
+    fillersReturnFocus = null;
+  }
+  if ($btnFillersClose) $btnFillersClose.addEventListener('click', hideFillersReviewModal);
+  if ($fillersModal) {
+    $fillersModal.addEventListener('click', (ev) => {
+      if (ev.target === $fillersModal) hideFillersReviewModal();
+    });
+  }
+  if ($btnFillersSelectAll) {
+    $btnFillersSelectAll.addEventListener('click', () => {
+      $fillersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
+      refreshFillersSelectedCount();
+    });
+  }
+  if ($btnFillersClear) {
+    $btnFillersClear.addEventListener('click', () => {
+      $fillersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+      refreshFillersSelectedCount();
+    });
+  }
+  if ($btnFillersApply) {
+    $btnFillersApply.addEventListener('click', () => {
+      if (fillersApplyInFlight) return;
+      const ids = Array.from($fillersList.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((cb) => cb.dataset.annId)
+        .filter(Boolean);
+      if (ids.length === 0) return;
+      fillersApplyInFlight = true;
+      $btnFillersApply.disabled = true;
+      try {
+        const added = applySelectedFillerAnnotations(ids);
+        hideFillersReviewModal();
+        if (added === 0) {
+          setModePill('error', 'no fillers applied');
+          setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+            state.previewMode ? 'preview' : 'source'), 1500);
+        }
+      } finally {
+        fillersApplyInFlight = false;
+      }
+    });
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $fillersModal && !$fillersModal.hidden) hideFillersReviewModal();
+  });
 
   function refreshButtons() {
     $btnUndo.disabled = !state.hasActive || state.undoStack.length === 0;
