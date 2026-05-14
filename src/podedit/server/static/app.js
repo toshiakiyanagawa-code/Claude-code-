@@ -3458,9 +3458,18 @@
   // win over tiny while still finishing a 30-min file in well under
   // 30 min on a 2-vCPU Codespace.
   const TRANSCRIBE_PRESETS = {
-    fast:     { model: 'tiny',  beam_size: 1, label: 'tiny · greedy' },
-    balanced: { model: 'small', beam_size: 1, label: 'small · greedy' },
-    quality:  { model: 'small', beam_size: 5, label: 'small · beam=5' },
+    fast:     { model: 'tiny',  beam_size: 1, batched: false,
+                label: 'tiny · greedy' },
+    balanced: { model: 'small', beam_size: 1, batched: false,
+                label: 'small · greedy' },
+    quality:  { model: 'small', beam_size: 5, batched: false,
+                label: 'small · beam=5' },
+    // P1 speedup (experimental): route through faster-whisper's
+    // BatchedInferencePipeline. VAD slices the audio and decodes in parallel
+    // inside CT2, so beam=5 quality is kept while wall time drops on long
+    // podcasts with natural silences. Cross-segment conditioning is lost.
+    quality_batched: { model: 'small', beam_size: 5, batched: true, batch_size: 4,
+                       label: 'small · beam=5 · batched' },
   };
   const TRANSCRIBE_PRESET_KEY = 'podedit.transcribePreset';
   const $transcribePreset = $('transcribe-preset');
@@ -3500,6 +3509,10 @@
         // default for this MVP's target content. Custom prompts can be
         // added via a future settings UI.
       };
+      if (preset.batched) {
+        payload.batched = true;
+        payload.batch_size = preset.batch_size || 4;
+      }
       if (path) payload.path = path;
       else payload.name = name;
       const r = await fetch('/api/library/transcribe', {

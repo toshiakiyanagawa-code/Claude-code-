@@ -188,6 +188,8 @@ class TranscriptionJobManager:
         beam_size: int = 1,
         initial_prompt: str | None = None,
         hotwords: str | None = None,
+        batched: bool = False,
+        batch_size: int = 4,
     ) -> dict:
         """Start a new transcription job. Raises RuntimeError if one is in flight.
 
@@ -233,7 +235,7 @@ class TranscriptionJobManager:
         # Spawn worker outside the lock so the start() call returns fast.
         t = threading.Thread(
             target=self._run_job,
-            args=(job, audio_path, transcript_path, model, language, beam_size, prompt, hw),
+            args=(job, audio_path, transcript_path, model, language, beam_size, prompt, hw, batched, batch_size),
             daemon=True,
             name=f"podedit-transcribe-{job.job_id}",
         )
@@ -253,25 +255,36 @@ class TranscriptionJobManager:
         with self._lock:
             job.log.append(line)
 
-    def _get_or_load_model(self, model: str, compute_type: str):
-        """Return a cached WhisperModel for (model, compute_type), loading on miss.
+    def _get_or_load_model(self, model: str, compute_type: str, cpu_threads: int, num_workers: int):
+        """Return a cached WhisperModel for (model, compute_type, threads, workers), loading on miss.
 
         On a cache miss, we drop the previously-cached handle *before* loading
         the new one — otherwise both would briefly be resident, which matters
         on RAM-constrained boxes when stepping from small to large-v3.
-        """
-        from faster_whisper import WhisperModel
 
-        key = (model, compute_type)
+        Cache key includes ``cpu_threads`` / ``num_workers`` because changing
+        either requires a new WhisperModel instance — CTranslate2 fixes those
+        at construction time.
+        """
+        key = (model, compute_type, cpu_threads, num_workers)
         with self._lock:
             if self._cached_model_key == key and self._cached_model is not None:
-                return self._cached_model, True  # cache hit
+                return self._cached_model, True  # cache hit (no import needed)
             # Evict before loading so peak memory is one model, not two.
             self._cached_model = None
             self._cached_model_key = None
+        # Import faster_whisper only when we actually need to load (deferred
+        # so a cache hit doesn't pay any import cost in tests/CI).
+        from faster_whisper import WhisperModel
         # Load outside the lock — model construction does disk I/O and weight
         # quantization that can take seconds.
-        instance = WhisperModel(model, device="cpu", compute_type=compute_type)
+        instance = WhisperModel(
+            model,
+            device="cpu",
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            num_workers=num_workers,
+        )
         with self._lock:
             self._cached_model = instance
             self._cached_model_key = key
@@ -287,6 +300,8 @@ class TranscriptionJobManager:
         beam_size: int,
         initial_prompt: str | None,
         hotwords: str | None,
+        batched: bool = False,
+        batch_size: int = 4,
     ) -> None:
         try:
             self._set(job, status="running", started_at=time.time())
@@ -312,12 +327,23 @@ class TranscriptionJobManager:
             # load cost only on a miss. The asr.transcribe() function accepts
             # an existing handle via model_handle=... so we don't reinstantiate.
             compute_type = "int8"  # CPU-only on the in-UI worker by design
+            # P1 speedup: explicit cpu_threads/num_workers for reproducibility.
+            # Cap at 2 — the P1 target is a 2-vCPU Codespace; on a beefier
+            # local machine a future config flag can raise this. num_workers=1
+            # keeps the worker simple — multiple workers would just thrash
+            # the same physical cores.
+            cpu_threads = min(os.cpu_count() or 2, 2)
+            num_workers = 1
             t0 = time.time()
-            whisper_model, cache_hit = self._get_or_load_model(model, compute_type)
+            whisper_model, cache_hit = self._get_or_load_model(
+                model, compute_type, cpu_threads, num_workers,
+            )
             load_ms = (time.time() - t0) * 1000
             self._append_log(
                 job,
-                f"model {'cached' if cache_hit else 'loaded'} ({model}/{compute_type}) in {load_ms:.0f}ms",
+                f"model {'cached' if cache_hit else 'loaded'} "
+                f"({model}/{compute_type}/cpu_threads={cpu_threads}/"
+                f"num_workers={num_workers}) in {load_ms:.0f}ms",
             )
 
             # Fast-mode opt-in for the in-UI worker. The CLI keeps the
@@ -354,6 +380,10 @@ class TranscriptionJobManager:
                 temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                 initial_prompt=effective_prompt,
                 hotwords=effective_hotwords,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+                batched=batched,
+                batch_size=batch_size,
             )
             if initial_prompt is None:
                 if glossary_count:
@@ -365,7 +395,15 @@ class TranscriptionJobManager:
             else:
                 prompt_tag = f"user-prompt ({len(initial_prompt)} chars)"
             hw_tag = f", hw={len(effective_hotwords)} chars" if effective_hotwords else ""
-            self._append_log(job, f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag})")
+            batch_tag = (
+                f", batched(bs={batch_size}, temp-fallback=off, cond=False)"
+                if batched
+                else ""
+            )
+            self._append_log(
+                job,
+                f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag}{batch_tag})",
+            )
             tx, gen = transcribe(info, asr_wav, cfg, model_handle=whisper_model)
 
             for seg in gen:

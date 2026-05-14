@@ -1913,6 +1913,19 @@ def create_app(config: ServeConfig) -> FastAPI:
         if len(raw_hotwords) > 2000:
             raise HTTPException(status_code=400, detail="hotwords too long (max 2000 chars)")
         hotwords = raw_hotwords or None
+        # P1 speedup: optional BatchedInferencePipeline path. ``batched`` is a
+        # bool flag; ``batch_size`` is bounded 1..8 (codex recommends 2..4 on
+        # a 2-CPU box). Default ``batched=False`` preserves prior behavior.
+        raw_batched = body.get("batched", False)
+        if not isinstance(raw_batched, bool):
+            raise HTTPException(status_code=400, detail="batched must be a bool")
+        batched = raw_batched
+        raw_batch_size = body.get("batch_size", 4)
+        if not isinstance(raw_batch_size, int) or isinstance(raw_batch_size, bool):
+            raise HTTPException(status_code=400, detail="batch_size must be an int")
+        if raw_batch_size < 1 or raw_batch_size > 8:
+            raise HTTPException(status_code=400, detail="batch_size must be in [1, 8]")
+        batch_size = raw_batch_size
         candidate_audio, label = _audio_from_library_request(body, require_string_name=("path" not in body))
         name = candidate_audio.name
         transcript_path = state.work_dir / f"{candidate_audio.stem}.transcript.json"
@@ -1930,6 +1943,8 @@ def create_app(config: ServeConfig) -> FastAPI:
                 beam_size=beam_size,
                 initial_prompt=initial_prompt,
                 hotwords=hotwords,
+                batched=batched,
+                batch_size=batch_size,
             )
         except RuntimeError as e:
             # Another job is in flight.
@@ -1937,6 +1952,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.transcribe.started",
             "name": name, "model": model, "beam_size": beam_size,
+            "batched": batched, "batch_size": batch_size,
             # Length only (not the prompt body) — we don't want big prompts
             # spilling into kpi.jsonl on every job.
             # Length only (not the prompt body) so we don't leak custom prompt
