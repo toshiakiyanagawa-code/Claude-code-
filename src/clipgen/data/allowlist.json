@@ -182,6 +182,17 @@
       "permission_evidence": "本人公式チャンネル。第三者切り抜き許諾は概要欄等で都度確認。",
       "permission_scope": "official_speech",
       "notes": "断定的な事実主張は元発言準拠で扱う。動画ごとに概要欄の許諾範囲を確認。"
+    },
+    {
+      "channel_id": "UCpdtHm6VFP_Qc-IDIsyLh1A",
+      "handle": "@SenkyoCom",
+      "name": "選挙ドットコムちゃんねる",
+      "category": "youtube_native_allowed",
+      "source_url": "https://www.youtube.com/@SenkyoCom",
+      "permission_checked_at": "2026-05-14",
+      "permission_evidence": "Yutura で切り抜き OK 明記。",
+      "permission_scope": "official_speech",
+      "notes": "条件付き。"
     }
   ]
 }
