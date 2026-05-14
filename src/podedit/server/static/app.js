@@ -2052,14 +2052,22 @@
     $kpiCut.textContent = fmtMs(cut);
   }
 
+  // Session elapsed counter is intentionally only updated when the DOM
+  // element exists. The toolbar used to show it next to ops/cut, but the
+  // ticker pushed the toolbar width around every minute and the editor
+  // wanted it gone. KPI events still carry sessionStartedAt so a downstream
+  // analysis can recover the same number off-screen.
   function tickElapsed() {
+    if (!$kpiElapsed) return;
     const elapsed = Math.floor(Date.now() / 1000 - kpi.sessionStartedAt);
     const m = Math.floor(elapsed / 60);
     const s = elapsed % 60;
     $kpiElapsed.textContent = `${m}:${String(s).padStart(2, '0')}`;
   }
-  setInterval(tickElapsed, 1000);
-  tickElapsed();
+  if ($kpiElapsed) {
+    setInterval(tickElapsed, 1000);
+    tickElapsed();
+  }
 
   // ------- autosave -------
   function setSaveStatus(s) {
@@ -2176,7 +2184,11 @@
     // In preview mode the audio source IS the rendered file, so currentTime
     // is already in edited space; sourceToEdited would double-map.
     const edt = state.previewMode ? t : sourceToEdited(t);
-    $kpiTime.textContent = `${t.toFixed(2)}s`;
+    // Toolbar source-time readout used to shake the layout every frame (the
+    // 0.00s → 1278.72s digit-count change re-flowed neighbouring spans).
+    // The element no longer exists in the default layout, but the
+    // per-frame write stays null-safe for users who add it back via CSS.
+    if ($kpiTime) $kpiTime.textContent = `${t.toFixed(2)}s`;
 
     // Mirror the playhead into the edited timeline displays — unless the user
     // is actively dragging the scrubber, in which case they own those values.
