@@ -7,6 +7,8 @@
   const $meta = $('audio-meta');
   const $tx = $('transcript');
   const $btnDelete = $('btn-delete');
+  const $btnFollowPlayhead = $('btn-follow-playhead');
+  const $followState = $('follow-state');
   const $btnUndo = $('btn-undo');
   const $btnRedo = $('btn-redo');
   const $btnClear = $('btn-clear-sel');
@@ -465,6 +467,27 @@
   const wordById = new Map();
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
   let activeIdx = -1;  // current word highlight; must exist before initial load/rerender
+
+  // Auto-follow the playhead with the transcript scroll position. Default OFF
+  // so the editor can scroll to a distant part of the audio (e.g. 5:00) while
+  // the player keeps playing somewhere else (e.g. 0:30) without the screen
+  // snapping back. Persisted across page loads so the user only sets it once.
+  const FOLLOW_PLAYHEAD_LS_KEY = 'podedit.followPlayhead';
+  let followPlayhead = false;
+  try { followPlayhead = localStorage.getItem(FOLLOW_PLAYHEAD_LS_KEY) === 'true'; } catch (_) {}
+  function setFollowPlayhead(next, opts) {
+    followPlayhead = !!next;
+    try { localStorage.setItem(FOLLOW_PLAYHEAD_LS_KEY, followPlayhead ? 'true' : 'false'); } catch (_) {}
+    if ($btnFollowPlayhead) $btnFollowPlayhead.dataset.active = followPlayhead ? 'true' : 'false';
+    if ($followState) $followState.textContent = followPlayhead ? 'ON' : 'OFF';
+    // Suppress the KPI event during boot-time restore — otherwise every
+    // page load would synthesise a spurious "user toggled" event.
+    if (!opts || !opts.silent) logKPI('ui.follow_playhead.toggle', { enabled: followPlayhead });
+  }
+  setFollowPlayhead(followPlayhead, { silent: true });
+  if ($btnFollowPlayhead) {
+    $btnFollowPlayhead.addEventListener('click', () => setFollowPlayhead(!followPlayhead));
+  }
 
   // Diagnostic logging: if seeks are silently ignored, we still see seeking/
   // seeked/error events in the KPI log. Wired once at boot so a SPA-style
@@ -1979,7 +2002,10 @@
       if (activeIdx >= 0) words[activeIdx].el.classList.remove('active');
       if (idx >= 0) {
         words[idx].el.classList.add('active');
-        scrollIfOffscreen(words[idx].el);
+        // Only follow the playhead when the user explicitly opted in. Default
+        // OFF lets them edit a distant part of the audio without the screen
+        // snapping back every time the active word changes.
+        if (followPlayhead) scrollIfOffscreen(words[idx].el);
       }
       activeIdx = idx;
     }

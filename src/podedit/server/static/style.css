@@ -382,6 +382,10 @@ main {
   font-size: 11px; background: #1f2a36; color: #9fc4ff;
   cursor: help;
 }
+.toolbar-toggle[data-active="true"] {
+  background: #2b4663; color: white; border-color: #4a7ab8;
+}
+.toolbar-toggle[data-active="true"] #follow-state { color: #b9d8ff; }
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }
