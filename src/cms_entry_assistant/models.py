@@ -132,6 +132,7 @@ class IstockSearchSuggestion:
     query_en: str = ""
     search_url_ja: str = ""
     search_url_en: str = ""
+    query_plan: list[str] = field(default_factory=list)
     rationale: str = ""
     picked_asset_id: str = ""
     note: str = ""

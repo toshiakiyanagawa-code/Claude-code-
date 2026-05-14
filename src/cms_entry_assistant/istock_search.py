@@ -403,6 +403,112 @@ def _generic_keywords(text: str) -> list[str]:
     return seen
 
 
+# 検索語から落とす固有名詞・企業名 (iStock で 0 件になりやすい)
+# press detection 自体は別経路 (PRESS_FIGURES / _press_title_match) で行うので、
+# 検索クエリには入れずに、写真化しやすい一般語へ寄せる。
+PRESS_QUERY_EXCLUDE_WORDS: set[str] = {
+    # 経済人・企業
+    "孫正義", "ソフトバンク", "ソフトバンクG", "ソフトバンクグループ",
+    "三木谷", "三木谷浩史", "楽天グループ", "柳井正", "ファーストリテイリング",
+    "堀江貴文", "ホリエモン", "田端信太郎", "元谷", "元谷外志雄", "元谷芙美子",
+    "アパグループ", "アパホテル", "ベゾス", "ジェフ・ベゾス",
+    "マスク", "イーロン・マスク", "イーロンマスク", "ザッカーバーグ",
+    "マーク・ザッカーバーグ", "ビル・ゲイツ", "ゲイツ",
+    "オープンAI", "OpenAI",
+    # 政治家・指導者
+    "習近平", "毛沢東", "鄧小平", "プーチン", "トランプ", "バイデン", "オバマ",
+    "ゼレンスキー", "ネタニヤフ", "金正恩", "金正日",
+    "岸田", "石破", "安倍", "高市", "麻生", "河野", "小泉", "野田",
+    "菅", "森", "中曽根", "田中角栄", "小池百合子", "吉村洋文", "橋下徹", "泉房穂",
+    # 著名人
+    "村上春樹", "オードリー", "和田秀樹", "昭和天皇",
+}
+
+
+# hero などで本文に「経営/業績/逆境」等の補助語があれば、写真化しやすい
+# 安全な代替クエリへ振る。
+STOCK_FALLBACK_QUERIES: list[tuple[str, str]] = [
+    ("企業", "会議 経営 戦略"),
+    ("経営", "経営 戦略 会議"),
+    ("会社", "会議 経営 戦略"),
+    ("業績", "業績 分析 資料"),
+    ("投資", "投資 判断 資料"),
+    ("逆境", "課題 解決 ビジネス"),
+    ("政治", "国旗 国会 ビジネス"),
+    ("外交", "国旗 会談 ビジネス"),
+    ("歴史", "資料 歴史 古い書類"),
+]
+
+
+def _stock_safe_query_words(
+    words: list[str],
+    *,
+    context: str,
+    slot_key: str,
+) -> list[str]:
+    """iStock で hit しにくい固有名詞・企業名を除き、stock 写真向けの語のみ残す。
+
+    hero は記事代表画像なので、除去後に語数が乏しい場合 (固有名詞だけが
+    残るケース) は context-aware fallback へ振る。
+    """
+    safe_words = [w for w in words if w and w not in PRESS_QUERY_EXCLUDE_WORDS]
+    if slot_key == "hero" and len(safe_words) < 2:
+        fallback = _stock_fallback_query(context=context, h4_text="", slot_key=slot_key)
+        return fallback.split()
+    return safe_words
+
+
+def _stock_fallback_query(*, context: str, h4_text: str, slot_key: str) -> str:
+    """0 件になりやすい固有名詞混じりクエリの代替 (場面・抽象寄り)。"""
+    source = f"{context}\n{h4_text}"
+    for marker, query in STOCK_FALLBACK_QUERIES:
+        if marker in source:
+            return query
+    if slot_key == "hero":
+        return "ビジネス 会議 戦略"
+    return (h4_text or "ビジネス 資料")[:20]
+
+
+def build_query_plan(
+    primary_query: str,
+    *,
+    context: str,
+    h4_text: str = "",
+    slot_key: str = "",
+) -> list[str]:
+    """Build ordered iStock query attempts for one slot.
+
+    primary は現行の query_ja を維持し、safe/fallback を後続候補として足す。
+    重複 query は同じ検索を繰り返さないよう除外する。
+    """
+    plan: list[str] = []
+
+    def add_query(query: str) -> None:
+        normalized = " ".join((query or "").split()).strip()
+        if normalized and normalized not in plan:
+            plan.append(normalized)
+
+    add_query(primary_query)
+
+    safe_words = _stock_safe_query_words(
+        primary_query.split(),
+        context=context,
+        slot_key=slot_key,
+    )
+    add_query(" ".join(safe_words[:3]))
+
+    add_query(
+        _stock_fallback_query(context=context, h4_text=h4_text, slot_key=slot_key)
+    )
+
+    source = f"{context}\n{h4_text}"
+    for marker, fallback_query in STOCK_FALLBACK_QUERIES:
+        if marker in source:
+            add_query(fallback_query)
+
+    return plan
+
+
 def build_suggestion(
     slot_key: str,
     slot_label: str,
@@ -434,8 +540,15 @@ def build_suggestion(
         context = (h4_text or "") + "\n" + "\n".join(surrounding_paragraphs[:2])
 
     type_code, ja_words, en_words, rationale = _detect_type(context)
-    query_ja = " ".join(ja_words[:3]).strip() or (h4_text or "")[:20]
+    primary_query = " ".join(ja_words[:3]).strip() or (h4_text or "")[:20]
+    query_ja = primary_query
     query_en = " ".join(w for w in en_words[:3] if w).strip() or query_ja
+    query_plan = build_query_plan(
+        primary_query,
+        context=context,
+        h4_text=h4_text,
+        slot_key=slot_key,
+    )
 
     # 報道/資料系のソフトフラグ (note に入れて編集者へアラート、type は変えない、
     # iStock 代替候補は通常通り提示される)。title も含む拡張 context で検出。
@@ -451,6 +564,7 @@ def build_suggestion(
         query_en=query_en,
         search_url_ja=_istock_search_url(query_ja, jp=True),
         search_url_en=_istock_search_url(query_en, jp=False),
+        query_plan=query_plan,
         rationale=rationale,
         note=press_note,
     )

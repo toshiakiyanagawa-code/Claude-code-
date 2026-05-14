@@ -106,27 +106,122 @@ def _fetch_candidates(
 ) -> dict[str, list[IstockSearchHit]]:
     """Return {slot_key: ranked_hits}. Uses the istock_crawler cache.
 
+    query_plan 対応 (codex Phase 2):
+      - 各 suggestion の query_plan を順に試し、累積で hits_per_slot 以上集まったら止める
+      - 失敗 query は -1 で attempts に記録 (デバッグ用)
+      - 取得後、diversify_case_candidates で hero/h4 の先頭重複を解消
     Per-slot try/except: 1 つのスロットで iStock 取得が失敗しても、案件全体は失敗させない。
     """
     out: dict[str, list[IstockSearchHit]] = {}
     if not is_available():
         for s in suggestions:
             out[s.slot_key] = []
-        return out
+        return diversify_case_candidates(out)
     prefs = PreferencesStore()
     history = UsageHistory()
+    attempts_by_slot: dict[str, dict[str, int]] = {}
+
     for s in suggestions:
-        if not s.query_ja:
+        # query_plan に primary も含む。空・重複を除いた順序付きリストを構築。
+        queries: list[str] = []
+        plan = list(getattr(s, "query_plan", []) or [])
+        for query in [s.query_ja, *plan]:
+            normalized = " ".join((query or "").split()).strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+
+        if not queries:
             out[s.slot_key] = []
             continue
-        try:
-            hits = _crawl_search_safe(s.query_ja, limit=8)
-            out[s.slot_key] = rank_hits(
-                hits, preferences=prefs, history=history, limit=hits_per_slot
+
+        attempts: dict[str, int] = {}
+        attempts_by_slot[s.slot_key] = attempts
+        collected: list[IstockSearchHit] = []
+        seen: set[str] = set()
+        # primary が hits_per_slot 件取れても、後段 diversify で先頭重複が起きた
+        # 場合に入れ替え候補が無いと困るため、少し余分に集める (codex Phase 4)。
+        collect_until = hits_per_slot + 2
+
+        for query in queries:
+            try:
+                hits = _crawl_search_safe(query, limit=8)
+            except Exception:
+                attempts[query] = -1
+                continue
+
+            attempts[query] = len(hits)
+            for hit in hits:
+                identity_keys = _hit_identity_keys(hit)
+                if any(k in seen for k in identity_keys):
+                    continue
+                seen.update(identity_keys)
+                collected.append(hit)
+
+            if len(collected) >= collect_until:
+                break
+
+        out[s.slot_key] = rank_hits(
+            collected, preferences=prefs, history=history, limit=hits_per_slot
+        )
+
+    return diversify_case_candidates(out)
+
+
+def _hit_identity_keys(hit) -> set[str]:
+    """Identity keys for de-dup (asset_id + detail_url + thumbnail_url)。
+
+    asset_id が空でも同じ写真を判別できるよう、URL 系も含めて identity を計算する。
+    """
+    keys: set[str] = set()
+    for attr in ("asset_id", "detail_url", "thumbnail_url"):
+        v = getattr(hit, attr, "") or ""
+        v = v.strip() if isinstance(v, str) else ""
+        if v:
+            keys.add(f"{attr}:{v}")
+    return keys
+
+
+def diversify_case_candidates(
+    out: dict[str, list[IstockSearchHit]],
+) -> dict[str, list[IstockSearchHit]]:
+    """Move duplicate leading assets down across hero and all h4_* slots.
+
+    Hero を起点に h4_* を順番に見て、先頭の identity が既出なら同一スロット内の
+    未使用候補で先頭を入れ替える。identity は asset_id だけでなく detail_url /
+    thumbnail_url も併用するので、asset_id が空の場合でも重複排除できる。
+    in-place 更新で返り値は引数と同じオブジェクト。
+    """
+    slot_keys: list[str] = []
+    if "hero" in out:
+        slot_keys.append("hero")
+    slot_keys.extend(
+        slot_key
+        for slot_key in out
+        if slot_key != "hero" and slot_key.startswith("h4")
+    )
+
+    seen_lead_identities: set[str] = set()
+    for slot_key in slot_keys:
+        hits = out.get(slot_key) or []
+        if not hits:
+            continue
+
+        lead_identity = _hit_identity_keys(hits[0])
+        if seen_lead_identities.intersection(lead_identity):
+            replacement_index = next(
+                (
+                    idx
+                    for idx, hit in enumerate(hits[1:], start=1)
+                    if not seen_lead_identities.intersection(_hit_identity_keys(hit))
+                ),
+                None,
             )
-        except Exception:
-            # crawl が失敗しても他のスロットは独立して処理 (空候補で続行)
-            out[s.slot_key] = []
+            if replacement_index is not None:
+                hits.insert(0, hits.pop(replacement_index))
+                lead_identity = _hit_identity_keys(hits[0])
+
+        seen_lead_identities.update(lead_identity)
+
     return out
 
 
