@@ -346,7 +346,7 @@ def _build_filtergraph(
         if source_sample_rate:
             # loudnorm internally upsamples to 192 kHz, so resample back to the
             # source rate to keep output files at the rate users expect.
-            parts.append(f"{loud_label}aresample={source_sample_rate}[out]")
+            parts.append(f"{loud_label}aresample={source_sample_rate},aformat=channel_layouts=mono|stereo[out]")
     else:
         parts.append(f"{cur}anull[out]")
 

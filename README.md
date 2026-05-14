@@ -20,6 +20,10 @@ uv run podedit serve
 Open the forwarded port `8765`, click **Open** in the UI, upload an audio file,
 click **Transcribe**, choose the **Balanced** preset, then select the file and edit.
 
+> Uploads in Codespaces go through a chunked transfer (512 KB per chunk) to bypass
+> the forwarded port's body-size limit. Files up to 500 MB work without leaving the
+> browser; progress shows on the upload button.
+
 ### Docker
 
 ```bash
@@ -240,6 +244,10 @@ tests/                  # 57 tests: edit / render / timeline / seam_eval / wavef
 | `GET` | `/api/waveform?points=N` | Pre-decoded envelope, cached on disk |
 | `GET` | `/api/library` | Library entries + active file |
 | `POST` | `/api/library/select` | Switch active (audio, transcript, session) triple |
+| `POST` | `/api/library/upload` | Single-shot multipart upload (CLI / local-host friendly; subject to reverse-proxy body limits) |
+| `POST` | `/api/library/upload/init` | Open a chunked upload session, returns `{upload_id, chunk_size}` |
+| `PUT` | `/api/library/upload/{upload_id}/chunk` | Append one ordered chunk (`X-Chunk-Index` header, raw bytes ≤ 512 KB) |
+| `POST` | `/api/library/upload/{upload_id}/finalize` | Commit the chunked upload to `.podedit/work/uploads/<basename>` |
 | `POST` | `/api/library/transcribe` | Kick off an ASR job, returns job snapshot |
 | `GET` | `/api/library/transcribe/status` | Poll current/last job state |
 | `POST` | `/api/kpi/event` | Client KPI append (keepalive-safe) |
@@ -264,6 +272,10 @@ Codespaces-forwarded ports where edge caches can sit between you and the dev ser
 - **W7.8 ✅** ASR speed — beam=1 greedy + WhisperModel cache, 1.65x faster on CPU
 - **W8 ✅** MVP completion — in-UI Export (wav/mp3), reproducibility docs, friction polish
 - **W9 ✅** ASR accuracy — small-model quality preset + JA podcast prompt biasing; tri-state API
+- **W10 ✅** Full-filesystem audio picker — Open dialog can browse audio files beyond the initial library root
+- **W11 ✅** UI density polish — tighter transcript layout, copy-transcript button, smaller font, Shift+Arrow selection
+- **W12 ✅** Native file picker + upload — choose laptop files via OS dialog and import them into the app
+- **W13 ✅** Codespaces-friendly chunked upload — 3-endpoint init/chunk/finalize protocol works around the forwarded-port body-size limit; existing files can be overwritten on demand; the in-UI Open audio strings are also localized to Japanese
 
 Differentiating bet: **Japanese conversation quality** (aizuchi vs filler distinction,
 prosody-aware cuts). Voice cloning is staged for v1.0.
@@ -272,7 +284,17 @@ prosody-aware cuts). Voice cloning is staged for v1.0.
 
 | Commit | Week | What |
 |---|---|---|
-| _pending_ | W7.7-7.8+W8 | In-UI Transcribe button, ASR fast mode, in-UI Export (wav/mp3), README refresh |
+| d1681f0 | W13 | Chunked upload init now supports overwrite from server and UI |
+| 4e42ffb | W13 | Restore chunked upload after PR #3 merge and widen file-picker accept types |
+| 674a486 | W13 | Fix multipart filename mojibake for Japanese uploads |
+| cac261c | W13 | Translate Open audio dialog and surrounding flow to Japanese |
+| a8dfd02 | W12 | Native file picker + upload — pick laptop files via OS dialog |
+| 53b2696 | W11 | Follow-up: bump transcript line-height 1.15 → 1.25 |
+| 94279da | W11 | Follow-up: tighten spacing per user feedback |
+| 8a9acce | W11 | UI density, copy-transcript, smaller font, Shift+Arrow selection |
+| 2c4892f | W10 | Full-filesystem audio file picker in the Open dialog |
+| f72c18d | W9 | ASR accuracy — quality presets and Japanese podcast prompt biasing |
+| 2dd09c2 | W7.7-7.8+W8 | In-UI Transcribe button, fast ASR, in-UI Export, MVP completion |
 | 32e48c6 | W7.6 | Fix: "Loading library…" stuck — defense against silent fetch failures |
 | cb384af | W7.6 | Follow-up: address Codex review on the file-picker refactor |
 | 5a5fa23 | W7.6 | In-app file picker — switch audio without restarting the server |
