@@ -296,10 +296,80 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _save_last_active(state: ServeState) -> None:
+    """Atomically record the currently-active (audio, transcript) pair.
+
+    Lets a subsequent ``podedit serve`` (without --audio) restore the last
+    file the user was working on, so an editor mid-task doesn't lose context
+    across server restarts or Codespace rebuilds.
+
+    Tmp name is suffixed with a random token so two concurrent saves don't
+    rename the same tempfile out from under each other (a 500 path codex
+    flagged in review).
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    tmp_path = state.work_dir / f"last_active.json.{secrets.token_hex(4)}.tmp"
+    try:
+        tmp_path.write_text(json.dumps({
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+            "ts": time.time(),
+        }))
+        os.replace(tmp_path, last_active_path)
+    finally:
+        # If write_text raised before os.replace, drop the dangling tmp.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _try_load_last_active(state: ServeState) -> bool:
+    """Try to restore the last active (audio, transcript) pair on startup.
+
+    Returns True if restoration succeeded. Any failure (missing file, missing
+    audio/transcript on disk, JSON corruption, audio/transcript mismatch) is
+    silently swallowed and the server stays in empty state.
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    try:
+        data = json.loads(last_active_path.read_text())
+        audio_path = Path(data["audio_path"])
+        transcript_path = Path(data["transcript_path"])
+        if not audio_path.exists() or not transcript_path.exists():
+            return False
+        state.load_active(audio_path, transcript_path)
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        FileNotFoundError,
+        AudioTranscriptMismatch,
+    ):
+        return False
+    print(f"restored last active audio: {state.audio_path}")
+    try:
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.restored",
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+        })
+    except OSError:
+        # KPI logging is best-effort during startup; never let a write
+        # failure here block a successful restore.
+        pass
+    return True
+
+
 def create_app(config: ServeConfig) -> FastAPI:
     state = ServeState(config)
     if config.audio_path is not None and config.transcript_path is not None:
         state.load_active(config.audio_path, config.transcript_path)
+    elif config.audio_path is None:
+        _try_load_last_active(state)
     transcription_jobs = TranscriptionJobManager(work_dir=state.work_dir)
     # Opportunistic startup cleanup of W8 transient hardlinks. BackgroundTask
     # usually deletes these on response end, but if the process died mid-
@@ -1318,6 +1388,7 @@ def create_app(config: ServeConfig) -> FastAPI:
             state.load_active(candidate_audio, candidate_transcript)
         except (FileNotFoundError, AudioTranscriptMismatch) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        _save_last_active(state)
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.library.selected",
             "name": candidate_audio.name, "audio_path": str(state.audio_path),
