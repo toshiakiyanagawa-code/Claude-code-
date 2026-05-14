@@ -149,20 +149,45 @@ def _llm_plan_to_rerank_view(plan: Any) -> _ReRankPlanView:
     )
 
 
+# Phase 4 (codex Phase 3 review より): plan が「使えない」と判定する閾値。
+# search_queries が 1 件未満、もしくは intent / keywords / negative_keywords が
+# どれも空、もしくは confidence が低すぎる場合は legacy にフォールバックする。
+_LLM_MIN_CONFIDENCE = 0.0  # confidence は任意フィールド。指定があれば 0.0 未満を除外。
+
+
+def _llm_plan_is_usable(plan: Any) -> bool:
+    """codex Phase 3 must-fix: 空 query / 弱い lexical / 低 confidence は弾く。"""
+    queries = [q for q in (getattr(plan, "search_queries", []) or []) if q]
+    if not queries:
+        return False
+    has_lexical = bool(
+        (getattr(plan, "intent", "") or "").strip()
+        or (getattr(plan, "keywords", []) or [])
+        or queries
+    )
+    if not has_lexical:
+        return False
+    confidence = getattr(plan, "confidence", None)
+    if confidence is not None and confidence < _LLM_MIN_CONFIDENCE:
+        return False
+    return True
+
+
 def _maybe_generate_llm_plan(
     suggestion: IstockSearchSuggestion, *, article_title: str
 ) -> Any | None:
     """Call the LLM query generator. Returns None on any failure (incl. missing key).
 
-    LLM/ネットワーク障害は legacy フローへフォールバックさせる。明示的な
-    LlmUnavailableError も同様に None で握る。
+    LLM/ネットワーク障害は legacy フローへフォールバックさせる。codex Phase 3:
+    sandbox failure / API failure / parse failure を区別して warning ログに残す。
     """
     try:
         from cms_entry_assistant.llm_query_generator import (  # noqa: WPS433
             LlmUnavailableError,
             generate_query_plan,
         )
-    except Exception:  # anthropic 未インストール等
+    except Exception as exc:  # anthropic 未インストール等
+        _log.warning("LLM module unavailable (skipped for %s): %s", suggestion.slot_key, exc)
         return None
 
     slot_payload = {
@@ -173,20 +198,38 @@ def _maybe_generate_llm_plan(
         "primary_query": suggestion.query_ja,
         "rationale": suggestion.rationale,
         "note": suggestion.note,
-        "article_title": article_title,
+        # article_title は弱い文脈 (codex Phase 3 推奨): 全 slot で同質化しないよう
+        # primary_query / slot_label / rationale を優先する旨を一緒に渡す。
+        "article_title_hint": article_title,
         "fallback_queries": list(suggestion.query_plan or []),
     }
     try:
         result = generate_query_plan(slot_payload)
-    except LlmUnavailableError:
+    except LlmUnavailableError as exc:
+        # ANTHROPIC_API_KEY 未設定など。一度だけ警告。
+        _log.warning(
+            "LLM plan unavailable for %s (legacy fallback): %s",
+            suggestion.slot_key, exc,
+        )
         return None
     except Exception as exc:  # noqa: BLE001 — 例外を握って legacy 復帰
         _log.warning("LLM plan generation failed for %s: %s", suggestion.slot_key, exc)
         return None
 
     if not getattr(result, "ok", False):
+        _log.info(
+            "LLM plan returned error for %s (legacy fallback): %s",
+            suggestion.slot_key, getattr(result, "error", None),
+        )
         return None
-    return result.plan
+    plan = result.plan
+    if not _llm_plan_is_usable(plan):
+        _log.info(
+            "LLM plan unusable for %s (empty queries or low confidence); falling back",
+            suggestion.slot_key,
+        )
+        return None
+    return plan
 
 
 def _fetch_candidates(
@@ -225,24 +268,33 @@ def _fetch_candidates(
         if mode in {"llm", "llm_rerank"}:
             llm_plan = _maybe_generate_llm_plan(s, article_title=article_title)
 
-        # Build ordered, unique query list.
-        # LLM queries 先頭 → 既存 primary + plan を後段フォールバック。
-        queries: list[str] = []
+        # codex Phase 3 must-fix #1:
+        # LLM が broad / title 汚染された query を返しても、legacy primary は必ず
+        # 実行する。そこで queries を 2 段に分ける:
+        #   - guaranteed: LLM の search_queries + legacy primary。早い break の対象外。
+        #   - fallback: legacy query_plan。pool が collect_until を超えたら break OK。
+        seen_queries: set[str] = set()
+        guaranteed: list[str] = []
+        fallback_queries: list[str] = []
 
-        def _add_query(query: str) -> None:
-            normalized = " ".join((query or "").split()).strip()
-            if normalized and normalized not in queries:
-                queries.append(normalized)
+        def _normalize(query: str) -> str:
+            return " ".join((query or "").split()).strip()
+
+        def _add(query: str, *, bucket: list[str]) -> None:
+            normalized = _normalize(query)
+            if not normalized or normalized in seen_queries:
+                return
+            seen_queries.add(normalized)
+            bucket.append(normalized)
 
         if llm_plan is not None:
             for q in getattr(llm_plan, "search_queries", []) or []:
-                _add_query(q)
+                _add(q, bucket=guaranteed)
+        _add(s.query_ja, bucket=guaranteed)
+        for q in (getattr(s, "query_plan", []) or []):
+            _add(q, bucket=fallback_queries)
 
-        legacy_plan = list(getattr(s, "query_plan", []) or [])
-        for query in [s.query_ja, *legacy_plan]:
-            _add_query(query)
-
-        if not queries:
+        if not guaranteed and not fallback_queries:
             out[s.slot_key] = []
             continue
 
@@ -253,13 +305,12 @@ def _fetch_candidates(
         # llm_rerank は 30 件まで集めて再順位付け。それ以外は diversify 用に +2。
         collect_until = 30 if mode == "llm_rerank" else hits_per_slot + 2
 
-        for query in queries:
+        def _ingest(query: str) -> None:
             try:
                 hits = _crawl_search_safe(query, limit=8)
             except Exception:
                 attempts[query] = -1
-                continue
-
+                return
             attempts[query] = len(hits)
             for hit in hits:
                 identity_keys = _hit_identity_keys(hit)
@@ -268,16 +319,27 @@ def _fetch_candidates(
                 seen.update(identity_keys)
                 collected.append(hit)
 
+        # 1. guaranteed: 全部回す (legacy primary 含めて必ず候補プールに入れる)
+        for query in guaranteed:
+            _ingest(query)
+        # 2. fallback: collect_until に達したら止める
+        for query in fallback_queries:
             if len(collected) >= collect_until:
                 break
+            _ingest(query)
 
         if mode == "llm_rerank" and llm_plan is not None and collected:
             try:
                 from cms_entry_assistant.candidate_reranker import (  # noqa: WPS433
                     rerank_candidates,
                 )
+                # codex Phase 3 must-fix #2: rank_hits (preferences + history)
+                # の既存 signal を rerank 前に通し、tie-break として残す。
+                baseline = rank_hits(
+                    collected, preferences=prefs, history=history, limit=30
+                )
                 view = _llm_plan_to_rerank_view(llm_plan)
-                ranked = rerank_candidates(collected, view, prefs=prefs)
+                ranked = rerank_candidates(baseline, view, prefs=prefs)
                 out[s.slot_key] = [r.candidate for r in ranked[:hits_per_slot]]
                 continue
             except Exception as exc:  # noqa: BLE001

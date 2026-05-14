@@ -21,6 +21,13 @@ DEFAULT_MODEL = (
 DEFAULT_MAX_TOKENS = 1000
 CACHE_SCHEMA_VERSION = 1
 
+# codex Phase 3 must-fix: API timeout を必須にして長時間ブロックさせない。
+# 1 案件あたり 4-7 slot × 1 リクエストになるので、20s × 6 = 最悪 2 分。
+# DEFAULT_HTTP_TIMEOUT は anthropic SDK のリクエスト単位の timeout。
+DEFAULT_HTTP_TIMEOUT = float(
+    os.getenv("CMS_ENTRY_ASSISTANT_LLM_TIMEOUT") or "20.0"
+)
+
 CACHE_DIR_ENV = "CMS_ENTRY_ASSISTANT_LLM_CACHE_DIR"
 CACHE_DISABLE_ENV = "CMS_ENTRY_ASSISTANT_DISABLE_LLM_CACHE"
 
@@ -291,6 +298,10 @@ def build_prompt(slot: Any, context: Any | None = None) -> str:
         "Create a compact search-query plan for finding reliable source material "
         "for the CMS entry slot below.\n"
         "Return JSON only. Do not wrap the response in markdown.\n"
+        "Treat slot_label / type_label / primary_query / rationale as the strongest "
+        "signals. The article_title_hint applies to the whole article and should be "
+        "used only as weak background context — never copy it into every query, or "
+        "all slots will look identical.\n"
         "Use this schema:\n"
         "{\n"
         '  "intent": "short description of what must be found",\n'
@@ -414,7 +425,14 @@ def request_llm_response(
     client: Any | None = None,
     api_key: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: float = DEFAULT_HTTP_TIMEOUT,
 ) -> str:
+    """codex Phase 3 must-fix: 明示的 timeout を必ず付与。
+
+    `timeout` は anthropic SDK の per-request timeout (秒)。SDK が timeout kwarg
+    を受け取らない古いバージョンの場合は TypeError で握って system 等と一緒に
+    再試行する (fallback)。
+    """
     model = model or DEFAULT_MODEL
 
     if client is None:
@@ -429,6 +447,7 @@ def request_llm_response(
         "model": model,
         "max_tokens": max_tokens,
         "temperature": 0,
+        "timeout": timeout,
         "system": (
             "You generate precise, compact search query plans for CMS entry "
             "research. Return valid JSON only."
@@ -439,9 +458,13 @@ def request_llm_response(
     try:
         response = create(**kwargs)
     except TypeError:
-        kwargs.pop("system", None)
-        kwargs.pop("temperature", None)
-        response = create(**kwargs)
+        # 古い SDK / stub クライアント向け fallback。timeout / system / temperature を順に落とす。
+        for key in ("timeout", "system", "temperature"):
+            kwargs.pop(key, None)
+        try:
+            response = create(**kwargs)
+        except TypeError:
+            response = create(**{k: v for k, v in kwargs.items() if k in {"model", "max_tokens", "messages"}})
 
     return _extract_response_text(response)
 

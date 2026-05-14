@@ -1082,6 +1082,117 @@ def test_fetch_candidates_llm_rerank_uses_rerank_order(monkeypatch):
     assert out["hero"][0].asset_id == "hit"
 
 
+def test_fetch_candidates_llm_mode_always_runs_legacy_primary(monkeypatch):
+    """codex Phase 3 must-fix #1: LLM が pool を埋め切っても legacy primary は必ず実行。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+
+    queries_seen: list[str] = []
+    def fake_crawl(query, limit=8):
+        queries_seen.append(query)
+        # LLM が 1 件返しただけで pool が満タンに見えるよう、limit=8 件返す
+        return [
+            IstockSearchHit(
+                asset_id=f"{query}_{i}",
+                thumbnail_url="",
+                alt=query,
+                photographer_username="",
+                detail_url=f"https://x/{query}/{i}",
+            )
+            for i in range(8)
+        ]
+
+    monkeypatch.setattr(app_module, "crawl_search", fake_crawl)
+
+    fake_plan = gen_module.LlmQueryPlan(
+        search_queries=["llm-only"],
+        intent="x",
+        keywords=[],
+        negative_keywords=[],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_maybe_generate_llm_plan",
+        lambda suggestion, article_title="": fake_plan,
+    )
+
+    suggestions = [
+        IstockSearchSuggestion(
+            slot_key="hero", slot_label="h", query_ja="legacy-primary"
+        ),
+    ]
+    app_module._fetch_candidates(suggestions, search_mode="llm")
+
+    # legacy primary が必ず実行される (LLM が 1 件で埋め尽くしても guaranteed bucket)
+    assert "llm-only" in queries_seen
+    assert "legacy-primary" in queries_seen
+
+
+def test_fetch_candidates_llm_rerank_applies_rank_hits_baseline(monkeypatch):
+    """codex Phase 3 must-fix #2: llm_rerank でも rank_hits の baseline を通す。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+    monkeypatch.setattr(
+        app_module,
+        "crawl_search",
+        lambda q, limit=8: [
+            IstockSearchHit(
+                asset_id="x", thumbnail_url="", alt="cat", photographer_username="", detail_url="https://x/x"
+            )
+        ],
+    )
+
+    fake_plan = gen_module.LlmQueryPlan(
+        search_queries=["cat"], intent="cat", keywords=[], negative_keywords=[]
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_maybe_generate_llm_plan",
+        lambda suggestion, article_title="": fake_plan,
+    )
+
+    baseline_called: list[bool] = []
+    real_rank_hits = app_module.rank_hits
+
+    def spy(*args, **kwargs):
+        baseline_called.append(True)
+        return real_rank_hits(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "rank_hits", spy)
+
+    suggestions = [
+        IstockSearchSuggestion(slot_key="hero", slot_label="h", query_ja="cat")
+    ]
+    app_module._fetch_candidates(suggestions, search_mode="llm_rerank")
+    # rank_hits が rerank の前に呼ばれている (baseline ordering)
+    assert baseline_called, "rank_hits should be called as a baseline before rerank"
+
+
+def test_maybe_generate_llm_plan_rejects_empty_queries(monkeypatch):
+    """codex Phase 3 must-fix #3: search_queries が空なら usable=False。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+
+    empty_plan = gen_module.LlmQueryPlan(
+        search_queries=[], intent="x", keywords=[], negative_keywords=[]
+    )
+    result = gen_module.QueryPlanResult(slot_hash="x", plan=empty_plan, model="stub")
+
+    # generate_query_plan の戻り値を直接モック
+    monkeypatch.setattr(gen_module, "generate_query_plan", lambda *a, **kw: result)
+    from cms_entry_assistant.models import IstockSearchSuggestion
+    suggestion = IstockSearchSuggestion(slot_key="hero", slot_label="h", query_ja="legacy")
+    assert app_module._maybe_generate_llm_plan(suggestion, article_title="") is None
+
+
 def test_fetch_candidates_legacy_mode_skips_llm_call(monkeypatch):
     """search_mode='legacy' は LLM を一切呼ばない (互換維持)。"""
     from cms_entry_assistant.web import app as app_module
