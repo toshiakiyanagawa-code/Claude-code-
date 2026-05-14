@@ -2727,19 +2727,53 @@
       librarySwitching = false;
     }
   }
-  function showOverwritePrompt(file) {
+  async function startTranscribeOnExisting(existing) {
+    // Re-use the existing file on disk and kick off ASR; no re-upload.
+    try {
+      const r = await fetch('/api/library/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: existing.existing_path }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      }
+      transcribeJob = await r.json();
+      logKPI('ui.library.upload.existing_transcribe', {
+        name: existing.basename,
+        path: existing.existing_path,
+      });
+      setLibraryStatus('文字起こしを開始しました。完了したら自動で選択できます。');
+      if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
+      schedulePoll();
+    } catch (e) {
+      setLibraryStatus(`文字起こしを開始できませんでした: ${e.message}`);
+    }
+  }
+
+  function showExistingNoTranscriptPrompt(file, existing) {
     $libraryStatus.hidden = false;
-    $libraryStatus.textContent = `同名ファイルが既にあります: ${file.name}　`;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = '上書きしてアップロード';
-    btn.className = 'library-action';
-    btn.style.marginLeft = '6px';
-    btn.addEventListener('click', () => {
-      btn.disabled = true;
+    $libraryStatus.textContent = `${file.name} は既にアップロード済みですが文字起こしがありません。　`;
+    const transcribeBtn = document.createElement('button');
+    transcribeBtn.type = 'button';
+    transcribeBtn.textContent = '再アップロードせず文字起こしを開始';
+    transcribeBtn.className = 'library-action';
+    transcribeBtn.style.marginRight = '6px';
+    transcribeBtn.addEventListener('click', () => {
+      transcribeBtn.disabled = true;
+      startTranscribeOnExisting(existing);
+    });
+    const overwriteBtn = document.createElement('button');
+    overwriteBtn.type = 'button';
+    overwriteBtn.textContent = '上書きしてアップロード';
+    overwriteBtn.className = 'library-action';
+    overwriteBtn.addEventListener('click', () => {
+      overwriteBtn.disabled = true;
       uploadFileToLibrary(file, { overwrite: true });
     });
-    $libraryStatus.appendChild(btn);
+    $libraryStatus.appendChild(transcribeBtn);
+    $libraryStatus.appendChild(overwriteBtn);
   }
 
   async function uploadFileToLibrary(file, opts) {
@@ -2755,7 +2789,14 @@
       const text = await r.text();
       try {
         const reply = JSON.parse(text);
-        return { detail: reply && reply.detail ? String(reply.detail) : text.slice(0, 200), status: r.status };
+        // Preserve detail as-is so callers can branch on a structured
+        // object (e.g. {code, basename, existing_path, has_transcript}
+        // for 409 already_exists). Older string-detail responses still
+        // pass through unchanged.
+        if (reply && Object.prototype.hasOwnProperty.call(reply, 'detail')) {
+          return { detail: reply.detail, status: r.status };
+        }
+        return { detail: text.slice(0, 200), status: r.status };
       } catch (_) {
         return { detail: text.slice(0, 200), status: r.status };
       }
@@ -2774,15 +2815,36 @@
       });
       if (!init.ok) {
         const err = await readUploadError(init);
-        if (init.status === 409 && /^already_exists:/.test(err.detail)) {
-          // Surface a friendly status and let the user retry with overwrite.
-          showOverwritePrompt(file);
-          logKPI('ui.library.upload.fetch_failed', {
-            message: err.detail, name: file.name, status: 409, reason: 'already_exists',
-          });
+        // Structured already_exists detail: server tells us the canonical
+        // path and whether a transcript already lives next to it.
+        // - has_transcript=true → silent SPA jump into the editor (no
+        //   re-upload prompt at all; that's the "上書きアップデートしなくても
+        //   すぐに編集に入れる" UX the user asked for).
+        // - has_transcript=false → offer "transcribe existing" vs "overwrite".
+        if (
+          init.status === 409
+          && err.detail
+          && typeof err.detail === 'object'
+          && err.detail.code === 'already_exists'
+        ) {
+          const existing = err.detail;
+          if (existing.has_transcript) {
+            logKPI('ui.library.upload.existing_reused', {
+              name: existing.basename, path: existing.existing_path,
+            });
+            // selectLibraryEntry runs its own unsaved-edits confirm and
+            // emits its own status messages on success/cancel. Await it
+            // so we don't show a stale "opens…" line if the user aborts.
+            await selectLibraryEntry({ name: existing.basename, path: existing.existing_path });
+          } else {
+            showExistingNoTranscriptPrompt(file, existing);
+            logKPI('ui.library.upload.existing_no_transcript', {
+              name: existing.basename, path: existing.existing_path,
+            });
+          }
           return;
         }
-        throw new Error(err.detail);
+        throw new Error(typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail));
       }
       const started = await init.json();
       logKPI('ui.library.upload.init_ok', {
@@ -2809,7 +2871,8 @@
           body: file.slice(start, end),
         });
         if (!chunk.ok) {
-          throw new Error((await readUploadError(chunk)).detail);
+          const chunkErr = await readUploadError(chunk);
+          throw new Error(typeof chunkErr.detail === 'string' ? chunkErr.detail : JSON.stringify(chunkErr.detail));
         }
         const progress = await chunk.json();
         bytesReceived = progress.bytes_received;
@@ -2828,7 +2891,8 @@
         body: JSON.stringify({ chunks }),
       });
       if (!finalize.ok) {
-        throw new Error((await readUploadError(finalize)).detail);
+        const finalizeErr = await readUploadError(finalize);
+        throw new Error(typeof finalizeErr.detail === 'string' ? finalizeErr.detail : JSON.stringify(finalizeErr.detail));
       }
       const reply = await finalize.json();
       logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });

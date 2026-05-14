@@ -1220,9 +1220,19 @@ def create_app(config: ServeConfig) -> FastAPI:
             entry_stat = None
         if entry_stat is not None:
             if not overwrite:
+                # Structured payload: client uses has_transcript to decide
+                # between zero-click "open the existing file" and the
+                # prompt-the-editor flow when the existing file has no
+                # transcript yet (re-transcribe vs. overwrite).
+                transcript_path = state.work_dir / f"{final_path.stem}.transcript.json"
                 raise HTTPException(
                     status_code=409,
-                    detail=f"already_exists:{basename}",
+                    detail={
+                        "code": "already_exists",
+                        "basename": basename,
+                        "existing_path": str(final_path),
+                        "has_transcript": transcript_path.exists(),
+                    },
                 )
             # Refuse anything that isn't a regular file owned by the server
             # process. This blocks symlinks (which we never create), dirs,
