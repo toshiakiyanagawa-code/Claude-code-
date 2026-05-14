@@ -149,25 +149,37 @@ def _llm_plan_to_rerank_view(plan: Any) -> _ReRankPlanView:
     )
 
 
-# Phase 4 (codex Phase 3 review より): plan が「使えない」と判定する閾値。
-# search_queries が 1 件未満、もしくは intent / keywords / negative_keywords が
-# どれも空、もしくは confidence が低すぎる場合は legacy にフォールバックする。
-_LLM_MIN_CONFIDENCE = 0.0  # confidence は任意フィールド。指定があれば 0.0 未満を除外。
+# Phase 4 (codex Phase 3 review + 監査):
+# plan が「使えない」と判定する閾値。
+# - 非空 search_queries (空白だけは除外)
+# - intent / keywords / negative_keywords のうち少なくとも 1 つに実値あり (reranker の signal が立つ)
+# - confidence が _LLM_MIN_CONFIDENCE 以上 (低 confidence は legacy にフォールバック)
+_LLM_MIN_CONFIDENCE = float(
+    os.getenv("CMS_ENTRY_ASSISTANT_LLM_MIN_CONFIDENCE") or "0.2"
+)
 
 
 def _llm_plan_is_usable(plan: Any) -> bool:
-    """codex Phase 3 must-fix: 空 query / 弱い lexical / 低 confidence は弾く。"""
-    queries = [q for q in (getattr(plan, "search_queries", []) or []) if q]
+    """codex Phase 3 must-fix + Phase 4 監査:
+    空 / whitespace-only / 弱い lexical / 低 confidence の plan は legacy にフォールバック。
+    """
+    queries = [
+        q for q in (getattr(plan, "search_queries", []) or [])
+        if isinstance(q, str) and q.strip()
+    ]
     if not queries:
         return False
+    # lexical signal は intent / keywords / negative_keywords から取る。
+    # queries の存在を lexical 判定に含めない (queries だけだと reranker が役立たない)。
     has_lexical = bool(
         (getattr(plan, "intent", "") or "").strip()
         or (getattr(plan, "keywords", []) or [])
-        or queries
+        or (getattr(plan, "negative_keywords", []) or [])
     )
     if not has_lexical:
         return False
     confidence = getattr(plan, "confidence", None)
+    # confidence が None (任意) なら通す。明示された値が閾値未満ならフォールバック。
     if confidence is not None and confidence < _LLM_MIN_CONFIDENCE:
         return False
     return True

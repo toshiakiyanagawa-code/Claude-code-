@@ -455,16 +455,25 @@ def request_llm_response(
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    try:
-        response = create(**kwargs)
-    except TypeError:
-        # 古い SDK / stub クライアント向け fallback。timeout / system / temperature を順に落とす。
-        for key in ("timeout", "system", "temperature"):
-            kwargs.pop(key, None)
+    # codex Phase 4 監査: TypeError fallback は一気に落とさず段階的に。
+    # timeout → system → temperature の順で 1 つずつ外して再試行する。
+    # こうすると、たとえば SDK が timeout だけ受け取らないバージョンの場合に
+    # system / temperature の signal を保ったまま継続できる。
+    fallback_keys = ("timeout", "system", "temperature")
+    response = None
+    last_error: TypeError | None = None
+    for attempt in range(len(fallback_keys) + 1):
         try:
             response = create(**kwargs)
-        except TypeError:
-            response = create(**{k: v for k, v in kwargs.items() if k in {"model", "max_tokens", "messages"}})
+            break
+        except TypeError as exc:
+            last_error = exc
+            if attempt < len(fallback_keys):
+                kwargs.pop(fallback_keys[attempt], None)
+            else:
+                raise
+    if response is None and last_error is not None:
+        raise last_error
 
     return _extract_response_text(response)
 

@@ -1193,6 +1193,62 @@ def test_maybe_generate_llm_plan_rejects_empty_queries(monkeypatch):
     assert app_module._maybe_generate_llm_plan(suggestion, article_title="") is None
 
 
+def test_llm_plan_is_usable_rejects_whitespace_only_queries():
+    """codex Phase 4 監査: query が " " のような空白だけだったら usable=False。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+
+    plan = gen_module.LlmQueryPlan(
+        search_queries=["   ", ""], intent="x", keywords=["y"], negative_keywords=[]
+    )
+    assert app_module._llm_plan_is_usable(plan) is False
+
+
+def test_llm_plan_is_usable_requires_lexical_signal():
+    """codex Phase 4 監査: intent / keywords / negative_keywords がすべて空なら usable=False。
+    queries だけある状態は弱 lexical 扱い (reranker が役立たない)。
+    """
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+
+    plan = gen_module.LlmQueryPlan(
+        search_queries=["valid query"], intent="", keywords=[], negative_keywords=[]
+    )
+    assert app_module._llm_plan_is_usable(plan) is False
+
+    # keywords だけある → 通る
+    plan2 = gen_module.LlmQueryPlan(
+        search_queries=["valid"], intent="", keywords=["topic"], negative_keywords=[]
+    )
+    assert app_module._llm_plan_is_usable(plan2) is True
+
+
+def test_llm_plan_is_usable_rejects_low_confidence(monkeypatch):
+    """codex Phase 4 監査: confidence が閾値 (default 0.2) 未満なら usable=False。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+
+    # 0.1 < 0.2 → 落ちる
+    plan = gen_module.LlmQueryPlan(
+        search_queries=["valid"], intent="real intent", keywords=[], negative_keywords=[],
+        confidence=0.1,
+    )
+    assert app_module._llm_plan_is_usable(plan) is False
+
+    # confidence 未指定 (None) は通す
+    plan2 = gen_module.LlmQueryPlan(
+        search_queries=["valid"], intent="real intent", keywords=[], negative_keywords=[],
+    )
+    assert app_module._llm_plan_is_usable(plan2) is True
+
+    # 閾値以上は通す
+    plan3 = gen_module.LlmQueryPlan(
+        search_queries=["valid"], intent="real intent", keywords=[], negative_keywords=[],
+        confidence=0.5,
+    )
+    assert app_module._llm_plan_is_usable(plan3) is True
+
+
 def test_fetch_candidates_legacy_mode_skips_llm_call(monkeypatch):
     """search_mode='legacy' は LLM を一切呼ばない (互換維持)。"""
     from cms_entry_assistant.web import app as app_module
