@@ -2337,11 +2337,16 @@
     searchActiveIdx = -1;
     const q = (query || '').trim();
     if (!q) { updateSearchInfo(); return; }
-    const needle = q.toLowerCase();
+    // Split on whitespace so the editor can paste several candidate
+    // spellings at once (ASR routinely mis-recognises proper nouns and
+    // hands them back inconsistently). Each token is matched independently
+    // and any word containing any token counts as a hit. Empty tokens
+    // after split are dropped so trailing spaces don't false-positive.
+    const needles = q.toLowerCase().split(/\s+/).filter(Boolean);
     for (let i = 0; i < words.length; i++) {
       const w = words[i];
       const text = (w.el?.textContent || '').toLowerCase();
-      if (text.includes(needle)) {
+      if (needles.some((n) => text.includes(n))) {
         searchMatches.push(i);
         w.el.classList.add('search-hit');
       }
@@ -2358,7 +2363,7 @@
       paintSearchActive();
     }
     updateSearchInfo();
-    logKPI('ui.search.query', { q, hits: searchMatches.length });
+    logKPI('ui.search.query', { q, tokens: needles.length, hits: searchMatches.length });
   }
   function searchNext() {
     if (searchMatches.length === 0) return;
