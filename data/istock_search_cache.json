@@ -377,6 +377,34 @@
     ],
     "query": "・タイトル"
   },
+  "上海 ビル群": {
+    "error": "",
+    "fetched_at": "2026-05-14T11:52:37+00:00",
+    "hits": [
+      {
+        "alt": "上海の夜景 - 上海 ビル群 ストックフォトと画像",
+        "asset_id": "922766090",
+        "detail_url": "https://www.istockphoto.com/jp/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E4%B8%8A%E6%B5%B7%E3%81%AE%E5%A4%9C%E6%99%AF-gm922766090-253308633",
+        "photographer_username": "owngarden",
+        "thumbnail_url": "https://media.istockphoto.com/id/922766090/ja/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E4%B8%8A%E6%B5%B7%E3%81%AE%E5%A4%9C%E6%99%AF.jpg?s=612x612&w=0&k=20&c=zft6nhDpxIbkk10Y8gDB4-twVXCZwBQC8ikBdn39OZk="
+      },
+      {
+        "alt": "上海航空写真ビュー日の出 - 上海 ビル群 ストックフォトと画像",
+        "asset_id": "1088909344",
+        "detail_url": "https://www.istockphoto.com/jp/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E4%B8%8A%E6%B5%B7%E8%88%AA%E7%A9%BA%E5%86%99%E7%9C%9F%E3%83%93%E3%83%A5%E3%83%BC%E6%97%A5%E3%81%AE%E5%87%BA-gm1088909344-292091935",
+        "photographer_username": "bjdlzx",
+        "thumbnail_url": "https://media.istockphoto.com/id/1088909344/ja/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E4%B8%8A%E6%B5%B7%E8%88%AA%E7%A9%BA%E5%86%99%E7%9C%9F%E3%83%93%E3%83%A5%E3%83%BC%E6%97%A5%E3%81%AE%E5%87%BA.jpg?s=612x612&w=0&k=20&c=9DCb7FLUSwqqA4UpGLRrCZJvI0wryGo0QBimro_lUxo="
+      },
+      {
+        "alt": "空から見た上海の夜景 - 上海 ビル群 ストックフォトと画像",
+        "asset_id": "615881342",
+        "detail_url": "https://www.istockphoto.com/jp/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E7%A9%BA%E3%81%8B%E3%82%89%E8%A6%8B%E3%81%9F%E4%B8%8A%E6%B5%B7%E3%81%AE%E5%A4%9C%E6%99%AF-gm615881342-106963997",
+        "photographer_username": "ASKA",
+        "thumbnail_url": "https://media.istockphoto.com/id/615881342/ja/%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%83%95%E3%82%A9%E3%83%88/%E7%A9%BA%E3%81%8B%E3%82%89%E8%A6%8B%E3%81%9F%E4%B8%8A%E6%B5%B7%E3%81%AE%E5%A4%9C%E6%99%AF.jpg?s=612x612&w=0&k=20&c=yY0mPnBxMkVs24eJps5kbiXlVWR4vcjZQl0v3iCKVa4="
+      }
+    ],
+    "query": "上海 ビル群"
+  },
   "中世 ヨーロッパ 処刑 資料": {
     "error": "",
     "fetched_at": "2026-05-14T04:44:24+00:00",
