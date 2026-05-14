@@ -183,12 +183,95 @@ def _candidate_plan(
     provider=None,
     highlight_status_override: str | None = None,
     min_score: float = 0.3,
+    selection_mode: str = "legacy",
+    llm_model: str = "claude-haiku-4-5",
+    llm_top_k: int = 12,
+    min_composite_score: float = 0.0,
+    candidate_dump_path: str | None = None,
 ) -> dict:
-    """1候補に対し、ハイライト/タイトル/サムネをまとめて生成する."""
+    """1候補に対し、ハイライト/タイトル/サムネをまとめて生成する.
+
+    selection_mode:
+      - "legacy"        : 旧キーワードベース (default、後方互換)
+      - "political"     : 政治密度 + 多軸スコア (codex 2026-05 リサーチ)
+      - "political_llm" : political → 上位を Claude API で rerank
+    """
     highlights = []
     if srt_text is not None:
         cues = parse_srt(srt_text)
-        highlights = detect_highlights(cues, target_format=target_format, min_score=min_score)
+        if selection_mode == "legacy":
+            highlights = detect_highlights(cues, target_format=target_format, min_score=min_score)
+        else:
+            from .political_scoring import select_political_highlights
+            highlights, all_features = select_political_highlights(
+                cues,
+                target_format=target_format,
+                min_composite_score=min_composite_score,
+            )
+            if selection_mode == "political_llm":
+                from .llm_rerank import rerank_candidates
+                from .political_scoring import apply_overlap_filter
+                from .highlights import Highlight
+
+                rerank = rerank_candidates(
+                    all_features,
+                    program_title=candidate.title,
+                    target_format=target_format,
+                    top_k=llm_top_k,
+                    model=llm_model,
+                    cues=cues,
+                )
+                if rerank:
+                    publishable_items = [r for r in rerank if r.publishable]
+                    if not publishable_items:
+                        # 全件 publishable=false → 文脈安全違反として政治スコアの highlights を維持
+                        # (rerank しない、または no_highlight)
+                        import sys
+                        print(
+                            "warning: LLM judged no candidates as publishable; keeping deterministic highlights",
+                            file=sys.stderr,
+                        )
+                    elif target_format == "short":
+                        top = max(publishable_items, key=lambda r: r.llm_score)
+                        highlights = [
+                            Highlight(
+                                start_sec=top.start_sec,
+                                end_sec=top.end_sec,
+                                score=round(top.llm_score, 3),
+                                rationale=[f"llm_score={top.llm_score:.1f}", top.reasoning],
+                                keywords=[],
+                            )
+                        ]
+                    else:
+                        # long: スコア降順 → overlap filter で重複除外 → 時系列ソート
+                        sorted_pub = sorted(publishable_items, key=lambda r: r.llm_score, reverse=True)
+                        filtered = apply_overlap_filter(sorted_pub, max_windows=5)
+                        filtered.sort(key=lambda r: r.start_sec)
+                        highlights = [
+                            Highlight(
+                                start_sec=r.start_sec,
+                                end_sec=r.end_sec,
+                                score=round(r.llm_score, 3),
+                                rationale=[f"llm_score={r.llm_score:.1f}", r.reasoning],
+                                keywords=[],
+                            )
+                            for r in filtered
+                        ]
+            if candidate_dump_path:
+                from pathlib import Path as _P
+                _P(candidate_dump_path).parent.mkdir(parents=True, exist_ok=True)
+                _dump = {
+                    "video_id": candidate.video_id,
+                    "target_format": target_format,
+                    "selection_mode": selection_mode,
+                    "candidates": [
+                        f.as_dict()
+                        for f in sorted(all_features, key=lambda w: w.composite_score(), reverse=True)[:30]
+                    ],
+                }
+                _P(candidate_dump_path).write_text(
+                    json.dumps(_dump, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
     highlight_status = "no_srt" if srt_text is None else ("no_highlight" if not highlights else "ok")
     if highlight_status_override is not None:
         highlight_status = highlight_status_override
@@ -290,6 +373,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     provider=provider,
                     highlight_status_override=highlight_status_override,
                     min_score=getattr(args, "min_score", 0.3),
+                    selection_mode=getattr(args, "selection_mode", "legacy"),
+                    llm_model=getattr(args, "llm_model", "claude-haiku-4-5"),
+                    llm_top_k=getattr(args, "llm_top_k", 12),
+                    min_composite_score=getattr(args, "min_composite_score", 0.0),
+                    candidate_dump_path=getattr(args, "dump_candidates", None),
                 )
             )
 
@@ -730,6 +818,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.3,
         help="ハイライト検出の最低スコア閾値 (default 0.3、煽り少ない素材は 0.0 で全区間採用)",
+    )
+    pp.add_argument(
+        "--selection-mode",
+        choices=["legacy", "political", "political_llm"],
+        default="legacy",
+        help="ハイライト選定方式: legacy (旧キーワード), political (政治密度多軸), political_llm (政治密度+Claude API rerank)",
+    )
+    pp.add_argument(
+        "--llm-model",
+        default="claude-haiku-4-5",
+        help="political_llm の rerank モデル (default claude-haiku-4-5)",
+    )
+    pp.add_argument(
+        "--llm-top-k",
+        type=int,
+        default=12,
+        help="LLM rerank に渡す上位候補数 (default 12)",
+    )
+    pp.add_argument(
+        "--min-composite-score",
+        type=float,
+        default=0.0,
+        help="political モードの最低 composite score (default 0.0)",
+    )
+    pp.add_argument(
+        "--dump-candidates",
+        help="political モードの全候補窓スコアを JSON でダンプ (デバッグ用)",
     )
     pp.add_argument("--quiet", action="store_true")
     pp.add_argument("--polish", action="store_true", help="LLM(Claude API)でタイトル品質を向上 (要 ANTHROPIC_API_KEY)")
