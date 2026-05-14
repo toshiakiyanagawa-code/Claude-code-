@@ -17,7 +17,9 @@ LONG_DIR="${OUT_ROOT}/${VIDEO_ID}_long"
 SHORT_DIR="${OUT_ROOT}/${VIDEO_ID}_short"
 SOURCE_MP4="${LONG_DIR}/source.mp4"
 SOURCE_SRT="${LONG_DIR}/source.ja.srt"
-MIN_MP4_BYTES=$((100 * 1024 * 1024))
+MIN_MP4_BYTES=$((10 * 1024 * 1024))
+# 解説調・冷静な動画はクリックベイトキーワード少ない → 閾値 0、煽り素材は 0.3
+MIN_HIGHLIGHT_SCORE="${MIN_HIGHLIGHT_SCORE:-0.0}"
 
 mp4_bytes() {
   [ -f "$1" ] && wc -c < "$1" || echo 0
@@ -34,8 +36,13 @@ parts_all_present() {
   local concat="${extract_dir}/concat.txt"
   [ -s "${concat}" ] || return 1
   while IFS= read -r line; do
-    [[ "${line}" =~ ^file[[:space:]]+\'(.+)\'$ ]] || continue
-    local p="${BASH_REMATCH[1]}"
+    if [[ "${line}" =~ ^file[[:space:]]+\'(.+)\'$ ]]; then
+      local p="${BASH_REMATCH[1]}"
+    elif [[ "${line}" =~ ^file[[:space:]]+(.+)$ ]]; then
+      local p="${BASH_REMATCH[1]}"
+    else
+      continue
+    fi
     [[ "${p}" = /* ]] || p="${extract_dir}/${p}"
     [ -s "${p}" ] || return 1
   done < "${concat}"
@@ -118,6 +125,7 @@ run_format() {
       --source mock --mock "${SOURCE_MOCK}" \
       --format "${fmt}" --top 1 --include-blocked \
       --aggressiveness 2 \
+      --min-score "${MIN_HIGHLIGHT_SCORE}" \
       "${SRT_ARG[@]}" \
       --out "${plan_json}" \
       --now 2026-05-14T12:00:00+00:00
@@ -160,7 +168,7 @@ run_format() {
       echo "[${fmt} 3/4] ffmpeg で切り出します..."
       rm -rf "${extract_dir}/parts"
       mkdir -p "${extract_dir}/parts"
-      (cd "${extract_dir}" && bash cut.sh)
+      bash "${extract_dir}/cut.sh"
       rm -f "${combined_mp4}"
     else
       echo "[${fmt} 3/4] SKIP: parts は source/cut/concat より新しいので再利用します。"
@@ -179,7 +187,7 @@ run_format() {
     fi
     if [ "${combined_needs_regen}" = "1" ]; then
       echo "[${fmt} 4/4] 連結します..."
-      (cd "${extract_dir}" && bash combine.sh)
+      bash "${extract_dir}/combine.sh"
       echo "完成: ${combined_mp4}"
     else
       echo "[${fmt} 4/4] SKIP: 連結済み動画は parts/concat より新しいので再利用します: ${combined_mp4}"

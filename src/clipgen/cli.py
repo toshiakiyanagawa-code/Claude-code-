@@ -182,12 +182,13 @@ def _candidate_plan(
     aggressiveness: int | None,
     provider=None,
     highlight_status_override: str | None = None,
+    min_score: float = 0.3,
 ) -> dict:
     """1候補に対し、ハイライト/タイトル/サムネをまとめて生成する."""
     highlights = []
     if srt_text is not None:
         cues = parse_srt(srt_text)
-        highlights = detect_highlights(cues, target_format=target_format)
+        highlights = detect_highlights(cues, target_format=target_format, min_score=min_score)
     highlight_status = "no_srt" if srt_text is None else ("no_highlight" if not highlights else "ok")
     if highlight_status_override is not None:
         highlight_status = highlight_status_override
@@ -288,6 +289,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     aggressiveness=aggressiveness,
                     provider=provider,
                     highlight_status_override=highlight_status_override,
+                    min_score=getattr(args, "min_score", 0.3),
                 )
             )
 
@@ -723,6 +725,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="煽り強度 0..3 (デフォルト=環境変数 CLIPGEN_AGGRESSIVENESS or 2)",
     )
     pp.add_argument("--now", help="ISO8601 で『現在時刻』を上書き")
+    pp.add_argument(
+        "--min-score",
+        type=float,
+        default=0.3,
+        help="ハイライト検出の最低スコア閾値 (default 0.3、煽り少ない素材は 0.0 で全区間採用)",
+    )
     pp.add_argument("--quiet", action="store_true")
     pp.add_argument("--polish", action="store_true", help="LLM(Claude API)でタイトル品質を向上 (要 ANTHROPIC_API_KEY)")
     pp.add_argument("--polish-model", default="claude-opus-4-7", help="LLM ポリッシュ用モデル")
