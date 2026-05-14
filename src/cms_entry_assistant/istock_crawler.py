@@ -81,7 +81,17 @@ def is_available() -> bool:
 
 # ---------------------------------------------------------------------------
 # Cache (a simple JSON dict keyed by normalized query)
+#
+# 並列書き込み race fix (2026-05-14):
+# 複数スレッドが read-modify-write を同時に行うと、後勝ちで先勝ちの更新が
+# 消えるバグがあった (eval v2 で 35/80 slot が空になった真因)。
+# 全 read-modify-write を _CACHE_LOCK で直列化し、書き込み自体も atomic
+# rename にする。
 # ---------------------------------------------------------------------------
+
+import threading
+
+_CACHE_LOCK = threading.Lock()
 
 
 def _cache_key(query: str) -> str:
@@ -99,10 +109,14 @@ def _load_cache(path: Path) -> dict:
 
 def _save_cache(path: Path, cache: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    # Atomic rename: tmp に書いてから replace。書き込み中に他スレッドが
+    # 半端な JSON を読まないようにする。
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
         json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    tmp_path.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -225,21 +239,23 @@ def crawl_search(
     if not query or not query.strip():
         return []
     cache_path = Path(cache_path)
-    cache = _load_cache(cache_path)
     key = _cache_key(query)
     now_ts = time.time()
 
-    # Cache hit?
-    if not force_refresh and key in cache:
-        entry = cache[key]
-        try:
-            fetched_at = datetime.fromisoformat(entry.get("fetched_at", "")).timestamp()
-        except Exception:
-            fetched_at = 0
-        if now_ts - fetched_at < max_age_days * 86400 and entry.get("hits"):
-            return [IstockSearchHit(**h) for h in entry["hits"][:limit]]
+    # Cache hit check: lock 内で read → 該当 entry を即返す
+    # (lock を read 中ずっと持つわけではなく、read-modify-write 全体を保護)。
+    with _CACHE_LOCK:
+        cache = _load_cache(cache_path)
+        if not force_refresh and key in cache:
+            entry = cache[key]
+            try:
+                fetched_at = datetime.fromisoformat(entry.get("fetched_at", "")).timestamp()
+            except Exception:
+                fetched_at = 0
+            if now_ts - fetched_at < max_age_days * 86400 and entry.get("hits"):
+                return [IstockSearchHit(**h) for h in entry["hits"][:limit]]
 
-    # Rate limit
+    # Rate limit (lock の外で sleep。クロール本体も lock 外。)
     global _LAST_SEARCH_AT
     wait = _MIN_SEARCH_INTERVAL_S - (time.monotonic() - _LAST_SEARCH_AT)
     if wait > 0:
@@ -250,20 +266,24 @@ def crawl_search(
         hits = asyncio.run(_do_search(query, limit=limit))
     except Exception as exc:
         # エラーはディスクに永続化しない (再試行が常に効くようにする)。
-        # 例えば過去の "asyncio.run cannot be called from a running event loop" のような
-        # 環境依存エラーをキャッシュに残すと、次回も誤って空候補を返してしまう。
-        # 既存のエラーエントリがあれば併せて掃除しておく。
-        cache.pop(key, None)
-        _save_cache(cache_path, cache)
+        # ただし read-modify-write は lock 配下で行う必要がある。
+        with _CACHE_LOCK:
+            cache = _load_cache(cache_path)
+            if key in cache:
+                cache.pop(key, None)
+                _save_cache(cache_path, cache)
         return []
 
-    cache[key] = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "query": query,
-        "hits": [h.to_dict() for h in hits],
-        "error": "",
-    }
-    _save_cache(cache_path, cache)
+    # 成功 hits の cache 反映も lock 配下で。最新の cache を読んでマージしてから書く。
+    with _CACHE_LOCK:
+        cache = _load_cache(cache_path)
+        cache[key] = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "query": query,
+            "hits": [h.to_dict() for h in hits],
+            "error": "",
+        }
+        _save_cache(cache_path, cache)
     return hits
 
 

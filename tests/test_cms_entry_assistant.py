@@ -1054,6 +1054,33 @@ def test_web_app_cms_html_pre_escapes_critical_html_characters(monkeypatch):
     assert "</pre>" not in pre_inner
 
 
+def test_cache_save_is_threadsafe_against_concurrent_writers(tmp_path):
+    """並列で _save_cache を叩いても、後勝ちで先勝ちが消えないこと (eval v2 で
+    多数 slot が空になった race の回帰防止)。"""
+    import threading
+    import json
+    from cms_entry_assistant.istock_crawler import _CACHE_LOCK, _load_cache, _save_cache
+
+    cache_file = tmp_path / "cache.json"
+
+    def writer(seed: int) -> None:
+        for i in range(15):
+            with _CACHE_LOCK:
+                cache = _load_cache(cache_file)
+                cache[f"k{seed}_{i}"] = {"query": f"q{seed}_{i}", "hits": []}
+                _save_cache(cache_file, cache)
+
+    threads = [threading.Thread(target=writer, args=(s,)) for s in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = json.loads(cache_file.read_text(encoding="utf-8"))
+    # 4 threads × 15 entries = 60 entries が全部残るはず
+    assert len(final) == 60, f"race condition: lost {60 - len(final)} writes"
+
+
 def test_crawl_search_does_not_persist_error_entries(tmp_path, monkeypatch):
     """エラー時はディスクキャッシュに永続化しない (再試行で自己回復)。"""
     import json
