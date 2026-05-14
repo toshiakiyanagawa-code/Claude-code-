@@ -291,6 +291,22 @@ _ABSTRACT_INDICATORS = (
     "concept", "abstract", "infographic", "diagram",
 )
 
+# Soft-demote: codex eval review Q4 拡張。
+# hard-block ほどでは無いが「スタジオ写真っぽい」「不自然な構図」「抱擁系で顔が密着」
+# など編集者が選ぶ確率の低いシグナル。-3 のペナルティで上位から押し下げる
+# (hard_block ではないので候補プールには残す)。
+_SOFT_DEMOTE_TERMS = (
+    # 合成・スタジオ感
+    "3dレンダリング", "3d render", "3d rendering", "cg ", "cgi ",
+    "白い背景", "白背景", "white background", "isolated", "隔離",
+    "ぬいぐるみ", "stuffed animal",
+    # 抱擁系 (顔密着リスク)
+    "ハグ", "抱擁", "抱きしめ", "kiss", "キス",
+    "誕生日パーティー", "birthday party",
+    # その他、ステレオタイプな観光写真 (記事文脈外で出やすい)
+    "観光客", "tourist",
+)
+
 
 @dataclass(frozen=True)
 class PolicyEval:
@@ -362,6 +378,12 @@ def evaluate_editorial_people_policy(hit, query_context: str = "") -> PolicyEval
     if not is_no_face and any(t in haystack for t in ("顔のアップ", "顔のクローズ", "顔出し", "face close")):
         score -= 8
         reasons.append("face_closeup")
+
+    # Soft-demote: スタジオ感 / 不自然な構図 / 抱擁・キス
+    soft_hits = [t for t in _SOFT_DEMOTE_TERMS if t in haystack]
+    if soft_hits:
+        score -= 3 * min(len(soft_hits), 2)  # 最大 -6 まで
+        reasons.append(f"soft_demote:{soft_hits[0]}")
 
     return PolicyEval(
         score=score,

@@ -173,6 +173,26 @@ def test_rerank_real_world_alts_filter_policy_violations():
     assert "a13" in top10 or "a14" in top10
 
 
+def test_rerank_soft_demotes_studio_and_3d_render_candidates():
+    """Q4: 3D レンダリング / 白い背景 / 隔離 / 抱擁 など soft-demote 語を含む
+    候補は、含まない通常の候補より下に来る。hard-block ではない (候補からは消えない)。"""
+    plan = _Plan(intent_terms=["business"], query_terms=[], avoid_terms=[])
+    hits = [
+        _Hit("natural", alt="日本人ビジネスマン 後ろ姿 オフィス"),
+        _Hit("studio-3d", alt="3dレンダリング 白い背景 ビジネスマン"),
+        _Hit("hugging", alt="ハグするカップル 抱きしめ"),
+    ]
+    ranked = rerank_candidates(hits, plan)
+    asset_ids = [r.candidate.asset_id for r in ranked]
+    # natural が最上位
+    assert asset_ids[0] == "natural"
+    # studio-3d と hugging は natural より下
+    assert asset_ids.index("studio-3d") > asset_ids.index("natural")
+    assert asset_ids.index("hugging") > asset_ids.index("natural")
+    # ただし候補からは消えない (hard_block ではないため)
+    assert set(asset_ids) == {"natural", "studio-3d", "hugging"}
+
+
 def test_rerank_preserves_candidate_object_identity():
     plan = _Plan(intent_terms=["x"], query_terms=[], avoid_terms=[])
     hits = [_Hit("a", alt="x match"), _Hit("b", alt="other")]
