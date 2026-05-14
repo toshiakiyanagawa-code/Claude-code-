@@ -631,7 +631,62 @@ def _build_photo_suggestions(
         )
         suggestion.page_number = page_num
         suggestions.append(suggestion)
+
+    # codex eval review Q5: 同一記事の slot で primary_query が重複する問題を
+    # 解消する (SPECIFIC_SCENE_RULES で全 h4 が同じ主題語にマッチした場合等)。
+    # 重複する slot には slot_label の固有語を prepend して iStock 検索の母集団を
+    # slot ごとにずらす。
+    _diversify_duplicate_queries(suggestions)
     return suggestions
+
+
+_LABEL_PREFIX_RE = re.compile(r"^[■「『]+")
+_LABEL_SUFFIX_RE = re.compile(r"[」』]+$")
+_LABEL_PUNCT_RE = re.compile(r"[、。…：:?？！!()（）\s]+")
+
+
+def _label_distinctive(slot_label: str) -> str:
+    """Extract a short distinctive phrase from a slot_label.
+
+    "■背中が丸くなると死亡リスクが約2倍になる" → "背中が丸くなると死亡"
+    最大 12 文字。空文字なら空を返す。
+    """
+    if not slot_label:
+        return ""
+    cleaned = _LABEL_PREFIX_RE.sub("", slot_label)
+    cleaned = _LABEL_SUFFIX_RE.sub("", cleaned)
+    cleaned = _LABEL_PUNCT_RE.sub(" ", cleaned).strip()
+    return cleaned[:12]
+
+
+def _diversify_duplicate_queries(suggestions: list[IstockSearchSuggestion]) -> None:
+    """In-place: 重複 primary_query (s.query_ja) を slot_label の固有語で差別化。
+
+    SPECIFIC_SCENE_RULES が 1 記事の複数 slot に同じ "シニア 背中 姿勢" 等を
+    返すと、guaranteed bucket が全 slot で同じ iStock pool を引いてしまい、
+    rerank で slot 固有の論点が反映されなくなる。
+    最初に出現した slot は原クエリのまま、2 つ目以降は slot_label から抽出した
+    固有語を prepend する。query_plan も新クエリを先頭に組み直す。
+    hero は記事代表なので dedup の対象外 (常に最初に登場するため自動的に原クエリ)。
+    """
+    seen: dict[str, int] = {}
+    for idx, s in enumerate(suggestions):
+        primary = (s.query_ja or "").strip()
+        if not primary:
+            continue
+        if primary in seen:
+            distinctive = _label_distinctive(s.slot_label)
+            if distinctive and distinctive not in primary:
+                new_query = f"{distinctive} {primary}".strip()
+                s.query_ja = new_query
+                # query_plan を再構築: 新クエリを先頭、旧 plan を後段 fallback として残す。
+                rebuilt: list[str] = [new_query]
+                for q in s.query_plan:
+                    if q and q != new_query and q not in rebuilt:
+                        rebuilt.append(q)
+                s.query_plan = rebuilt
+        else:
+            seen[primary] = idx
 
 
 def _derive_placements_from_submission_only(

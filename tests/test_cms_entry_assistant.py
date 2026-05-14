@@ -1054,6 +1054,65 @@ def test_web_app_cms_html_pre_escapes_critical_html_characters(monkeypatch):
     assert "</pre>" not in pre_inner
 
 
+def test_diversify_duplicate_queries_prepends_label_keywords(tmp_path):
+    """codex eval Q5: SPECIFIC_SCENE_RULES が複数 slot に同じ primary を返した時
+    でも、slot_label の固有語を prepend して iStock 母集団を slot 別にずらす。"""
+    from cms_entry_assistant.conversion_engine import _diversify_duplicate_queries
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    suggestions = [
+        IstockSearchSuggestion(
+            slot_key="hero",
+            slot_label="カンバン(冒頭)",
+            query_ja="シニア 背中 姿勢",
+            query_plan=["シニア 背中 姿勢"],
+        ),
+        IstockSearchSuggestion(
+            slot_key="h4_1",
+            slot_label="■背中が丸くなると死亡リスクが約2倍になる",
+            query_ja="シニア 背中 姿勢",
+            query_plan=["シニア 背中 姿勢"],
+        ),
+        IstockSearchSuggestion(
+            slot_key="h4_2",
+            slot_label="■老化は背中から始まっていく",
+            query_ja="シニア 背中 姿勢",
+            query_plan=["シニア 背中 姿勢"],
+        ),
+        IstockSearchSuggestion(
+            slot_key="h4_3",
+            slot_label="■段差でつまずくようになったら要注意",
+            query_ja="シニア 背中 姿勢",
+            query_plan=["シニア 背中 姿勢"],
+        ),
+    ]
+
+    _diversify_duplicate_queries(suggestions)
+
+    # hero は触らず原クエリ維持
+    assert suggestions[0].query_ja == "シニア 背中 姿勢"
+    # 2 つ目以降は slot_label の固有語が前置されてユニーク化
+    queries = [s.query_ja for s in suggestions]
+    assert len(set(queries)) == len(queries), f"duplicates remain: {queries}"
+    # 旧クエリは query_plan の fallback 段に保持
+    for s in suggestions[1:]:
+        assert "シニア 背中 姿勢" in s.query_plan
+
+
+def test_diversify_duplicate_queries_leaves_unique_queries_alone():
+    """重複しない slot は触らない。"""
+    from cms_entry_assistant.conversion_engine import _diversify_duplicate_queries
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    suggestions = [
+        IstockSearchSuggestion(slot_key="hero", slot_label="x", query_ja="A"),
+        IstockSearchSuggestion(slot_key="h4_1", slot_label="x", query_ja="B"),
+        IstockSearchSuggestion(slot_key="h4_2", slot_label="x", query_ja="C"),
+    ]
+    _diversify_duplicate_queries(suggestions)
+    assert [s.query_ja for s in suggestions] == ["A", "B", "C"]
+
+
 def test_cache_save_is_threadsafe_against_concurrent_writers(tmp_path):
     """並列で _save_cache を叩いても、後勝ちで先勝ちが消えないこと (eval v2 で
     多数 slot が空になった race の回帰防止)。"""
