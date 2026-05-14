@@ -530,6 +530,14 @@ def _photos_tab_html(case: CaseState) -> str:
             selected = case.selections.get(slot_key, "")
             cards = _candidate_cards_html(slot_key, hits, selected)
             rationale = _esc(suggestion.rationale) if suggestion.rationale else ""
+            note_html = ""
+            if getattr(suggestion, "note", ""):
+                note_html = (
+                    '<div class="press-hint">'
+                    '<span class="press-hint-title">📰 報道写真の参考</span>'
+                    f'<span class="press-hint-body">{_esc(suggestion.note)}</span>'
+                    "</div>"
+                )
             slot_parts.append(
                 f'<section class="slot" data-slot-key="{_esc(slot_key)}">'
                 f'  <header class="slot-head">'
@@ -538,6 +546,7 @@ def _photos_tab_html(case: CaseState) -> str:
                 f'    <span class="query">クエリ: {_esc(query_text)}</span>'
                 f"  </header>"
                 f'  <div class="rationale">{rationale}</div>'
+                f"{note_html}"
                 f'  <div class="grid">{cards}</div>'
                 f"</section>"
             )
@@ -681,6 +690,26 @@ button.ghost:hover { border-color: #d75a3b; }
 .slot-head .type { color: #6ab0ff; font-size: 12px; font-family: ui-monospace, monospace; }
 .slot-head .query { color: #aab0ba; font-size: 12px; }
 .rationale { color: #6b727d; font-size: 11px; margin-bottom: 8px; }
+.press-hint {
+    margin: 8px 0 12px;
+    padding: 10px 12px;
+    border: 1px solid #f0c542;
+    border-left-width: 4px;
+    border-radius: 6px;
+    background: #3a3a18;
+    color: #f7e7a1;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.press-hint-title {
+    display: inline-block;
+    margin-right: 8px;
+    color: #f0c542;
+    font-weight: 700;
+}
+.press-hint-body {
+    color: #fff3bf;
+}
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
 .card { background: #0d1016; border: 2px solid #2a2f38; border-radius: 6px;
   padding: 8px; display: block; cursor: pointer; transition: border-color 0.15s; }
