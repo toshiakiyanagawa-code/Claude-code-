@@ -141,7 +141,121 @@ TYPE_LABEL: dict[str, str] = {
     "C": "抽象シンボル",
     "D": "行動シーン",
     "E": "産業",
+    "G": "具体シーン",
 }
+
+
+# --- Soft flag: photos that may benefit from 報道/資料 手配 -------------------
+# 現役政治家・現代外交事件・戦争資料・歴史画像は通信社/Wikimedia 案件のことが多い。
+# しかし codex 2周目指摘の通り「ハード切替で iStock 代替を見えなくする」のは編集ワークフローを
+# 阻害する。代わりに通常の type 判定 (A〜G) は続け、note フィールドに「報道写真の手配も検討」
+# とソフトフラグを立てる方針にする。recall を上げても代替候補が見える。
+PRESS_FIGURES: tuple[str, ...] = (
+    "習近平", "毛沢東", "プーチン", "トランプ", "金正恩", "ゼレンスキー",
+    "岸田", "石破", "安倍", "高市", "ネタニヤフ", "バイデン",
+    "ハマス", "イスラエル軍",
+)
+PRESS_EVENTS: tuple[str, ...] = (
+    "原爆", "ポツダム", "ヒロシマ", "終戦", "敗戦", "宣戦", "枢軸",
+    "天安門事件", "ウクライナ戦争", "侵攻", "停戦合意", "国連安保理",
+    "ノーベル賞", "選挙", "総選挙", "国際裁判",
+)
+HISTORICAL_ARCHIVE_TERMS: tuple[str, ...] = (
+    "中世ヨーロッパ", "古文書", "古地図", "甲骨文字", "絵巻物", "肖像画",
+    "浮世絵", "錦絵", "戦国時代", "幕末", "明治維新",
+)
+
+
+# --- Specific scene rules (codex HIGH 提案: 安全版) ----------------------------
+# v2 期と違い、必ず「主題語 + 場面語」の AND 条件で発火させる。記事タイトル全体ではなく
+# slot-local context (h4 + 直近 2 段落 or lead) でのみ判定するので、全 slot の
+# 同一クエリ収束は起きにくい。発火しなかったら通常の A〜E 判定にフォールスルー。
+# クエリは「具体被写体 + 場面」3-4 語に絞り、機械的 suffix は付けない。
+SPECIFIC_SCENE_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...], str, str, str], ...] = (
+    # (主題語, 場面語/必須併用語, query_ja, query_en, rationale)
+    # 健康+部位
+    (("腰痛", "ぎっくり"), ("シニア", "高齢者", "寝たきり", "和田", "医師"),
+     "シニア 腰痛", "senior lower back pain", "腰痛+シニア併用"),
+    (("背中", "猫背"), ("姿勢", "シニア", "高齢者", "ヨボヨボ", "丸まった", "健康寿命"),
+     "シニア 背中 姿勢", "senior back posture", "背中+姿勢/シニア"),
+    (("膝", "ひざ"), ("痛", "シニア", "高齢者", "寝たきり"),
+     "高齢者 膝 痛み", "elderly knee pain", "膝+痛み/シニア"),
+    (("足", "靴底", "アーチ"), ("形", "歩", "高齢者", "シニア", "転倒"),
+     "高齢者 足 靴", "elderly foot shoe", "足/靴底+シニア"),
+    # 運動・歩行
+    (("ウォーキング", "歩数", "歩く"), ("公園", "シニア", "高齢者", "毎日"),
+     "シニア ウォーキング 公園", "senior walking park", "ウォーキング+場面"),
+    (("ストレッチ", "体操"), ("自宅", "毎日", "シニア", "高齢者"),
+     "シニア ストレッチ 自宅", "senior stretching home", "ストレッチ+場面"),
+    # 食・生活
+    (("みかん", "果物", "フルーツ"), ("健康", "血管", "血圧", "食卓"),
+     "みかん 果物 食卓", "mandarin fruit table", "果物+健康"),
+    (("ラーメン", "酒"), ("我慢", "60代", "高齢者", "シニア", "和田"),
+     "ラーメン ビール 食卓", "ramen beer table", "ラーメン酒+シニア"),
+    (("献立", "1日4食", "食習慣"), ("血管", "シニア", "高齢者", "食卓"),
+     "シニア 食卓 健康", "senior meal table healthy", "食習慣+シニア"),
+    # 運転
+    (("免許返納", "運転"), ("高齢者", "シニア", "車", "事故", "65歳"),
+     "高齢者 運転 車", "elderly driver car", "運転+高齢者"),
+    # 街・住宅
+    (("タワマン", "タワーマンション", "再開発"), ("街", "都市", "建設", "規制緩和", "人口"),
+     "タワーマンション 都市 街並み", "tower apartment urban", "タワマン+都市"),
+    # 対人トラブル (場面語 AND)
+    (("クレーマー", "カスハラ"), ("窓口", "カウンター", "電話", "謝罪", "金銭", "店員"),
+     "クレーム対応 接客 窓口", "customer complaint service counter", "クレーマー+場面"),
+    # 子ども・教育
+    (("不登校", "学校嫌い"), ("子ども", "親", "後悔", "プレッシャー"),
+     "子ども 学校 後ろ姿", "child school back view", "不登校+子ども"),
+)
+
+
+def _press_or_archive_note(text: str) -> str:
+    """報道/資料案件の soft 検出 (note 文字列を返す。type は変更しない)。
+
+    codex 2周目指摘反映: type を F にハード切替するのではなく、
+    note フィールドに「報道写真の手配も検討」とアラートを出すだけにし、
+    通常の type 判定 (A〜G) は続ける。これで:
+      - 編集者は通常の iStock 代替候補を引き続き見られる
+      - 「報道で手配する選択肢もある」と note で気づける
+      - recall を広めに取っても iStock 代替が消えない
+    """
+    if not text:
+        return ""
+    persons = [p for p in PRESS_FIGURES if p in text]
+    if persons:
+        return (
+            f"参考: 政治・国際人物『{persons[0]}』検出 — 通信社/Getty Editorial の"
+            "報道写真も並行検討してください"
+        )
+    events = [e for e in PRESS_EVENTS if e in text]
+    if events:
+        return (
+            f"参考: 歴史的事件『{events[0]}』検出 — 通信社/共同通信の資料写真も並行検討してください"
+        )
+    archives = [a for a in HISTORICAL_ARCHIVE_TERMS if a in text]
+    if archives:
+        return (
+            f"参考: 歴史図版『{archives[0]}』検出 — Wikimedia Commons の資料写真も並行検討してください"
+        )
+    return ""
+
+
+def _specific_scene_check(text: str) -> tuple[str, list[str], list[str], str] | None:
+    """選択的具体化ルール (codex 安全版)。
+
+    主題語 + 場面語の AND 条件で発火。発火したら type G を返す。
+    """
+    if not text:
+        return None
+    for subjects, contexts, query_ja, query_en, rationale in SPECIFIC_SCENE_RULES:
+        if any(s in text for s in subjects) and any(c in text for c in contexts):
+            return (
+                "G",
+                query_ja.split(),
+                query_en.split(),
+                f"具体シーン: {rationale}",
+            )
+    return None
 
 
 def _detect_type(text: str) -> tuple[str, list[str], list[str], str]:
@@ -149,15 +263,23 @@ def _detect_type(text: str) -> tuple[str, list[str], list[str], str]:
 
     Returns (type_code, ja_keywords, en_keywords, rationale).
 
-    Priority order (v8, intentionally conservative):
+    Priority order:
+      G: specific scene (主題語+場面語 AND ヒット — 安全版具体化)
       A: landmark / institution
       B: ≥2 countries + a diplomacy word
       E: industry
       D: action verb
       C: abstract concept
       (fallback): generic noun extraction → type C
+
+    報道/資料案件は type を奪わず、build_suggestion 側で note に soft フラグを立てる。
     """
     text = text or ""
+
+    # Type G: specific scene (主題語 AND 場面語)
+    scene = _specific_scene_check(text)
+    if scene is not None:
+        return scene
 
     # Type A: landmark / institution
     matches_a = [(k, v) for k, v in LANDMARKS.items() if k in text]
@@ -231,6 +353,7 @@ def build_suggestion(
     h4_text: str,
     surrounding_paragraphs: list[str] | None = None,
     lead_text: str = "",
+    article_title: str = "",
 ) -> IstockSearchSuggestion:
     """Compose context, decide type, and build a suggestion object (v8 style).
 
@@ -238,13 +361,15 @@ def build_suggestion(
       - hero: lead_text. Fallback to h4_text if no lead.
         → The hero is the article's representative image.
       - h4_*: h4_text + first 2 surrounding paragraphs (slot-local context).
-        → article-wide title is NOT used here, to avoid title-word pollution
-          across all subheadings.
+        → article-wide title is NOT used for query generation, to avoid
+          title-word pollution across all subheadings.
 
-    No mechanical "日本人 顔なし 後ろ姿 手元" suffix is appended; the v2-era
-    `_specific_subject_rule` + `_with_japanese_no_face_policy` were removed
-    because they collapsed candidates from different sections onto the same
-    image search.
+    article_title は **press soft note の検出にのみ** 使う (codex 2 周目反映):
+      - 政治家・戦争・歴史図版の固有名詞は本文中に出ないことが多く、タイトルでしか
+        判別できない場合がある。query 生成は引き続き slot-local で行うが、報道
+        ソフトフラグだけは title も含めた広い context で検出する。
+
+    No mechanical "日本人 顔なし 後ろ姿 手元" suffix is appended.
     """
     surrounding_paragraphs = surrounding_paragraphs or []
     if slot_key == "hero":
@@ -256,6 +381,11 @@ def build_suggestion(
     query_ja = " ".join(ja_words[:3]).strip() or (h4_text or "")[:20]
     query_en = " ".join(w for w in en_words[:3] if w).strip() or query_ja
 
+    # 報道/資料系のソフトフラグ (note に入れて編集者へアラート、type は変えない、
+    # iStock 代替候補は通常通り提示される)。title も含む拡張 context で検出。
+    press_context = " ".join(p for p in [context, article_title] if p)
+    press_note = _press_or_archive_note(press_context)
+
     return IstockSearchSuggestion(
         slot_key=slot_key,
         slot_label=slot_label,
@@ -266,6 +396,7 @@ def build_suggestion(
         search_url_ja=_istock_search_url(query_ja, jp=True),
         search_url_en=_istock_search_url(query_en, jp=False),
         rationale=rationale,
+        note=press_note,
     )
 
 

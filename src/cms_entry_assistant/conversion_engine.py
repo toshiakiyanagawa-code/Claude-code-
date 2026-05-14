@@ -583,6 +583,7 @@ def _build_photo_suggestions(
         h4_text=article_title or lead_text,
         surrounding_paragraphs=[],
         lead_text=lead_text,
+        article_title=article_title,
     )
     hero.page_number = 1
     suggestions.append(hero)
@@ -626,6 +627,7 @@ def _build_photo_suggestions(
             h4_text=heading,
             surrounding_paragraphs=paragraphs[:2],
             lead_text=lead_text,
+            article_title=article_title,  # press soft-flag 検出のみに使う
         )
         suggestion.page_number = page_num
         suggestions.append(suggestion)
