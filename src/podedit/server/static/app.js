@@ -1049,6 +1049,9 @@
     }
     if (dragAnchor === null) return;
     pendingDragMove = { x: e.clientX, y: e.clientY };
+    // Stamp the last actual pointer motion so the auto-scroll tick can
+    // tell "moving" from "held still" — Word/Docs style.
+    _lastSelectionPointerMoveAt = performance.now();
   });
 
   document.addEventListener('pointerup', (e) => {
@@ -1106,34 +1109,58 @@
   // Without this, drag-to-select can't pull the transcript past whatever's
   // visible — the user reported being capped around 30 seconds because
   // wordFromPoint can only see what's already painted on screen.
+  // Selection drag uses a centre-based auto-scroll (Word / Google Docs
+  // style) rather than the move-drag's 80px edge zone. Real-user KPI
+  // (2026-05-14) showed users keep their pointer near the vertical
+  // middle (y ~= innerHeight * 0.6) while dragging — they never get
+  // within 80px of the bottom edge, so the transcript never scrolled
+  // and selection stalled at ~30 sec of already-painted words. Dead
+  // zone ±60px in the centre, then velocity ramps from a BASE the
+  // instant the pointer leaves the dead zone up to MAX at the viewport
+  // edge. Auto-scroll only fires within ACTIVITY_MS of the last
+  // pointermove so a held-still pointer can't drift the page silently.
+  const SELECTION_AUTOSCROLL_DEAD_ZONE_PX = 60;
+  const SELECTION_AUTOSCROLL_MAX_VELOCITY = 24;
+  const SELECTION_AUTOSCROLL_BASE_VELOCITY = 3;
+  const SELECTION_AUTOSCROLL_ACTIVITY_MS = 500;
+  let _lastSelectionPointerMoveAt = 0;
   let _dragDebugLastEmitAt = 0;
   function dragMoveTick() {
     if (pendingDragMove && dragAnchor !== null && !moveDrag) {
       const x = pendingDragMove.x;
       const y = pendingDragMove.y;
+      const now = performance.now();
+      const recentlyMoved = (now - _lastSelectionPointerMoveAt) < SELECTION_AUTOSCROLL_ACTIVITY_MS;
+      const centerY = window.innerHeight / 2;
+      const distFromCenter = Math.abs(y - centerY);
       let velocity = 0;
-      if (y < MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
-        velocity = -((MOVE_DRAG_AUTOSCROLL_EDGE_PX - y) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
-      } else if (y > window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
-        velocity = ((y - (window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX)) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
+      if (recentlyMoved && distFromCenter > SELECTION_AUTOSCROLL_DEAD_ZONE_PX) {
+        const effectiveDist = distFromCenter - SELECTION_AUTOSCROLL_DEAD_ZONE_PX;
+        const maxDist = Math.max(1, centerY - SELECTION_AUTOSCROLL_DEAD_ZONE_PX);
+        const sign = y < centerY ? -1 : 1;
+        const fraction = Math.min(1, effectiveDist / maxDist);
+        // Start at BASE the instant we leave the dead zone, ramp up to
+        // MAX at the viewport edge. Never drops to zero again until the
+        // pointer comes back into the centre band.
+        velocity = sign * (SELECTION_AUTOSCROLL_BASE_VELOCITY
+          + fraction * (SELECTION_AUTOSCROLL_MAX_VELOCITY - SELECTION_AUTOSCROLL_BASE_VELOCITY));
       }
       const beforeTxTop = $tx.scrollTop;
       const beforeWinY = window.scrollY;
       if (velocity !== 0) scrollViewportBy(velocity);
       const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
-      // Debug telemetry: throttled to ~5Hz so the server log stays
-      // readable. Lets us see, from server-side KPI alone, where the
-      // pointer is, whether the scroller is moving, and which word (if
-      // any) we picked. Indispensable for diagnosing the 30sec wall on
-      // user environments we can't open DevTools on.
-      const now = performance.now();
-      if (now - _dragDebugLastEmitAt > 200) {
+      // Throttled diagnostic KPI: lets us see from server-side KPI alone
+      // whether auto-scroll is firing and the extent is advancing.
+      if (now - _dragDebugLastEmitAt > 250) {
         _dragDebugLastEmitAt = now;
         logKPI('ui.drag.tick_debug', {
           x, y,
           innerH: window.innerHeight,
           innerW: window.innerWidth,
+          recentlyMoved,
+          dist: distFromCenter,
+          dead_zone: SELECTION_AUTOSCROLL_DEAD_ZONE_PX,
           edge_zone: MOVE_DRAG_AUTOSCROLL_EDGE_PX,
           velocity,
           tx_top_before: beforeTxTop,
@@ -1150,9 +1177,10 @@
           paint_we: state.selectionPainted ? state.selectionPainted.we : null,
         });
       }
-      // Intentionally NOT clearing pendingDragMove: a stationary pointer
-      // at the edge must keep auto-scrolling. extendSelectionDrag is
-      // idempotent for the same extent thanks to the no-op guard.
+      // Intentionally NOT nulling pendingDragMove: a stationary pointer
+      // must keep the rAF tick running so when the user resumes moving
+      // (within ACTIVITY_MS) scroll picks back up. The "no-op for same
+      // extent" guard in extendSelectionDrag keeps per-frame work tiny.
     }
     requestAnimationFrame(dragMoveTick);
   }
