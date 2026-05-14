@@ -867,10 +867,22 @@ def _photos_tab_html(case: CaseState) -> str:
 
 
 def _candidate_cards_html(slot_key: str, hits: list[IstockSearchHit], selected: str) -> str:
+    # codex Phase 4 レビュー: 編集者向け文言と運用文言を分離。
+    # iStock 取得機能そのものが起動できないケースは「担当者に連絡」、
+    # 検索ヒット 0 件の通常ケースは「検索語を変えて」と案内する。
     if not hits:
+        if not is_available():
+            return (
+                '<p class="empty">素材候補の取得機能を起動できませんでした。'
+                'システム担当者にご連絡ください。'
+                '<br><small>(技術詳細: Playwright + Chromium が必要です。'
+                '<code>uv sync</code> と <code>uv run playwright install chromium --with-deps</code> '
+                'を実行してください)</small></p>'
+            )
         return (
-            '<p class="empty">候補が見つかりませんでした。'
-            '<code>uv run playwright install chromium --with-deps</code> 済みかご確認ください。</p>'
+            '<p class="empty">この見出しに合う素材候補が見つかりませんでした。'
+            '右側の「iStockで検索」リンクから手動で検索するか、'
+            '原稿の見出しを少し具体化して再アップロードしてください。</p>'
         )
     out: list[str] = []
     for hit in hits:
