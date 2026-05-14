@@ -151,19 +151,66 @@ TYPE_LABEL: dict[str, str] = {
 # 阻害する。代わりに通常の type 判定 (A〜G) は続け、note フィールドに「報道写真の手配も検討」
 # とソフトフラグを立てる方針にする。recall を上げても代替候補が見える。
 PRESS_FIGURES: tuple[str, ...] = (
-    "習近平", "毛沢東", "プーチン", "トランプ", "金正恩", "ゼレンスキー",
-    "岸田", "石破", "安倍", "高市", "ネタニヤフ", "バイデン",
+    "習近平", "毛沢東", "鄧小平", "江沢民", "胡錦濤", "李強", "王毅",
+    "プーチン", "トランプ", "バイデン", "オバマ", "ゼレンスキー",
+    "ネタニヤフ", "金正恩", "金正日",
+    "岸田文雄", "岸田", "石破茂", "石破", "安倍晋三", "安倍",
+    "高市早苗", "高市", "麻生太郎", "麻生", "河野太郎", "河野",
+    "小泉純一郎", "小泉進次郎", "野田佳彦", "野田", "鳩山由紀夫",
+    "菅義偉", "菅直人", "森喜朗", "中曽根康弘", "田中角栄",
+    "小池百合子", "吉村洋文", "橋下徹", "泉房穂",
+    "孫正義", "田端信太郎", "堀江貴文", "ホリエモン", "三木谷浩史", "三木谷",
+    "柳井正", "元谷外志雄", "元谷芙美子", "元谷", "ジェフ・ベゾス", "ベゾス",
+    "イーロン・マスク", "イーロンマスク", "マーク・ザッカーバーグ", "ザッカーバーグ",
+    "ビル・ゲイツ", "ゲイツ", "ウォーレン・バフェット", "バフェット",
+    "ソフトバンクG", "ソフトバンクグループ", "楽天グループ",
+    "ファーストリテイリング", "アパグループ", "アパホテル", "オープンAI", "OpenAI",
+    "村上春樹", "オードリー", "和田秀樹", "昭和天皇", "明仁上皇",
+    "天皇陛下", "上皇", "宮内庁長官",
     "ハマス", "イスラエル軍",
 )
 PRESS_EVENTS: tuple[str, ...] = (
-    "原爆", "ポツダム", "ヒロシマ", "終戦", "敗戦", "宣戦", "枢軸",
+    "原爆", "ポツダム", "ヒロシマ", "真珠湾攻撃", "真珠湾", "終戦", "敗戦",
+    "戦後", "戦後史", "宣戦", "枢軸", "太平洋戦争", "第二次世界大戦", "沖縄戦",
     "天安門事件", "ウクライナ戦争", "侵攻", "停戦合意", "国連安保理",
-    "ノーベル賞", "選挙", "総選挙", "国際裁判",
+    "首脳会談", "国葬", "ノーベル賞", "選挙", "総選挙", "国際裁判", "高考",
 )
 HISTORICAL_ARCHIVE_TERMS: tuple[str, ...] = (
-    "中世ヨーロッパ", "古文書", "古地図", "甲骨文字", "絵巻物", "肖像画",
-    "浮世絵", "錦絵", "戦国時代", "幕末", "明治維新",
+    "中世ヨーロッパ", "古文書", "古地図", "甲骨文字", "殷王朝", "殷墟",
+    "殷墟博物館", "殷代", "商王朝", "絵巻物", "肖像画", "浮世絵", "錦絵",
+    "戦国時代", "幕末", "明治維新", "宮内庁", "皇居", "一般参賀", "長和殿",
+    "戦前", "昭和史", "GHQ", "占領期", "冷戦", "日中戦争", "満州事変",
+    "関東大震災",
 )
+
+PRESS_TITLE_SUFFIXES: tuple[str, ...] = (
+    "氏", "市長", "首相", "社長", "大臣", "議員", "長官", "代表",
+    "知事", "大統領", "会長", "CEO",
+)
+PRESS_TITLE_EXCLUDED_NAME_SUFFIXES: tuple[str, ...] = (
+    "県", "府", "都", "道", "市", "区", "町", "村", "省", "庁",
+    "社", "党", "軍", "局", "部", "課", "会", "院",
+)
+
+
+def _press_title_match(text: str) -> tuple[str, str] | None:
+    """「姓名 + 肩書」らしい短い固有名を soft flag 用に拾う。"""
+    title_pattern = "|".join(re.escape(title) for title in PRESS_TITLE_SUFFIXES)
+    person_title_re = re.compile(
+        r"(?<![一-龥々ァ-ヶA-Za-z0-9])"
+        r"(?P<name>"
+        r"[一-龥々]{2,8}|[ァ-ヴー・]{2,24}|"
+        r"[A-Z][A-Za-z.'-]{1,24}(?:\s+[A-Z][A-Za-z.'-]{1,24}){0,3}"
+        r")"
+        rf"(?P<title>{title_pattern})"
+    )
+    for match in person_title_re.finditer(text):
+        name = match.group("name")
+        title = match.group("title")
+        if name.endswith(PRESS_TITLE_EXCLUDED_NAME_SUFFIXES):
+            continue
+        return name, title
+    return None
 
 
 # --- Specific scene rules (codex HIGH 提案: 安全版) ----------------------------
@@ -224,13 +271,20 @@ def _press_or_archive_note(text: str) -> str:
     persons = [p for p in PRESS_FIGURES if p in text]
     if persons:
         return (
-            f"参考: 政治・国際人物『{persons[0]}』検出 — 通信社/Getty Editorial の"
+            f"参考: 報道人物・固有名『{persons[0]}』検出 — 通信社/Getty Editorial の"
+            "報道写真も並行検討してください"
+        )
+    title_match = _press_title_match(text)
+    if title_match:
+        name, title = title_match
+        return (
+            f"参考: 肩書付き人物『{name}{title}』検出 — 通信社/Getty Editorial の"
             "報道写真も並行検討してください"
         )
     events = [e for e in PRESS_EVENTS if e in text]
     if events:
         return (
-            f"参考: 歴史的事件『{events[0]}』検出 — 通信社/共同通信の資料写真も並行検討してください"
+            f"参考: 報道・歴史トピック『{events[0]}』検出 — 通信社/共同通信の資料写真も並行検討してください"
         )
     archives = [a for a in HISTORICAL_ARCHIVE_TERMS if a in text]
     if archives:
