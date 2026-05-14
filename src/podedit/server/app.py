@@ -105,6 +105,9 @@ class ServeState:
         self.transcript_data: dict = {}
         self.session: EditSession | None = None
         self.session_lock = Lock()
+        # Snapshot operations (create/rename/delete/restore) serialise on this.
+        # Light contention only — actions are user-initiated and one-at-a-time.
+        self.snapshots_lock = Lock()
 
     def has_active(self) -> bool:
         return (
@@ -555,6 +558,179 @@ def create_app(config: ServeConfig) -> FastAPI:
         record = {"server_ts": time.time(), **event}
         _append_jsonl(state.kpi_log_path, record)
         return {"ok": True}
+
+    # ------- snapshots (named editing drafts) -------
+    # Each snapshot is a self-contained EditSession dict written to its own
+    # file. Listing rebuilds a manifest from the directory so we never carry
+    # a stale index — losing/finding a snapshot file just changes the listing.
+    SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{16}$")
+
+    def _snapshots_dir() -> Path:
+        require_active()
+        assert state.audio_path is not None and state.work_dir is not None
+        return state.work_dir / f"{state.audio_path.stem}.snapshots"
+
+    def _snapshot_path(snapshot_id: str) -> Path:
+        # Strict id check on every entry point: the id segment is appended to
+        # a file path, so an attacker-controlled value would otherwise enable
+        # ../escape. ^[a-f0-9]{16}$ matches what we generate with token_hex(8).
+        if not SNAPSHOT_ID_RE.match(snapshot_id):
+            raise HTTPException(status_code=400, detail=f"invalid snapshot id: {snapshot_id!r}")
+        return _snapshots_dir() / f"{snapshot_id}.json"
+
+    def _load_snapshot_payload(path: Path) -> dict:
+        # Centralised reader: corrupted or unreadable snapshot files surface
+        # as 400, never as the default FastAPI 500. Caller decides whether to
+        # convert NotFound paths to 404 separately.
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=400, detail=f"snapshot file unreadable: {e}") from e
+
+    def _summarise_snapshot(payload: dict, fallback_id: str | None = None) -> dict:
+        # Tolerate older or hand-written files: surface what we can find. The
+        # id we use is the one we trust (the filename); payload.id is only
+        # advisory and may be missing/wrong on hand-edited files.
+        return {
+            "id": fallback_id or payload.get("id"),
+            "name": payload.get("name") or "(no name)",
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+            "ops_count": len((payload.get("session") or {}).get("ops") or []),
+        }
+
+    @app.get("/api/snapshots")
+    def list_snapshots() -> dict:
+        # Listing intentionally tolerates broken individual files: a single
+        # corrupted entry must not blank the whole picker, since the user
+        # may need the rest of the list precisely to recover. Single-record
+        # endpoints (GET/PATCH/restore) still return 400 on the same input.
+        snaps_dir = _snapshots_dir()
+        items: list[dict] = []
+        if snaps_dir.exists():
+            for f in sorted(snaps_dir.glob("*.json")):
+                file_id = f.stem
+                # Only honour files whose name matches our id format. Hand-
+                # dropped files with arbitrary names don't appear in the UI.
+                if not SNAPSHOT_ID_RE.match(file_id):
+                    continue
+                try:
+                    payload = json.loads(f.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                # Trust the filename, not the payload, for the id field.
+                items.append(_summarise_snapshot(payload, fallback_id=file_id))
+        # Newest first so the most recent draft is at the top of the picker.
+        items.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+        return {"snapshots": items}
+
+    @app.post("/api/snapshots")
+    def create_snapshot(body: dict) -> dict:
+        require_active()
+        name = (body or {}).get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="name is required")
+        name = name.strip()[:200]
+        snaps_dir = _snapshots_dir()
+        snapshot_id = secrets.token_hex(8)
+        now = time.time()
+        with state.snapshots_lock:
+            snaps_dir.mkdir(parents=True, exist_ok=True)
+            with state.session_lock:
+                assert state.session is not None
+                payload = {
+                    "id": snapshot_id,
+                    "name": name,
+                    "created_at": now,
+                    "updated_at": now,
+                    "session": state.session.to_dict(),
+                }
+            _atomic_write_text(
+                snaps_dir / f"{snapshot_id}.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        return {"snapshot": _summarise_snapshot(payload, fallback_id=snapshot_id)}
+
+    @app.get("/api/snapshots/{snapshot_id}")
+    def get_snapshot(snapshot_id: str) -> dict:
+        path = _snapshot_path(snapshot_id)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return _load_snapshot_payload(path)
+
+    @app.patch("/api/snapshots/{snapshot_id}")
+    def rename_snapshot(snapshot_id: str, body: dict) -> dict:
+        path = _snapshot_path(snapshot_id)
+        name = (body or {}).get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="name is required")
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            payload = _load_snapshot_payload(path)
+            payload["name"] = name.strip()[:200]
+            payload["updated_at"] = time.time()
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return {"snapshot": _summarise_snapshot(payload, fallback_id=snapshot_id)}
+
+    @app.delete("/api/snapshots/{snapshot_id}")
+    def delete_snapshot(snapshot_id: str) -> dict:
+        path = _snapshot_path(snapshot_id)
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            path.unlink()
+        return {"ok": True}
+
+    @app.post("/api/snapshots/{snapshot_id}/restore")
+    def restore_snapshot(snapshot_id: str) -> dict:
+        # Loads the snapshot's ops into the current session (the autosave
+        # file). The UI is expected to re-render after this call. We don't
+        # auto-backup the current session — the user can save a new
+        # snapshot first if they want to keep it.
+        #
+        # Lock order: snapshots_lock first (read+validate the snapshot file
+        # without an inner session_lock), then release before grabbing
+        # session_lock for the autosave write. All other code paths only
+        # take one of the two — keeping these two phases disjoint avoids
+        # any AB/BA ordering surprises later on.
+        path = _snapshot_path(snapshot_id)
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            payload = _load_snapshot_payload(path)
+        session_dict = payload.get("session")
+        if not isinstance(session_dict, dict):
+            raise HTTPException(status_code=400, detail="snapshot missing session payload")
+        try:
+            restored = EditSession.from_dict(session_dict)
+        except (KeyError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid session in snapshot: {e}") from e
+        with state.session_lock:
+            assert state.session_path is not None
+            # Source-audio sha guard: restoring a snapshot taken from a
+            # different audio file would silently align ops to the wrong
+            # timeline. Strict — if either side is missing the sha we
+            # can't prove safety, so we refuse rather than fail-open.
+            expected_src = (state.transcript_data or {}).get("source_audio") or {}
+            expected_sha = expected_src.get("sha256")
+            actual_sha = restored.source_audio.sha256
+            if not expected_sha or not actual_sha:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cannot verify snapshot source_audio sha256 (missing on either snapshot or served audio)",
+                )
+            if expected_sha != actual_sha:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"snapshot source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
+                )
+            state.session = restored
+            _atomic_write_text(
+                state.session_path,
+                json.dumps(state.session.to_dict(), ensure_ascii=False, indent=2),
+            )
+        return {"ok": True, "ops": len(restored.ops), "name": payload.get("name")}
 
     # ------- preview render (W5) -------
     # Renders the current session to a wav using the W5 PCM pipeline. Cached by

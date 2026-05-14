@@ -3294,6 +3294,190 @@
   if ($btnAddFillers) $btnAddFillers.addEventListener('click', addRecommendedFillers);
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
+
+  // ------- snapshots (named editing drafts) -------
+  const $btnSnapshots = $('btn-snapshots');
+  const $snapshotsModal = $('snapshots-modal');
+  const $btnSnapshotsClose = $('btn-snapshots-close');
+  const $snapshotsList = $('snapshots-list');
+  const $snapshotsStatus = $('snapshots-status');
+  const $snapshotNameInput = $('snapshot-name-input');
+  const $btnSnapshotSave = $('btn-snapshot-save');
+
+  function setSnapshotsStatus(msg, isError) {
+    if (!$snapshotsStatus) return;
+    $snapshotsStatus.textContent = msg || '';
+    $snapshotsStatus.classList.toggle('error', !!isError);
+  }
+  function fmtSnapshotTs(ts) {
+    if (!ts) return '—';
+    try {
+      const d = new Date(ts * 1000);
+      return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    } catch (_) { return '—'; }
+  }
+  async function refreshSnapshotsList() {
+    setSnapshotsStatus('読み込み中…');
+    $snapshotsList.innerHTML = '';
+    try {
+      const r = await fetch('/api/snapshots');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const items = data.snapshots || [];
+      if (items.length === 0) {
+        setSnapshotsStatus('まだ保存されたスナップショットはありません。上の入力欄で名前を付けて保存してください。');
+        return;
+      }
+      setSnapshotsStatus(`${items.length} 件`);
+      for (const s of items) {
+        const li = document.createElement('li');
+        const name = document.createElement('span');
+        name.className = 'snapshot-name';
+        name.textContent = s.name || '(no name)';
+        name.title = `${s.ops_count} ops · ${fmtSnapshotTs(s.updated_at)}`;
+        const meta = document.createElement('span');
+        meta.className = 'snapshot-meta';
+        meta.textContent = `${s.ops_count} ops · ${fmtSnapshotTs(s.updated_at)}`;
+        const btnLoad = document.createElement('button');
+        btnLoad.type = 'button';
+        btnLoad.textContent = '読み込み';
+        btnLoad.title = 'この編集状態を現在の編集に上書きする';
+        btnLoad.addEventListener('click', () => restoreSnapshot(s.id, s.name));
+        const btnRename = document.createElement('button');
+        btnRename.type = 'button';
+        btnRename.textContent = '名前変更';
+        btnRename.addEventListener('click', () => renameSnapshot(s.id, s.name));
+        const btnDelete = document.createElement('button');
+        btnDelete.type = 'button';
+        btnDelete.className = 'danger';
+        btnDelete.textContent = '削除';
+        btnDelete.addEventListener('click', () => deleteSnapshot(s.id, s.name));
+        li.append(name, meta, btnLoad, btnRename, btnDelete);
+        $snapshotsList.appendChild(li);
+      }
+    } catch (e) {
+      setSnapshotsStatus(`一覧の取得に失敗: ${e.message}`, true);
+    }
+  }
+  async function saveCurrentAsSnapshot() {
+    const name = ($snapshotNameInput.value || '').trim();
+    if (!name) {
+      $snapshotNameInput.focus();
+      setSnapshotsStatus('名前を入力してください。', true);
+      return;
+    }
+    // Flush any pending autosave first so the snapshot really matches what
+    // the user sees on screen. flushSave() catches errors internally and
+    // routes them through setSaveStatus, so we detect failure via the
+    // saveDirty flag instead — if it's still dirty after the flush, the
+    // autosave POST is broken and we must not snapshot stale on-disk state.
+    await flushSave();
+    if (state.saveDirty) {
+      setSnapshotsStatus('自動保存がエラー中のためスナップショットを作れません。右上の save-status を確認してください。', true);
+      return;
+    }
+    $btnSnapshotSave.disabled = true;
+    try {
+      const r = await fetch('/api/snapshots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      $snapshotNameInput.value = '';
+      logKPI('ui.snapshot.save', { name });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnSnapshotSave.disabled = false;
+    }
+  }
+  async function restoreSnapshot(id, name) {
+    if (!confirm(`「${name}」を読み込みますか?\n現在の編集は上書きされます (失いたくない場合は先に保存してください)。`)) return;
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.restore', { id, name });
+      hideSnapshotsModal();
+      await loadActiveAndRender();
+    } catch (e) {
+      setSnapshotsStatus(`読み込みに失敗: ${e.message}`, true);
+    }
+  }
+  async function renameSnapshot(id, oldName) {
+    const next = prompt('新しい名前を入力してください:', oldName || '');
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (!trimmed) {
+      setSnapshotsStatus('名前は空にできません。', true);
+      return;
+    }
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.rename', { id, name: trimmed });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`名前変更に失敗: ${e.message}`, true);
+    }
+  }
+  async function deleteSnapshot(id, name) {
+    if (!confirm(`「${name}」を削除しますか? この操作は取り消せません。`)) return;
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.delete', { id });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`削除に失敗: ${e.message}`, true);
+    }
+  }
+  function showSnapshotsModal() {
+    if (!$snapshotsModal) return;
+    $snapshotsModal.hidden = false;
+    $snapshotNameInput.value = '';
+    refreshSnapshotsList();
+    setTimeout(() => $snapshotNameInput.focus(), 50);
+    logKPI('ui.snapshot.modal_open');
+  }
+  function hideSnapshotsModal() {
+    if (!$snapshotsModal) return;
+    $snapshotsModal.hidden = true;
+  }
+  if ($btnSnapshots) $btnSnapshots.addEventListener('click', showSnapshotsModal);
+  if ($btnSnapshotsClose) $btnSnapshotsClose.addEventListener('click', hideSnapshotsModal);
+  if ($snapshotsModal) {
+    $snapshotsModal.addEventListener('click', (ev) => {
+      if (ev.target === $snapshotsModal) hideSnapshotsModal();
+    });
+  }
+  if ($btnSnapshotSave) $btnSnapshotSave.addEventListener('click', saveCurrentAsSnapshot);
+  if ($snapshotNameInput) {
+    $snapshotNameInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); saveCurrentAsSnapshot(); }
+    });
+  }
+  // Esc to close the snapshots modal alongside the library one.
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $snapshotsModal && !$snapshotsModal.hidden) hideSnapshotsModal();
+  });
   if ($btnLibraryUpload && $libraryFileInput) {
     $btnLibraryUpload.addEventListener('click', () => {
       logKPI('ui.library.upload.button_clicked');

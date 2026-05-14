@@ -34,7 +34,8 @@
   <button id="btn-paste-before" disabled title="Paste clipboard before marked word">Paste Before</button>
   <button id="btn-paste-after" disabled title="Paste clipboard after marked word (⌘V)">Paste After <kbd>⌘V</kbd></button>
   <button id="btn-audition" title="Render preview (sample-precise + crossfade + LUFS)">Audition</button>
-  <button id="btn-export" title="Render the edit and download it (E)">Export <kbd>E</kbd></button>
+  <button id="btn-snapshots" title="編集状態を名前付きで保存 / 過去の保存に戻す">スナップショット</button>
+  <button id="btn-export" class="btn-primary" title="編集済みの音源をレンダリングしてダウンロード (E)">編集済み音源をダウンロード <kbd>E</kbd></button>
   <select id="export-format" title="Export format" aria-label="Export format">
     <option value="mp3">mp3</option>
     <option value="wav">wav</option>
@@ -84,6 +85,28 @@
         スキャン元: <code id="library-dir-hint">—</code> / 現在のパス:
         <code id="library-current-path">—</code>。各行の「文字起こし」ボタンは上のプリセットを使用します。
         CLI <code>podedit transcribe</code> でも文字起こしを生成でき、このピッカーに表示されます。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Snapshot modal: list/save/load/rename/delete named editing drafts. -->
+<div id="snapshots-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="snapshots-title">
+    <div class="modal-header">
+      <h2 id="snapshots-title">スナップショット</h2>
+      <button id="btn-snapshots-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="snapshots-create-row">
+        <input id="snapshot-name-input" type="text" maxlength="200" placeholder="例: ドラフト1 / 本番候補" aria-label="スナップショット名" />
+        <button id="btn-snapshot-save" type="button" title="現在の編集状態をこの名前で保存">この名前で保存</button>
+      </div>
+      <div id="snapshots-status" class="status">読み込み中…</div>
+      <ul id="snapshots-list" class="snapshots-list"></ul>
+      <div class="library-hint">
+        スナップショットは <code id="snapshots-dir-hint">work_dir/{stem}.snapshots/</code> に保存されます。
+        「読み込み」で現在の編集を上書きします(失いたくない場合は先に名前を付けて保存してください)。
       </div>
     </div>
   </div>

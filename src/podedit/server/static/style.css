@@ -386,6 +386,39 @@ main {
   background: #2b4663; color: white; border-color: #4a7ab8;
 }
 .toolbar-toggle[data-active="true"] #follow-state { color: #b9d8ff; }
+.toolbar .btn-primary {
+  background: #2b6cb0; color: white; border-color: #3b82c4; font-weight: 600;
+}
+.toolbar .btn-primary:hover { background: #3578bf; }
+.toolbar .btn-primary:disabled { background: #1f3a55; color: #7a8aa0; }
+
+.snapshots-create-row {
+  display: flex; gap: 8px; padding: 4px 0 10px;
+  border-bottom: 1px solid var(--border); margin-bottom: 10px;
+}
+.snapshots-create-row input {
+  flex: 1; padding: 6px 10px; background: var(--input-bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; font-size: 13px;
+}
+.snapshots-create-row input:focus { outline: none; border-color: var(--accent); }
+.snapshots-list { list-style: none; padding: 0; margin: 0; }
+.snapshots-list li {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 4px; margin-bottom: 4px;
+}
+.snapshots-list li:hover { background: var(--hover-bg); border-color: var(--border); }
+.snapshots-list .snapshot-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 600;
+}
+.snapshots-list .snapshot-meta {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  margin-right: 8px;
+}
+.snapshots-list button {
+  font-size: 11px; padding: 3px 8px;
+}
+.snapshots-list .danger { color: #ff8080; }
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }
