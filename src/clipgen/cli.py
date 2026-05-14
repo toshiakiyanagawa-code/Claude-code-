@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -321,14 +322,140 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config_check(args) -> int:
+def _first_output_line(result: subprocess.CompletedProcess) -> str:
+    text = (result.stdout or result.stderr or "").strip()
+    if not text:
+        return "出力なし"
+    return text.splitlines()[0].strip()
+
+
+def _run_version_command(label: str, command: list[str]) -> tuple[str | None, str | None]:
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, f"{label} が見つかりません。PATH または仮想環境を確認してください。"
+    except subprocess.TimeoutExpired:
+        return None, f"{label} のバージョン取得が 10 秒でタイムアウトしました。"
+    except OSError as exc:
+        return None, f"{label} のバージョン取得に失敗しました: {exc}"
+
+    line = _first_output_line(result)
+    if result.returncode != 0:
+        return None, f"{label} のバージョン取得に失敗しました (終了コード {result.returncode}): {line}"
+    return line, None
+
+
+def _check_runtime_versions() -> tuple[list[str], list[str]]:
+    infos: list[str] = []
+    errors: list[str] = []
+    commands = [
+        ("python", [sys.executable, "--version"]),
+        ("ffmpeg", ["ffmpeg", "-version"]),
+        ("yt-dlp", ["yt-dlp", "--version"]),
+    ]
+
+    for label, command in commands:
+        version, error = _run_version_command(label, command)
+        if error is not None:
+            errors.append(error)
+        else:
+            infos.append(f"{label} バージョン: {version}")
+
+    return infos, errors
+
+
+def _check_job_dir(job_dir: str | None) -> tuple[list[str], list[str], list[str]]:
+    infos: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    if not job_dir:
+        return infos, warnings, errors
+
+    root = Path(job_dir)
+    if not root.exists():
+        errors.append(f"ジョブディレクトリが見つかりません: {root}")
+        return infos, warnings, errors
+    if not root.is_dir():
+        errors.append(f"ジョブディレクトリではありません: {root}")
+        return infos, warnings, errors
+
+    source_mp4 = root / "source.mp4"
+    if not source_mp4.exists():
+        errors.append(f"source.mp4 が見つかりません: {source_mp4}")
+    elif not source_mp4.is_file():
+        errors.append(f"source.mp4 が通常ファイルではありません: {source_mp4}")
+    else:
+        try:
+            size = source_mp4.stat().st_size
+        except OSError as exc:
+            errors.append(f"source.mp4 のサイズ確認に失敗しました: {exc}")
+        else:
+            mb = size / (1024 * 1024)
+            if size <= 0:
+                errors.append(f"source.mp4 が空です: {source_mp4}")
+            elif size < 100 * 1024 * 1024:
+                warnings.append(
+                    f"source.mp4 のサイズが小さい可能性 (要 100MB 以上、実測 {mb:.1f}MB): {source_mp4}"
+                )
+            else:
+                infos.append(f"source.mp4 を確認しました: {source_mp4} ({mb:.1f}MB)")
+
+    source_srt = root / "source.ja.srt"
+    if not source_srt.exists():
+        errors.append(f"source.ja.srt が見つかりません: {source_srt}")
+    elif not source_srt.is_file():
+        errors.append(f"source.ja.srt が通常ファイルではありません: {source_srt}")
+    else:
+        try:
+            srt_text = source_srt.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            errors.append(f"source.ja.srt を UTF-8 として読めません: {exc}")
+        except OSError as exc:
+            errors.append(f"source.ja.srt の読み込みに失敗しました: {exc}")
+        else:
+            try:
+                cues = parse_srt(srt_text)
+            except Exception as exc:
+                errors.append(f"source.ja.srt の SRT 解析に失敗しました: {exc}")
+            else:
+                if not cues:
+                    errors.append(f"source.ja.srt を解析できましたが字幕区間が 0 件です: {source_srt}")
+                else:
+                    infos.append(f"source.ja.srt を解析しました: {len(cues)} 区間")
+
+    return infos, warnings, errors
+
+
+def cmd_config_check(args: argparse.Namespace) -> int:
     from .config_check import run_config_check
 
     warnings, errors = run_config_check()
+
+    infos, version_errors = _check_runtime_versions()
+    errors.extend(version_errors)
+
+    job_infos, job_warnings, job_errors = _check_job_dir(args.job_dir)
+    infos.extend(job_infos)
+    warnings.extend(job_warnings)
+    errors.extend(job_errors)
+
+    for info in infos:
+        print(f"情報: {info}")
     for w in warnings:
-        print(f"WARNING: {w}")
+        print(f"警告: {w}", file=sys.stderr)
     for e in errors:
-        print(f"ERROR: {e}")
+        print(f"エラー: {e}", file=sys.stderr)
+
+    if not warnings and not errors:
+        print("情報: 設定検証は正常に完了しました。")
+
     return 1 if errors else 0
 
 
@@ -556,6 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     cc = sub.add_parser("config-check", help="設定ファイル・環境変数・出力先を検証")
+    cc.add_argument("--job-dir", help="source.mp4/source.ja.srt を検証するジョブディレクトリ")
     cc.set_defaults(func=cmd_config_check)
 
     cp = sub.add_parser("compliance-check", help="削除依頼/権利リストで候補を再フィルタ")

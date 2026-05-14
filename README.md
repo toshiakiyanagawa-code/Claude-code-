@@ -257,6 +257,22 @@ benefit most from freshness (library, transcribe status, audio file) explicitly 
 in too — so a hard refresh reliably pulls the latest UI bundle, important on
 Codespaces-forwarded ports where edge caches can sit between you and the dev server.
 
+## clipgen (政治系切り抜き自動生成)
+
+`src/clipgen/` 配下の Python パッケージ。許諾チェック → SRT からハイライト検出 → タイトル候補生成 → yt-dlp + ffmpeg コマンド生成までを CLI で実行する。詳細は [docs/clipgen/development_plan.md](docs/clipgen/development_plan.md)。
+
+### テスト版 A1 の実行手順
+
+編集者がローカル PC と Codespace を組み合わせて使う 2 ステップ方式。手順書: [output/test_a1/RUNBOOK.md](output/test_a1/RUNBOOK.md)。
+
+事前検証コマンド:
+
+```bash
+clipgen config-check --job-dir output/test_a1/extract/<VIDEO_ID>_long
+```
+
+`ffmpeg` / `yt-dlp` / `python` の存在、`source.mp4` のサイズ、`source.ja.srt` の SRT パース成否を日本語で表示する。
+
 ## Roadmap
 
 - **W1 ✅** Foundation — ASR PoC + bench harness

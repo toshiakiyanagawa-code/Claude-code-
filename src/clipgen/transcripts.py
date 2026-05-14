@@ -2,71 +2,122 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from importlib import import_module
+from typing import Any
 
 from .highlights import Cue
+
+DEFAULT_LANGUAGES: tuple[str, ...] = ("ja", "ja-JP", "en")
+
+_TRANSCRIPT_ERROR_NAMES = (
+    "NoTranscriptFound",
+    "TranscriptsDisabled",
+    "VideoUnavailable",
+    "CouldNotRetrieveTranscript",
+    "YouTubeRequestFailed",
+    "IpBlocked",
+    "RequestBlocked",
+    "AgeRestricted",
+    "InvalidVideoId",
+    "VideoUnplayable",
+    "TooManyRequests",
+    "NotTranslatable",
+    "TranslationLanguageNotAvailable",
+)
+
+
+def _load_transcript_error_types() -> tuple[type[BaseException], ...]:
+    try:
+        errors_mod = import_module("youtube_transcript_api._errors")
+    except Exception:
+        return ()
+
+    error_types: list[type[BaseException]] = []
+    for name in _TRANSCRIPT_ERROR_NAMES:
+        exc = getattr(errors_mod, name, None)
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            error_types.append(exc)
+    return tuple(error_types)
+
+
+def _snippet_value(snippet: Any, name: str) -> Any:
+    if isinstance(snippet, dict):
+        return snippet.get(name)
+    return getattr(snippet, name)
 
 
 def fetch_youtube_transcript(
     video_id: str,
-    *,
-    languages: tuple[str, ...] = ("ja", "ja-JP", "en"),
+    languages: Iterable[str] | None = DEFAULT_LANGUAGES,
 ) -> list[Cue]:
-    """Fetch a YouTube transcript and normalize it to Cue objects.
+    """Fetch a YouTube transcript and convert it to highlight cues.
 
-    Returns an empty list when transcripts are unavailable so callers can
-    fall back to non-transcript behavior.
+    youtube-transcript-api v1 returns a FetchedTranscript object from
+    YouTubeTranscriptApi().fetch(...). Its caption rows live in
+    FetchedTranscript.snippets and expose .start, .duration and .text.
+    Network/IP/transcript availability failures are treated as "no transcript".
     """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api._errors import (
-            NoTranscriptFound,
-            TranscriptsDisabled,
-            VideoUnavailable,
-        )
-    except ImportError:
-        return []
-
-    try:
-        rows = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
-    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
-        return []
     except Exception:
         return []
 
+    language_list = list(languages) if languages is not None else list(DEFAULT_LANGUAGES)
+    error_types = _load_transcript_error_types()
+
+    try:
+        fetched = YouTubeTranscriptApi().fetch(video_id, languages=language_list)
+    except Exception as exc:
+        if not error_types or isinstance(exc, error_types):
+            return []
+        raise
+
+    snippets = getattr(fetched, "snippets", None)
+    if snippets is None:
+        return []
+
     cues: list[Cue] = []
-    for row in rows:
+    for snippet in snippets:
         try:
-            start = float(row["start"])
-            duration = float(row.get("duration", 0.0))
-            text = str(row.get("text", "")).strip()
-        except (TypeError, ValueError, KeyError):
+            start = float(_snippet_value(snippet, "start"))
+            duration = float(_snippet_value(snippet, "duration"))
+            text_value = _snippet_value(snippet, "text")
+        except (AttributeError, TypeError, ValueError):
             continue
+
+        if duration < 0 or text_value is None:
+            continue
+
+        text = str(text_value).replace("\r\n", "\n").replace("\r", "\n").strip()
         if not text:
             continue
-        cues.append(Cue(start_sec=start, end_sec=start + max(duration, 0.0), text=text))
+
+        cues.append(Cue(start_sec=start, end_sec=start + duration, text=text))
+
     return cues
 
 
-def _format_timestamp(seconds: float) -> str:
-    total_ms = max(int(round(seconds * 1000)), 0)
+def _format_srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
     hours, rem = divmod(total_ms, 3_600_000)
     minutes, rem = divmod(rem, 60_000)
     secs, millis = divmod(rem, 1000)
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 
-def transcript_to_srt(cues: Iterable[Cue]) -> str:
-    """Convert cues to standard numbered SRT text."""
+def transcript_to_srt(cues: list[Cue]) -> str:
     blocks: list[str] = []
     for i, cue in enumerate(cues, start=1):
-        text = cue.text.replace("\r\n", "\n").replace("\r", "\n").strip()
         blocks.append(
             "\n".join(
                 [
                     str(i),
-                    f"{_format_timestamp(cue.start_sec)} --> {_format_timestamp(cue.end_sec)}",
-                    text,
+                    f"{_format_srt_timestamp(cue.start_sec)} --> {_format_srt_timestamp(cue.end_sec)}",
+                    str(cue.text),
                 ]
             )
         )
     return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+__all__ = ["fetch_youtube_transcript", "transcript_to_srt"]

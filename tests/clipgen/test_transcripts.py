@@ -3,11 +3,17 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 from clipgen.highlights import Cue, parse_srt
 from clipgen.transcripts import fetch_youtube_transcript, transcript_to_srt
 
 
-def _install_fake_youtube_api(monkeypatch, *, rows=None, exc=None):
+def _snippet(start, duration, text):
+    return types.SimpleNamespace(start=start, duration=duration, text=text)
+
+
+def _install_fake_youtube_api(monkeypatch, *, snippets=None, exc_name=None, on_fetch=None):
     api_mod = types.ModuleType("youtube_transcript_api")
     errors_mod = types.ModuleType("youtube_transcript_api._errors")
 
@@ -20,16 +26,39 @@ def _install_fake_youtube_api(monkeypatch, *, rows=None, exc=None):
     class VideoUnavailable(Exception):
         pass
 
-    class YouTubeTranscriptApi:
-        @staticmethod
-        def get_transcript(video_id, languages):
-            if exc is not None:
-                raise exc
-            return rows
+    class YouTubeRequestFailed(Exception):
+        pass
 
-    errors_mod.NoTranscriptFound = NoTranscriptFound
-    errors_mod.TranscriptsDisabled = TranscriptsDisabled
-    errors_mod.VideoUnavailable = VideoUnavailable
+    class IpBlocked(Exception):
+        pass
+
+    class RequestBlocked(Exception):
+        pass
+
+    error_classes = {
+        "NoTranscriptFound": NoTranscriptFound,
+        "TranscriptsDisabled": TranscriptsDisabled,
+        "VideoUnavailable": VideoUnavailable,
+        "YouTubeRequestFailed": YouTubeRequestFailed,
+        "IpBlocked": IpBlocked,
+        "RequestBlocked": RequestBlocked,
+    }
+
+    for name, cls in error_classes.items():
+        setattr(errors_mod, name, cls)
+
+    class FetchedTranscript:
+        def __init__(self, fetched_snippets):
+            self.snippets = list(fetched_snippets or [])
+
+    class YouTubeTranscriptApi:
+        def fetch(self, video_id, languages):
+            if on_fetch is not None:
+                on_fetch(video_id, languages)
+            if exc_name is not None:
+                raise error_classes[exc_name]()
+            return FetchedTranscript(snippets)
+
     api_mod.YouTubeTranscriptApi = YouTubeTranscriptApi
 
     monkeypatch.setitem(sys.modules, "youtube_transcript_api", api_mod)
@@ -40,9 +69,9 @@ def _install_fake_youtube_api(monkeypatch, *, rows=None, exc=None):
 def test_fetch_youtube_transcript_returns_cues(monkeypatch):
     _install_fake_youtube_api(
         monkeypatch,
-        rows=[
-            {"start": 1.2, "duration": 2.3, "text": "こんにちは"},
-            {"start": 4.0, "duration": 1.0, "text": "次の字幕"},
+        snippets=[
+            _snippet(1.2, 2.3, "こんにちは"),
+            _snippet(4.0, 1.0, "次の字幕"),
         ],
     )
 
@@ -57,59 +86,46 @@ def test_fetch_youtube_transcript_returns_cues(monkeypatch):
 def test_fetch_youtube_transcript_uses_requested_languages(monkeypatch):
     seen = {}
 
-    api_mod = types.ModuleType("youtube_transcript_api")
-    errors_mod = types.ModuleType("youtube_transcript_api._errors")
+    def on_fetch(video_id, languages):
+        seen["video_id"] = video_id
+        seen["languages"] = languages
 
-    class NoTranscriptFound(Exception):
-        pass
-
-    class TranscriptsDisabled(Exception):
-        pass
-
-    class VideoUnavailable(Exception):
-        pass
-
-    class YouTubeTranscriptApi:
-        @staticmethod
-        def get_transcript(video_id, languages):
-            seen["video_id"] = video_id
-            seen["languages"] = languages
-            return [{"start": 0, "duration": 1, "text": "hello"}]
-
-    errors_mod.NoTranscriptFound = NoTranscriptFound
-    errors_mod.TranscriptsDisabled = TranscriptsDisabled
-    errors_mod.VideoUnavailable = VideoUnavailable
-    api_mod.YouTubeTranscriptApi = YouTubeTranscriptApi
-    monkeypatch.setitem(sys.modules, "youtube_transcript_api", api_mod)
-    monkeypatch.setitem(sys.modules, "youtube_transcript_api._errors", errors_mod)
+    _install_fake_youtube_api(
+        monkeypatch,
+        snippets=[_snippet(0, 1, "hello")],
+        on_fetch=on_fetch,
+    )
 
     fetch_youtube_transcript("abc", languages=("en", "ja"))
 
     assert seen == {"video_id": "abc", "languages": ["en", "ja"]}
 
 
-def test_fetch_youtube_transcript_returns_empty_when_transcripts_disabled(monkeypatch):
-    errors_mod = _install_fake_youtube_api(monkeypatch, rows=[])
-    _install_fake_youtube_api(monkeypatch, exc=errors_mod.TranscriptsDisabled())
+@pytest.mark.parametrize(
+    "exc_name",
+    [
+        "TranscriptsDisabled",
+        "NoTranscriptFound",
+        "VideoUnavailable",
+        "YouTubeRequestFailed",
+        "IpBlocked",
+        "RequestBlocked",
+    ],
+)
+def test_fetch_youtube_transcript_returns_empty_for_youtube_failures(monkeypatch, exc_name):
+    _install_fake_youtube_api(monkeypatch, exc_name=exc_name)
 
     assert fetch_youtube_transcript("video123") == []
 
 
-def test_fetch_youtube_transcript_returns_empty_when_no_transcript(monkeypatch):
-    errors_mod = _install_fake_youtube_api(monkeypatch, rows=[])
-    _install_fake_youtube_api(monkeypatch, exc=errors_mod.NoTranscriptFound())
-
-    assert fetch_youtube_transcript("video123") == []
-
-
-def test_fetch_youtube_transcript_skips_invalid_or_empty_rows(monkeypatch):
+def test_fetch_youtube_transcript_skips_invalid_or_empty_snippets(monkeypatch):
     _install_fake_youtube_api(
         monkeypatch,
-        rows=[
-            {"start": 0, "duration": 1, "text": "ok"},
-            {"start": "bad", "duration": 1, "text": "skip"},
-            {"start": 2, "duration": 1, "text": "   "},
-            {"duration": 1, "text": "skip"},
+        snippets=[
+            _snippet(0, 1, "ok"),
+            _snippet("bad", 1, "skip"),
+            _snippet(2, 1, "   "),
+            types.SimpleNamespace(duration=1, text="skip"),
         ],
     )
 
