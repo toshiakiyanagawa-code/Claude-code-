@@ -120,6 +120,10 @@
 
 ---
 
+### 測定方法
+
+ASR の速度・精度は `eval/asr/<set_name>/` に `audio.{wav,mp3,m4a}`、`reference.transcript.json`、`meta.json` を置き、`uv run podedit asr-eval <set_name> --model small --beam-size 1` で測定する。実行結果は `predicted.transcript.json` と `runs/<run_id>.json` に保存され、wall time、RTF、CER、glossary recall を比較できる。編集者の手戻り量は `.podedit/work/<audio>.kpi.jsonl` に対して `uv run podedit kpi-summary .podedit/work/<audio>.kpi.jsonl --audio-duration-sec <sec>` を実行し、主 KPI の correction clicks と時間音源あたりの値で追跡する。
+
 ## 4. 推奨ロードマップ(週単位)
 
 | 週 | やること |

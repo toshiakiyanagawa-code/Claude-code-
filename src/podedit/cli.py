@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -12,12 +13,30 @@ from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
 from .asr import ASRConfig, resolve_device, transcribe
+from .asr_eval import (
+    compute_cer,
+    compute_glossary_recall,
+    find_eval_audio,
+    kpi_summary_path,
+    read_json,
+    summarize_kpi_jsonl,
+    transcript_to_dict,
+    transcript_to_text,
+    write_json,
+)
 from .audio import AudioProbeError, FFmpegMissingError, probe, to_wav_16k_mono
 from .bench import measure
 from .edit import EditSession, compile_timeline, sha256_of_file
 from .render import RenderError, render_cuts, render_segments
 
 console = Console()
+
+
+ASR_EVAL_PRESETS = {
+    "fast": {"model": "tiny", "beam_size": 1},
+    "balanced": {"model": "small", "beam_size": 1},
+    "quality": {"model": "large-v3-turbo", "beam_size": 5},
+}
 
 
 def _browser_url(host: str, port: int) -> str:
@@ -35,6 +54,212 @@ def _browser_url(host: str, port: int) -> str:
 @click.group()
 def cli() -> None:
     """podedit — transcript-driven podcast editor (local-first)."""
+
+
+@cli.command("asr-eval")
+@click.argument("set_name")
+@click.option("--model", default=None,
+              help="faster-whisper model id (default: ASRConfig.model)")
+@click.option("--beam-size", default=None, type=int,
+              help="Beam size (default: ASRConfig.beam_size)")
+@click.option("--preset", default=None,
+              type=click.Choice(["fast", "balanced", "quality"]),
+              help="Preset defaults for model/beam-size")
+@click.option("--out-dir", type=click.Path(path_type=Path), default=None,
+              help="Output directory for predicted transcript and run reports")
+@click.option("--initial-prompt", default=None)
+@click.option("--hotwords", default=None)
+@click.option("--no-vad", is_flag=True, default=False,
+              help="Disable VAD filter")
+def asr_eval_cmd(
+    set_name: str,
+    model: str | None,
+    beam_size: int | None,
+    preset: str | None,
+    out_dir: Path | None,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    no_vad: bool,
+) -> None:
+    """Run ASR on eval/asr/<set_name> and write accuracy/speed metrics."""
+    base_cfg = ASRConfig()
+    cfg_values = {
+        "model": base_cfg.model,
+        "beam_size": base_cfg.beam_size,
+    }
+    if preset is not None:
+        cfg_values.update(ASR_EVAL_PRESETS[preset])
+    if model is not None:
+        cfg_values["model"] = model
+    if beam_size is not None:
+        cfg_values["beam_size"] = beam_size
+
+    cfg = ASRConfig(
+        model=cfg_values["model"],
+        beam_size=cfg_values["beam_size"],
+        vad_filter=not no_vad,
+        initial_prompt=initial_prompt,
+        hotwords=hotwords,
+    )
+
+    set_dir = Path("eval/asr") / set_name
+    if not set_dir.exists():
+        _fatal(f"Evaluation set not found: {set_dir}")
+
+    try:
+        audio_path = find_eval_audio(set_dir)
+        source_info = probe(audio_path)
+    except (FileNotFoundError, ValueError, FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+
+    reference_path = set_dir / "reference.transcript.json"
+    meta_path = set_dir / "meta.json"
+    if not reference_path.exists():
+        _fatal(f"Reference transcript not found: {reference_path}")
+    if not meta_path.exists():
+        _fatal(f"Eval metadata not found: {meta_path}")
+
+    output_dir = out_dir or set_dir
+    runs_dir = output_dir / "runs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = (
+        f"{datetime.now().strftime('%Y%m%d-%H%M')}-"
+        f"{cfg.model.replace('/', '-')}-beam{cfg.beam_size}"
+    )
+    asr_wav_path = output_dir / f"{audio_path.stem}.16k.wav"
+    predicted_path = output_dir / "predicted.transcript.json"
+    report_path = runs_dir / f"{run_id}.json"
+
+    total_start = time.perf_counter()
+    ffmpeg_start = time.perf_counter()
+    try:
+        to_wav_16k_mono(audio_path, asr_wav_path)
+    except (FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+    wall_sec_ffmpeg = time.perf_counter() - ffmpeg_start
+
+    asr_start = time.perf_counter()
+    tx, segments = transcribe(source_info, asr_wav_path, cfg)
+    wall_sec_model_load = time.perf_counter() - asr_start
+    for _segment in segments:
+        pass
+    wall_sec_asr = time.perf_counter() - asr_start
+    wall_sec_total = time.perf_counter() - total_start
+
+    predicted = transcript_to_dict(tx)
+    write_json(predicted_path, predicted)
+
+    reference = read_json(reference_path)
+    meta = read_json(meta_path)
+    reference_text = transcript_to_text(reference)
+    predicted_text = transcript_to_text(predicted)
+    cer = compute_cer(reference_text, predicted_text)
+    glossary_recall, glossary_details = compute_glossary_recall(
+        predicted_text,
+        list(meta.get("glossary") or []),
+    )
+    glossary_found = sum(1 for item in glossary_details if item["found"])
+    glossary_total = len(glossary_details)
+    glossary_misses = [item["term"] for item in glossary_details if not item["found"]]
+
+    resolved = resolve_device(cfg)
+    duration_sec = float(getattr(source_info, "duration_sec", 0.0) or meta.get("duration_sec") or 0.0)
+    rtf = wall_sec_asr / duration_sec if duration_sec > 0 else None
+
+    report = {
+        "run_id": run_id,
+        "set_name": set_name,
+        "config": {
+            "model": cfg.model,
+            "beam_size": cfg.beam_size,
+            "vad_filter": cfg.vad_filter,
+            "device": resolved.device,
+            "compute_type": resolved.compute_type,
+            "initial_prompt": cfg.initial_prompt,
+            "hotwords": cfg.hotwords,
+        },
+        "timing": {
+            "audio_duration_sec": duration_sec,
+            "wall_sec_total": wall_sec_total,
+            "wall_sec_ffmpeg": wall_sec_ffmpeg,
+            "wall_sec_asr": wall_sec_asr,
+            "wall_sec_model_load": wall_sec_model_load,
+            "rtf": rtf,
+        },
+        "accuracy": {
+            "cer": cer,
+            "glossary_recall": glossary_recall,
+            "glossary_details": glossary_details,
+        },
+        "artifacts": {
+            "predicted_transcript": str(predicted_path),
+        },
+    }
+    write_json(report_path, report)
+
+    console.print(f"Source : {audio_path} ({duration_sec:.1f}s)")
+    console.print(
+        f"Model  : {cfg.model} / beam={cfg.beam_size} / "
+        f"vad={'on' if cfg.vad_filter else 'off'} / {resolved.device}/{resolved.compute_type}"
+    )
+    console.print("")
+    console.print("| Metric                 | Value       |")
+    console.print("|------------------------|-------------|")
+    console.print(f"| wall (total)           | {wall_sec_total:.1f}s      |")
+    console.print(f"| wall (ASR only)        | {wall_sec_asr:.1f}s      |")
+    console.print(f"| RTF                    | {rtf:.3f}       |" if rtf is not None else "| RTF                    | n/a         |")
+    console.print(f"| CER                    | {cer * 100:.1f}%        |")
+    console.print(
+        f"| Glossary recall        | {glossary_recall * 100:.0f}% "
+        f"({glossary_found}/{glossary_total})   |"
+    )
+    console.print("")
+    console.print("Glossary misses: " + (", ".join(glossary_misses) if glossary_misses else "-"))
+    console.print(f"Report written: {report_path}")
+
+
+@cli.command("kpi-summary")
+@click.argument("kpi_jsonl", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--audio-duration-sec", default=None, type=float,
+              help="Audio duration used for per-hour normalisation")
+def kpi_summary_cmd(kpi_jsonl: Path, audio_duration_sec: float | None) -> None:
+    """Summarise editor correction clicks from a KPI JSONL log."""
+    summary = summarize_kpi_jsonl(kpi_jsonl, audio_duration_sec=audio_duration_sec)
+    out_path = kpi_summary_path(kpi_jsonl)
+    write_json(out_path, summary)
+
+    duration = summary["audio_duration_sec"]
+    wall = summary["session_wall_sec"]
+    counts = summary["counts"]
+    per_hour = summary["correction_clicks_per_audio_hour"]
+
+    duration_label = "unknown"
+    if duration is not None:
+        duration_label = f"{duration:.1f}s ({duration / 60.0:.1f} min)"
+    wall_label = "unknown"
+    if wall is not None:
+        wall_label = f"{wall:.1f}s ({wall / 60.0:.1f} min)"
+
+    console.print(f"KPI file       : {kpi_jsonl}")
+    console.print(f"Audio duration : {duration_label}")
+    console.print(f"Session wall   : {wall_label}")
+    console.print("")
+    console.print("| Metric                          | Value           |")
+    console.print("|---------------------------------|-----------------|")
+    console.print(f"| ops.delete                      | {counts['ops.delete']}              |")
+    console.print(f"| ops.move                        | {counts['ops.move']}               |")
+    console.print(f"| ops.fillers.added (auto)        | {counts['ops.fillers.added']}              |")
+    console.print(f"| **correction clicks**           | **{summary['correction_clicks']}**          |")
+    if per_hour is None:
+        console.print("| **per hour of audio**           | **n/a**         |")
+    else:
+        console.print(f"| **per hour of audio**           | **{per_hour:.1f} / hr**  |")
+    console.print(f"| word clicks (seek)              | {counts['word_clicks']}             |")
+    console.print(f"| drag selections                 | {counts['drag_selections']}              |")
+    console.print("")
+    console.print(f"Summary written: {out_path}")
 
 
 @cli.command("transcribe")
