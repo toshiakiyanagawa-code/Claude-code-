@@ -2294,9 +2294,13 @@
   // Free-text search across the rendered words. Editors specifically asked
   // for "type a phrase, jump to that moment" — much faster than scrubbing a
   // 30-min episode when they remember the wording but not the time. Match
-  // is a case-insensitive substring on word.text; ja text is not normalised
-  // (no kana folding) since the query and the transcript both come from
-  // the same ASR output.
+  // is a case-insensitive, NFKC-normalised substring against the full
+  // concatenated transcript text (see buildSearchIndex below). Word-by-
+  // word matching was tried first but missed every phrase that crossed
+  // even one ASR word boundary, which is most ja phrases in practice.
+  // Kana folding is NOT applied — query and transcript both go through
+  // the same NFKC + lowercase pipeline, so ASCII case and width
+  // differences are absorbed but hiragana ↔ katakana still distinguish.
   const $searchInput = $('search-input');
   const $searchInfo = $('search-info');
   const $btnSearchNext = $('btn-search-next');
