@@ -267,9 +267,11 @@ def test_rank_hits_applies_policy_without_magic_query_suffix(tmp_path):
         query_context="会議 ビジネス",
     )
 
-    # 日本人 + 顔なし composition が最上位、白人 face が最下位。
+    # Policy-3 後: 日本人 + 顔なし composition が最上位、白人 を含む候補は
+    # hard_block (score -100) でまとめて最下位に沈む (rank_hits 自身は除外しないが、
+    # candidate_reranker 側で表示前に除外される)。
     assert ranked[0].asset_id == "japanese-hands"
-    assert ranked[-1].asset_id == "foreign-face"
+    assert {r.asset_id for r in ranked[1:]} == {"foreign-face", "foreign-back"}
 
 
 def test_rank_hits_policy_leaves_non_people_hits_neutral(tmp_path):

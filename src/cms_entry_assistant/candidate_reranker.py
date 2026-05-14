@@ -25,17 +25,42 @@ class RankedCandidate:
     prefs_score: float
     penalty: float
     avoided_terms: list[str]
+    # Policy-3 (2026-05-14): 編集部ポリシー由来の signal。
+    # policy_score は -1..+1 に正規化された値、policy_reasons はデバッグ用。
+    policy_score: float = 0.0
+    policy_reasons: list[str] = None  # type: ignore[assignment]
 
     @property
     def total(self) -> float:
         return self.rank_raw
+
+    def __post_init__(self) -> None:
+        if self.policy_reasons is None:
+            object.__setattr__(self, "policy_reasons", [])
 
 
 def rerank_candidates(
     candidates: Iterable[Any],
     plan: LlmQueryPlan,
     prefs: Any = None,
+    *,
+    apply_policy: bool = True,
 ) -> list[RankedCandidate]:
+    """Rank candidates by LLM intent/query + editor policy.
+
+    Policy-3 (2026-05-14):
+      - hard_block 判定 (笑顔 / 肖像画 / 白人 / 黒人 等) を最終リストから完全に除外。
+      - policy normalized score を 0.30 の重みで scoring 式に組み込む。
+      - 既存 intent (0.40) / query (0.20) / prefs (0.15) と並列。
+
+    apply_policy=False で旧挙動 (テスト互換用)。デフォルト True。
+    """
+    # Policy-3 を呼び出す。photo_preferences との循環 import を避けるため lazy import。
+    if apply_policy:
+        from cms_entry_assistant.photo_preferences import (  # noqa: WPS433
+            evaluate_editorial_people_policy,
+        )
+
     intent_terms = set(_tokens(_get(plan, "intent_terms", [])))
     query_terms = _unique(_tokens(_query_source(plan)))
     avoid_terms = _term_entries(_get(plan, "avoid_terms", []))
@@ -43,6 +68,18 @@ def rerank_candidates(
     ranked: list[RankedCandidate] = []
 
     for candidate in candidates:
+        # Hard-filter (明示違反は最終リストから除外)
+        if apply_policy:
+            policy_eval = evaluate_editorial_people_policy(candidate)
+            if policy_eval.hard_block:
+                continue
+            # raw score -100..+20 を -1..+1 に正規化
+            policy_norm = max(-1.0, min(1.0, policy_eval.score / 20.0))
+            policy_reasons = list(policy_eval.reasons)
+        else:
+            policy_norm = 0.0
+            policy_reasons = []
+
         candidate_terms = set(_candidate_tokens(candidate))
         alt_terms = set(_tokens(_get(candidate, "alt", "")))
 
@@ -54,7 +91,16 @@ def rerank_candidates(
         avoided_terms = _matched_avoid_terms(avoid_terms, candidate_terms, candidate_text)
         penalty = len(avoided_terms) * 0.1
 
-        rank_raw = (0.55 * intent_score) + (0.25 * query_score) + prefs_score - penalty
+        # Policy-3 重み: 0.40 intent + 0.20 query + 0.30 policy + 0.15 prefs - penalty
+        # (元 0.55 intent + 0.25 query + 0.15 prefs から intent / query を弱めて
+        # policy を 0.30 で組み込む。codex policy review §1 推奨)
+        rank_raw = (
+            0.40 * intent_score
+            + 0.20 * query_score
+            + 0.30 * policy_norm
+            + prefs_score  # _prefs_score 自体が既に 0.15 倍されている
+            - penalty
+        )
 
         ranked.append(
             RankedCandidate(
@@ -65,6 +111,8 @@ def rerank_candidates(
                 prefs_score=prefs_score,
                 penalty=penalty,
                 avoided_terms=avoided_terms,
+                policy_score=policy_norm,
+                policy_reasons=policy_reasons,
             )
         )
 
@@ -72,6 +120,7 @@ def rerank_candidates(
         key=lambda item: (
             -item.total,
             -item.rank_raw,
+            -item.policy_score,
             -item.prefs_score,
             _detail_url(item.candidate),
         )

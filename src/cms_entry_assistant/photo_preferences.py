@@ -239,53 +239,144 @@ def rank_hits(
     return [h for _, h in scored][:limit]
 
 
-# 編集者ポリシー (2026-05-13 確定、再適用 2026-05-14):
+# 編集者ポリシー (2026-05-13 確定、再適用 2026-05-14、Policy-3 拡張 2026-05-14):
 # - 人物は日本人に絞る
 # - 顔はうつさない (後ろ姿 / 手元 / 足元 / シルエット を優先)
 # - 抽象的な写真 / シンボル / イメージ を優先
-# 旧実装は query_context に "日本人 顔なし ..." の機械的接尾辞が入っているか
-# どうかで gate していたが、codex Phase 2 で接尾辞が外れたため永久に発火しない
-# 状態になっていた。gate を hit alt の人物指標に変更し、人物が写ってる候補だけ
-# にポリシーを当てる (landmark / 抽象シンボルなど人物が写っていない hit は
-# 影響を受けない)。
-_PEOPLE_INDICATORS = (
-    "人", "人物", "男", "女", "笑顔", "ポートレート", "顔",
-    "people", "person", "man", "woman", "men", "women",
-    "face", "smiling", "portrait", "boy", "girl", "child",
-    "family", "team", "group", "couple",
+
+# 明示違反 = 必ず除外 (hard_block)。alt 中に下記いずれかが含まれたら、その候補は
+# 最終リストから完全に外す。日本人かどうかが alt から分からない欧米人 portrait
+# でも、笑顔 / 肖像画 / カメラ目線 のキーワードがあれば確実に排除できる。
+_HARD_BLOCK_TERMS = (
+    # 笑顔・微笑 (face-on with positive emotion ≒ 顔出しほぼ確実)
+    "笑顔", "微笑む", "微笑", "smiling", "smile",
+    # "幸せな" は alt で「幸せな中年のビジネスウーマン...」のように face-on の合図に
+    # なっているケースが多い (codex policy review § 4)
+    "幸せな", "幸せそう",
+    # 肖像 / カメラ目線
+    "肖像画", "ポートレート", "portrait", "カメラ目線", "カメラを見", "looking at camera",
+    "looking into the camera",
+    # 明示的に欧米/白人/黒人と書かれているもの (= 日本人ではない確信)
+    "白人", "欧米", "外国人", "caucasian", "western businessman", "western woman",
+    "foreigner", "foreign businessman", "黒人", "アフリカ系", "african american",
+    "black businessman", "black businesswoman", "black woman", "black man",
 )
+
+# 顔なし構図シグナル (積極的に boost)
 _NO_FACE_INDICATORS = (
-    "後ろ姿", "背中", "手元", "足元", "シルエット", "顔なし",
+    "後ろ姿", "背中", "手元", "足元", "シルエット", "顔なし", "横顔",
     "back view", "rear view", "from behind", "hands", "feet", "silhouette", "no face",
+    "headless", "faceless",
+)
+
+# 人物指標 (人物が写ってる可能性が高い)
+_PEOPLE_INDICATORS = (
+    "人", "人物", "男", "女", "ポートレート", "顔",
+    "people", "person", "man", "woman", "men", "women",
+    "businessman", "businesswoman", "businesspeople",
+    "boy", "girl", "child", "kid",
+    "family", "team", "group", "couple", "colleague",
+)
+
+# 日本人指標
+_JAPANESE_INDICATORS = (
+    "日本人", "日本の", "日本のビジネス", "japanese", "asian",
+)
+
+# 抽象 / シンボル / グラフ (積極的に boost)
+_ABSTRACT_INDICATORS = (
+    "グラフ", "矢印", "チャート", "シンボル", "ランドマーク", "街並み", "都市",
+    "建物", "ビル", "風景", "イメージ", "概念", "図形", "アイコン",
+    "graph", "chart", "arrow", "icon", "skyline", "landmark", "cityscape",
+    "concept", "abstract", "infographic", "diagram",
 )
 
 
-def _editorial_people_policy_score(hit, query_context: str) -> int:
-    """Apply editor policy (Japanese / no-face / abstract) for people-bearing hits.
+@dataclass(frozen=True)
+class PolicyEval:
+    """編集部写真ポリシーに対する 1 候補の評価結果。"""
 
-    人物が写っている (alt に人物指標がある) 候補だけスコア対象。
-    landmark / 抽象シンボル等の人物無し hit は触らない。
+    score: int  # -100..+20 程度の生スコア。
+    hard_block: bool  # True なら最終リストから除外。
+    ambiguous_person: bool  # 人物だが日本人/顔なし指標が無く要警戒。
+    reasons: list[str]  # デバッグ用 (どの語が当たったか)
+
+
+def evaluate_editorial_people_policy(hit, query_context: str = "") -> PolicyEval:
+    """編集部ポリシーで候補を評価して PolicyEval を返す。
+
+    hard_block: True なら呼び出し側は表示前に除外する責任を持つ。
+    score: 通常スコア (rank_hits 等のソートに使える)。
+    ambiguous_person: 人物指標はあるが日本人 / 顔なし指標が無い候補。reranker で
+                     soft-demote の対象。
     """
     alt = (getattr(hit, "alt", "") or "").lower()
     detail = (getattr(hit, "detail_url", "") or "").lower()
     haystack = f"{alt} {detail}"
 
-    # 1) hit 自体が "顔なし" 構図 (後ろ姿/手元 etc.) なら、人物指標がなくても
-    #    ポジティブ判定を残す (こういう hit は積極的に上に上げたい)。
-    is_no_face_composition = any(t in haystack for t in _NO_FACE_INDICATORS)
+    # 1) hard-block 判定 (明示違反)
+    hits_blocked: list[str] = []
+    for term in _HARD_BLOCK_TERMS:
+        if term in haystack:
+            hits_blocked.append(term)
+    if hits_blocked:
+        return PolicyEval(
+            score=-100,
+            hard_block=True,
+            ambiguous_person=False,
+            reasons=[f"hard_block:{t}" for t in hits_blocked],
+        )
 
-    # 2) hit に人物指標があるか? 無ければポリシー無関係なので 0。
-    is_people_bearing = any(t in haystack for t in _PEOPLE_INDICATORS)
-    if not is_people_bearing and not is_no_face_composition:
-        return 0
+    reasons: list[str] = []
+    is_no_face = any(t in haystack for t in _NO_FACE_INDICATORS)
+    is_people = any(t in haystack for t in _PEOPLE_INDICATORS)
+    is_japanese = any(t in haystack for t in _JAPANESE_INDICATORS)
+    is_abstract = any(t in haystack for t in _ABSTRACT_INDICATORS)
 
     score = 0
-    if any(token in haystack for token in ("日本人", "日本の", "japanese", "asian")):
+
+    # 抽象 / シンボル / グラフ — 編集部ポリシー 3 で積極的に boost
+    if is_abstract:
+        score += 10
+        reasons.append("abstract")
+
+    # 日本人と分かる → +8
+    if is_japanese:
         score += 8
-    if is_no_face_composition:
+        reasons.append("japanese")
+
+    # 顔なし構図 → +8
+    if is_no_face:
         score += 8
-    if any(token in haystack for token in ("顔", "笑顔", "ポートレート", "カメラ目線", "face", "smiling", "portrait", "looking at camera")):
+        reasons.append("no_face_composition")
+
+    # ambiguous: 人物が写ってるが日本人 / 顔なし のシグナルが無い → soft demote
+    ambiguous = False
+    if is_people and not is_japanese and not is_no_face and not is_abstract:
+        score -= 6
+        reasons.append("ambiguous_person")
+        ambiguous = True
+
+    # 「顔」が明示されている (顔のクローズアップ等) → -8
+    # 「顔なし」は _NO_FACE_INDICATORS で boost 済なので、その判定後にしか減点しない
+    if not is_no_face and any(t in haystack for t in ("顔のアップ", "顔のクローズ", "顔出し", "face close")):
         score -= 8
-    if any(token in haystack for token in ("白人", "欧米", "外国人", "caucasian", "western")):
-        score -= 10
-    return score
+        reasons.append("face_closeup")
+
+    return PolicyEval(
+        score=score,
+        hard_block=False,
+        ambiguous_person=ambiguous,
+        reasons=reasons,
+    )
+
+
+def _editorial_people_policy_score(hit, query_context: str) -> int:
+    """Backwards-compatible scalar API used by rank_hits.
+
+    hard_block 判定は呼び出し側に伝えられないので、強い負スコア (-100) を返して
+    rank_hits の安全弁にする。最終的な hard_block は candidate_reranker 側で
+    evaluate_editorial_people_policy() を直接呼んで除外する。
+    """
+    evaluation = evaluate_editorial_people_policy(hit, query_context)
+    return evaluation.score
