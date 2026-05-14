@@ -63,9 +63,22 @@ class CaseState:
     draft: CMSDraft
     selections: dict[str, str] = field(default_factory=dict)  # slot_key -> asset_id
     photo_candidates: dict[str, list[IstockSearchHit]] = field(default_factory=dict)
+    # 候補生成は upload 直後に submit され、view_case 側は status を見て
+    # pending なら "読み込み中" 画面 (meta-refresh で再表示) を出す。
+    # 値は "pending" / "ready" / "error"。
+    candidate_status: str = "pending"
+    candidate_error: str = ""
 
 
 _cases: dict[str, CaseState] = {}
+
+# 候補生成 (LLM + iStock) を背後で走らせる用の executor。
+# 1 案件あたり 80-100s 程度かかるので、ユーザーが連続でアップロードしても
+# 詰まらないように max_workers は控えめに 2 件まで。
+import concurrent.futures as _futures
+_CANDIDATE_BG_POOL = _futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="cms-cand"
+)
 
 
 def _new_case_id() -> str:
@@ -593,6 +606,34 @@ def index() -> str:
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
 
 
+def _run_candidate_fetch(case_id: str, article_title: str) -> None:
+    """Background worker: fetch iStock candidates and stamp case.photo_candidates.
+
+    create_case() で submit され、_CANDIDATE_BG_POOL のスレッドで走る。
+    エラーは _log.warning に出して candidate_status="error" にする (UI 側は
+    pending と区別して reload しない案内を出す)。
+    """
+    case = _cases.get(case_id)
+    if case is None:
+        _log.warning("background fetch: case %s vanished", case_id)
+        return
+    try:
+        candidates = _fetch_candidates(
+            case.draft.photo_suggestions,
+            article_title=article_title,
+        )
+        case.photo_candidates = candidates
+        case.candidate_status = "ready"
+        _log.info(
+            "background fetch done for %s (%d slots)",
+            case_id, len(candidates),
+        )
+    except Exception as exc:  # noqa: BLE001
+        case.candidate_status = "error"
+        case.candidate_error = str(exc)
+        _log.warning("background fetch failed for %s: %s", case_id, exc)
+
+
 @app.post("/case", response_class=HTMLResponse)
 async def create_case(manuscript: UploadFile = File(...)) -> Any:
     # Stream-read with hard cap so a huge upload doesn't blow up memory.
@@ -621,25 +662,62 @@ async def create_case(manuscript: UploadFile = File(...)) -> Any:
         or submission.title
         or ""
     )
-    candidates = _fetch_candidates(
-        draft.photo_suggestions,
-        article_title=article_title,
-    )
+    # codex perf review #1: 候補取得は同期で 80-100s かかるため、
+    # case を pending 状態で保存して即 redirect。実取得は background pool。
     case = CaseState(
         case_id=_new_case_id(),
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         manuscript=parsed,
         submission=submission,
         draft=draft,
-        photo_candidates=candidates,
+        photo_candidates={},
+        candidate_status="pending",
     )
     _cases[case.case_id] = case
+    _CANDIDATE_BG_POOL.submit(_run_candidate_fetch, case.case_id, article_title)
     return RedirectResponse(url=f"/case/{case.case_id}", status_code=303)
+
+
+def _pending_case_html(case: CaseState) -> str:
+    """候補生成中の "読み込み中" 画面。meta-refresh で 5 秒ごとに自分自身を再取得。"""
+    slot_count = len(case.draft.photo_suggestions)
+    title = _esc(case.draft.selected_title or case.manuscript.source_file)
+    return (
+        '<meta http-equiv="refresh" content="5">'
+        f'<h2>案件: {title}</h2>'
+        '<div class="loading-card">'
+        '  <p><strong>素材候補を取得しています…</strong></p>'
+        f'  <p class="muted">写真スロット {slot_count} 件分の候補を AI + iStock から生成中です。'
+        '通常 30 秒から 2 分ほどかかります。このページは 5 秒ごとに自動で更新されます。</p>'
+        '  <p class="muted"><small>ブラウザの「閉じる」ボタンや戻るボタンを押しても、'
+        '取得は背後で続いています。あとから同じ URL を開けば結果が見られます。</small></p>'
+        '</div>'
+        '<style>.loading-card{margin:24px 0;padding:24px;border:1px solid #ccc;border-radius:8px;background:#fafafa}'
+        '.loading-card .muted{color:#555}</style>'
+    )
+
+
+def _error_case_html(case: CaseState) -> str:
+    title = _esc(case.draft.selected_title or case.manuscript.source_file)
+    return (
+        f'<h2>案件: {title}</h2>'
+        '<div class="error-card">'
+        '  <p><strong>素材候補の取得に失敗しました。</strong></p>'
+        f'  <p><code>{_esc(case.candidate_error or "詳細不明")}</code></p>'
+        '  <p>担当者にご連絡ください。原稿のアップロードからやり直すことも可能です。</p>'
+        '  <p><a href="/">トップに戻る</a></p>'
+        '</div>'
+        '<style>.error-card{margin:24px 0;padding:24px;border:1px solid #c33;border-radius:8px;background:#fff5f5}</style>'
+    )
 
 
 @app.get("/case/{case_id}", response_class=HTMLResponse)
 def view_case(case_id: str) -> str:
     case = _get_case(case_id)
+    if case.candidate_status == "pending":
+        return _page_shell(_pending_case_html(case))
+    if case.candidate_status == "error":
+        return _page_shell(_error_case_html(case))
     return _page_shell(_case_html(case))
 
 

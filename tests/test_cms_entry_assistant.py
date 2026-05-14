@@ -416,6 +416,56 @@ def _web_test_client():
     return TestClient(app_module.app), app_module
 
 
+def _wait_for_case_ready(app_module, case_id: str, timeout: float = 5.0) -> None:
+    """Block until background candidate fetch finishes (for sync test assertions)."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        case = app_module._cases.get(case_id)
+        if case is not None and case.candidate_status in {"ready", "error"}:
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"candidate fetch did not finish within {timeout}s for case {case_id}"
+    )
+
+
+def test_view_case_pending_renders_loading_page(monkeypatch):
+    """codex perf review #1: POST 直後 (background 完了前) は読み込み中 HTML を返す。"""
+    import threading
+    from cms_entry_assistant.web import app as app_module
+
+    # Hold the background fetch open until we explicitly release it.
+    gate = threading.Event()
+
+    def slow_fake_candidates(suggestions, **_kwargs):
+        gate.wait(timeout=5.0)
+        return {s.slot_key: [] for s in suggestions}
+
+    monkeypatch.setattr(app_module, "_fetch_candidates", slow_fake_candidates)
+
+    client, mod = _web_test_client()
+    create = client.post(
+        "/case",
+        files={"manuscript": ("sample.txt", MANUSCRIPT_TEXT.encode("utf-8"), "text/plain")},
+        follow_redirects=False,
+    )
+    assert create.status_code == 303
+    case_id = create.headers["location"].rsplit("/", 1)[-1]
+
+    assert mod._cases[case_id].candidate_status == "pending"
+
+    view = client.get(f"/case/{case_id}")
+    assert view.status_code == 200
+    body = view.text
+    assert "素材候補を取得しています" in body
+    assert 'http-equiv="refresh"' in body
+
+    gate.set()
+    _wait_for_case_ready(mod, case_id)
+    assert mod._cases[case_id].candidate_status == "ready"
+
+
 def test_web_app_renders_upload_form_at_root():
     client, _ = _web_test_client()
     response = client.get("/")
