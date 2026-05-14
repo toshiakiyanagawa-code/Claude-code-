@@ -443,48 +443,9 @@
   const words = [];    // [{el, start, end, idx, segIdx}]
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
 
-  // ------- load -------
-  const t0 = performance.now();
-  let info, tx, session;
-  try {
-    tx = await fetchJSONDetailed('/api/transcript');
-    [info, session] = await Promise.all([
-      fetchJSON('/api/audio/info'),
-      fetchJSON('/api/session'),
-    ]);
-  } catch (e) {
-    if (e && e.status === 503) {
-      state.hasActive = false;
-      info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
-      tx = { segments: [] };
-      session = { ops: [] };
-      $tx.innerHTML = '<div class="status empty">音声が読み込まれていません。<br>上の「音声を開く」(O) をクリックして、Codespace 内のファイルを選ぶか、アップロードしてください。</div>';
-    } else {
-      $tx.innerHTML = `<div class="status error">読み込みに失敗しました: ${e.message}</div>`;
-      return;
-    }
-  }
-  state.sessionTemplate = session;
-  state.ops = session.ops || [];
-  state.sourceDuration = info.duration_sec;
-  logKPI('ui.loaded', {
-    latency_ms: performance.now() - t0,
-    has_existing_session: state.ops.length > 0,
-    has_active: state.hasActive,
-  });
-
-  $name.textContent = info.name;
-  $meta.textContent = [
-    fmt(info.duration_sec),
-    info.sample_rate && `${info.sample_rate}Hz`,
-    info.channels && `${info.channels}ch`,
-    info.codec,
-    tx.model_config && `· model: ${tx.model_config.model}`,
-  ].filter(Boolean).join(' · ');
-  if (state.hasActive) $player.src = info.url;
-
   // Diagnostic logging: if seeks are silently ignored, we still see seeking/
-  // seeked/error events in the KPI log.
+  // seeked/error events in the KPI log. Wired once at boot so a SPA-style
+  // library switch doesn't stack duplicate listeners.
   $player.addEventListener('seeking', () => logKPI('ui.audio.seeking', { t: $player.currentTime }));
   $player.addEventListener('seeked', () => logKPI('ui.audio.seeked', { t: $player.currentTime }));
   $player.addEventListener('error', () => logKPI('ui.audio.error', {
@@ -492,31 +453,172 @@
   }));
   $player.addEventListener('stalled', () => logKPI('ui.audio.stalled', { t: $player.currentTime }));
 
-  // ------- render -------
-  if (state.hasActive) $tx.innerHTML = '';
-  let idx = 0;
-  tx.segments.forEach((seg, segIdx) => {
-    const div = document.createElement('div');
-    div.className = 'segment';
-    const time = document.createElement('span');
-    time.className = 'seg-time';
-    time.textContent = fmt(seg.start);
-    div.appendChild(time);
-    (seg.words || []).forEach((w) => {
-      const span = document.createElement('span');
-      span.className = 'word';
-      const wordIdx = idx;  // capture per-iteration value
-      span.dataset.idx = String(wordIdx);
-      span.textContent = w.text;
-      const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
-      words.push(word);
-      span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
-      span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
-      div.appendChild(span);
-      idx += 1;
+  // Fetches /api/transcript /audio/info /session, resets edit state to a
+  // clean slate, and rebuilds the transcript DOM. Called once at boot and
+  // again every time the user switches files via the Open dialog — no full
+  // page reload, so the in-page UI stays mounted (keyboard focus, scroll,
+  // env banner state, etc.).
+  //
+  // Returns true on success (active or empty state), false on hard fetch
+  // failure so callers (e.g. selectLibraryEntry) can keep their UI honest.
+  // Concurrent calls cancel each other via loadSeq: only the most recent
+  // call gets to commit DOM/state changes — a slow earlier call that
+  // returns after a newer call started is silently dropped.
+  let loadSeq = 0;
+  async function loadActiveAndRender() {
+    const mySeq = ++loadSeq;
+    const stale = () => mySeq !== loadSeq;
+    const t0 = performance.now();
+    let info, tx, session;
+    let nextHasActive = true;
+    let loadError = null;
+    try {
+      tx = await fetchJSONDetailed('/api/transcript');
+      if (stale()) return false;
+      [info, session] = await Promise.all([
+        fetchJSON('/api/audio/info'),
+        fetchJSON('/api/session'),
+      ]);
+      if (stale()) return false;
+    } catch (e) {
+      if (stale()) return false;
+      if (e && e.status === 503) {
+        nextHasActive = false;
+        info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
+        tx = { segments: [] };
+        session = { ops: [] };
+      } else {
+        loadError = e;
+      }
+    }
+
+    // Stop any current playback / revoke a previous preview blob URL before
+    // we tear the DOM down. Switching files mid-audition would otherwise
+    // leak the rendered wav for the previous file.
+    try { $player.pause(); } catch (_) { /* element may not be ready */ }
+    if (state.previewURL) {
+      try { URL.revokeObjectURL(state.previewURL); } catch (_) { /* non-fatal */ }
+    }
+
+    // Reset every piece of per-file edit state. Anything that survives here
+    // becomes a ghost from the previous file (e.g. selection indexes that
+    // point past the new transcript, an undo stack referring to deleted
+    // ops, a stale paste anchor).
+    if (stale()) return false;
+    state.hasActive = nextHasActive;
+    state.ops = [];
+    state.mergedDeletes = [];
+    state.timeline = [];
+    state.editedDuration = 0;
+    state.sourceDuration = 0;
+    state.isScrubbing = false;
+    state.previewMode = false;
+    state.previewURL = null;
+    state.previewCacheKey = null;
+    state.previewDuration = null;
+    state.renderSeq = (state.renderSeq || 0) + 1;  // invalidate in-flight renders
+    state.undoStack = [];
+    state.redoStack = [];
+    state.selection = null;
+    state.clipboard = null;
+    state.pasteAnchor = null;
+    state.sessionTemplate = null;
+    state.saveStatus = 'idle';
+    if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
+    state.saveDirty = false;
+    state.saveSeq = (state.saveSeq || 0) + 1;  // any in-flight autosave is no longer ours
+    // KPI counters are per-file too: a fresh switch starts a fresh editing
+    // session so downstream metrics (time-to-first-op, ops-per-session) are
+    // not contaminated by the previous file's history.
+    kpi.sessionStartedAt = Date.now() / 1000;
+    kpi.firstOpAt = null;
+    kpi.opsCount = 0;
+    words.length = 0;
+    $tx.innerHTML = '';
+    $skipPill.textContent = 'no cut';
+    if ($clipboardPill) $clipboardPill.hidden = true;
+
+    if (loadError) {
+      $tx.innerHTML = `<div class="status error">読み込みに失敗しました: ${loadError.message}</div>`;
+      // Leave the rest of the UI consistent with the empty state so the
+      // error doesn't leave stale chips/pills/pasteAnchor markers from
+      // the previous file.
+      $name.textContent = '読み込み失敗';
+      $meta.textContent = '';
+      $player.removeAttribute('src');
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+      syncTimelineUI();
+      updateStats();
+      renderPasteAnchor();
+      refreshButtons();
+      setModePill('source', 'source');
+      setSaveStatus('idle');
+      return false;
+    }
+
+    state.sessionTemplate = session;
+    state.ops = session.ops || [];
+    state.sourceDuration = info.duration_sec;
+    logKPI('ui.loaded', {
+      latency_ms: performance.now() - t0,
+      has_existing_session: state.ops.length > 0,
+      has_active: state.hasActive,
     });
-    $tx.appendChild(div);
-  });
+
+    $name.textContent = info.name;
+    $meta.textContent = [
+      fmt(info.duration_sec),
+      info.sample_rate && `${info.sample_rate}Hz`,
+      info.channels && `${info.channels}ch`,
+      info.codec,
+      tx.model_config && `· model: ${tx.model_config.model}`,
+    ].filter(Boolean).join(' · ');
+
+    if (state.hasActive) {
+      $player.src = info.url;
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+    } else {
+      $player.removeAttribute('src');
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+      $tx.innerHTML = '<div class="status empty">音声が読み込まれていません。<br>上の「音声を開く」(O) をクリックして、Codespace 内のファイルを選ぶか、アップロードしてください。</div>';
+    }
+
+    if (state.hasActive) {
+      let idx = 0;
+      tx.segments.forEach((seg, segIdx) => {
+        const div = document.createElement('div');
+        div.className = 'segment';
+        const time = document.createElement('span');
+        time.className = 'seg-time';
+        time.textContent = fmt(seg.start);
+        div.appendChild(time);
+        (seg.words || []).forEach((w) => {
+          const span = document.createElement('span');
+          span.className = 'word';
+          const wordIdx = idx;
+          span.dataset.idx = String(wordIdx);
+          span.textContent = w.text;
+          const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
+          words.push(word);
+          span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
+          span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
+          div.appendChild(span);
+          idx += 1;
+        });
+        $tx.appendChild(div);
+      });
+    }
+
+    if (state.hasActive) rerenderOps();
+    else { syncTimelineUI(); updateStats(); }
+    renderPasteAnchor();
+    refreshButtons();
+    setModePill('source', 'source');
+    setSaveStatus('idle');
+    return true;
+  }
+
+  await loadActiveAndRender();
 
   // ------- selection + move-drag clicks -------
   // Pointerdown on an unselected word keeps the W4 drag-to-select behavior.
@@ -2454,6 +2556,17 @@
     if (librarySwitching) return;
     const name = entry && entry.name ? entry.name : String(entry || '');
     const path = entry && (entry.path || entry.audio_path) ? (entry.path || entry.audio_path) : null;
+    // SPA swap means we no longer trigger window.beforeunload, so the
+    // browser's native "unsaved changes" prompt won't fire on file switch.
+    // Re-create that safety net with an explicit confirm against the
+    // autosave dirty flag.
+    if (state.saveDirty || (state.saveStatus || '').startsWith('saving') || (state.saveStatus || '').startsWith('error')) {
+      const ok = window.confirm('未保存の編集があります。破棄して切り替えますか?');
+      if (!ok) {
+        logKPI('ui.library.switch_cancelled_unsaved', { name, path });
+        return;
+      }
+    }
     librarySwitching = true;
     $libraryStatus.textContent = `${name} に切り替え中…`;
     $libraryStatus.hidden = false;
@@ -2469,10 +2582,27 @@
         throw new Error(`HTTP ${r.status} ${text.slice(0, 200)}`);
       }
       logKPI('ui.library.selected', { name, path });
-      // The page reload picks up the new transcript / waveform / audio.
-      // beforeunload above will warn if there's unsaved work.
-      window.location.reload();
+      // SPA-style swap: re-fetch transcript/audio/session + rebuild DOM
+      // in place. No full page reload — keyboard focus, the Open dialog's
+      // scroll, the env banner, and the toolbar all survive the switch.
+      const ok = await loadActiveAndRender();
+      if (!ok) {
+        // Surface the failure without closing the modal so the user can
+        // pick a different entry. loadActiveAndRender already printed an
+        // error into the transcript area; mirror it in the dialog status.
+        logKPI('ui.library.switch_failed', { name, path, reason: 'load_failed' });
+        $libraryStatus.textContent = `${name} の読み込みに失敗しました`;
+        $libraryStatus.hidden = false;
+        librarySwitching = false;
+        return;
+      }
+      hideLibraryModal();
+      $libraryStatus.textContent = `${name} を読み込みました`;
+      $libraryStatus.hidden = false;
+      logKPI('ui.library.switched', { name, path });
+      librarySwitching = false;
     } catch (e) {
+      logKPI('ui.library.switch_failed', { name, message: e && e.message ? e.message : String(e) });
       $libraryStatus.textContent = `切り替えに失敗しました: ${e.message}`;
       librarySwitching = false;
     }
@@ -2620,12 +2750,5 @@
     if (ev.target === $libraryModal) hideLibraryModal();
   });
 
-  // ------- initial paint -------
-  if (state.hasActive) rerenderOps();
-  else {
-    syncTimelineUI();
-    updateStats();
-  }
-  renderPasteAnchor();
-  refreshButtons();
+  // Initial paint is owned by loadActiveAndRender(), called above.
 })();
