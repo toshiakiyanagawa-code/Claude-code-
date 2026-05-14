@@ -1520,6 +1520,19 @@
 
   function applyMoveRange(srcStart, srcEnd, targetEditedT) {
     if (srcEnd <= srcStart || targetEditedT < 0) return;
+    // No-op guard: dropping a range back onto its own current edited
+    // position would add a Move op that produces zero observable change
+    // but still occupies an Undo slot and a render-cache invalidation.
+    // Skip it so the editor's history stays clean.
+    const currentEditedStart = sourceToEdited(srcStart);
+    if (Math.abs(targetEditedT - currentEditedStart) < 1e-3) {
+      logKPI('ui.op.move.no_op', {
+        src_start: srcStart, src_end: srcEnd,
+        target_edited_t: targetEditedT,
+        current_edited_start: currentEditedStart,
+      });
+      return;
+    }
     if (state.previewMode) revertToSource('apply-move');
     else state.renderSeq += 1;
     const op = {
@@ -1546,8 +1559,33 @@
     state.pasteAnchor = null;
     rerenderOps();
     renderPasteAnchor();
+    // Keep the moved range selected so the editor can immediately keep
+    // working with it (delete, re-move, audition). After rerenderOps()
+    // the words are in their new edited-order positions; we find them
+    // by their source-time range since that's invariant across the move.
+    const movedRange = wordRangeFromSourceSpan(srcStart, srcEnd);
+    if (movedRange) {
+      state.selection = { anchor: movedRange.ws, extent: movedRange.we };
+      renderSelection();
+    }
     refreshButtons();
     scheduleSave();
+  }
+
+  function wordRangeFromSourceSpan(srcStart, srcEnd) {
+    // Find the contiguous index range of words whose source-time span
+    // overlaps [srcStart, srcEnd]. The set is contiguous because the
+    // moved span is a single source range and rerenderOps re-emits each
+    // word once. Use word.idx (not loop index) so the result is stable
+    // even if the words[] array is re-sorted by the renderer later.
+    let ws = -1, we = -1;
+    for (const w of words) {
+      if (w.start >= srcEnd - 1e-6 || w.end <= srcStart + 1e-6) continue;
+      if (ws < 0 || w.idx < ws) ws = w.idx;
+      if (we < 0 || w.idx > we) we = w.idx;
+    }
+    if (ws < 0 || we < 0) return null;
+    return { ws, we };
   }
 
   function findPlayheadWord() {
