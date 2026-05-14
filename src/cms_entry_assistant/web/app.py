@@ -73,12 +73,38 @@ class CaseState:
 _cases: dict[str, CaseState] = {}
 
 # 候補生成 (LLM + iStock) を背後で走らせる用の executor。
-# 1 案件あたり 80-100s 程度かかるので、ユーザーが連続でアップロードしても
-# 詰まらないように max_workers は控えめに 2 件まで。
+# 1 案件あたり 1-3 分かかるので、ユーザーが連続でアップロードしても詰まらない
+# 程度の並列度。値は CMS_ENTRY_ASSISTANT_CASE_WORKERS で上書き可能。
 import concurrent.futures as _futures
+_BG_MAX_WORKERS = int(os.getenv("CMS_ENTRY_ASSISTANT_CASE_WORKERS") or "2")
 _CANDIDATE_BG_POOL = _futures.ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="cms-cand"
+    max_workers=_BG_MAX_WORKERS, thread_name_prefix="cms-cand"
 )
+
+
+def _queue_status_for(case: CaseState) -> dict[str, Any]:
+    """この case がいまキューのどこにいるかを返す。
+
+    - state="running": バックグラウンドの worker が assign されて処理中
+    - state="queued":  worker 空き待ち。ahead は自分の前にいる pending case 数
+    - state="active":  candidate_status="ready" / "error" など pending 以外。
+
+    case.created_at の昇順で並べて、自分のインデックスを位置とする。
+    インデックス < _BG_MAX_WORKERS なら running、それ以上は queued。
+    """
+    if case.candidate_status != "pending":
+        return {"state": "active", "ahead": 0}
+    pending_sorted = sorted(
+        (c for c in _cases.values() if c.candidate_status == "pending"),
+        key=lambda c: c.created_at,
+    )
+    try:
+        pos = [c.case_id for c in pending_sorted].index(case.case_id)
+    except ValueError:
+        return {"state": "active", "ahead": 0}
+    if pos < _BG_MAX_WORKERS:
+        return {"state": "running", "ahead": pos}
+    return {"state": "queued", "ahead": pos - _BG_MAX_WORKERS + 1}
 
 
 def _new_case_id() -> str:
@@ -679,18 +705,38 @@ async def create_case(manuscript: UploadFile = File(...)) -> Any:
 
 
 def _pending_case_html(case: CaseState) -> str:
-    """候補生成中の "読み込み中" 画面。meta-refresh で 5 秒ごとに自分自身を再取得。"""
+    """候補生成中の "読み込み中" 画面。meta-refresh で 5 秒ごとに自分自身を再取得。
+
+    キュー位置 (_queue_status_for) も表示して、複数アップロード時に「動いていない」
+    と誤解されないようにする (B: queue position display)。
+    """
     slot_count = len(case.draft.photo_suggestions)
     title = _esc(case.draft.selected_title or case.manuscript.source_file)
+    status = _queue_status_for(case)
+    if status["state"] == "queued":
+        ahead = status["ahead"]
+        queue_html = (
+            f'<p><strong>処理待ち:</strong> あなたの前に <strong>{ahead} 件</strong>'
+            f'処理中の案件があります。</p>'
+            f'<p class="muted">バックグラウンドの並列処理数は {_BG_MAX_WORKERS} 件です。'
+            f'前の案件が終わり次第、自動で開始されます (1 件あたり 1-3 分)。</p>'
+        )
+        headline = "順番待ち中です…"
+    else:
+        queue_html = (
+            f'<p class="muted">写真スロット {slot_count} 件分の候補を AI + iStock から'
+            '生成しています。通常 30 秒から 2 分ほどかかります。</p>'
+        )
+        headline = "素材候補を取得しています…"
     return (
         '<meta http-equiv="refresh" content="5">'
         f'<h2>案件: {title}</h2>'
         '<div class="loading-card">'
-        '  <p><strong>素材候補を取得しています…</strong></p>'
-        f'  <p class="muted">写真スロット {slot_count} 件分の候補を AI + iStock から生成中です。'
-        '通常 30 秒から 2 分ほどかかります。このページは 5 秒ごとに自動で更新されます。</p>'
-        '  <p class="muted"><small>ブラウザの「閉じる」ボタンや戻るボタンを押しても、'
-        '取得は背後で続いています。あとから同じ URL を開けば結果が見られます。</small></p>'
+        f'  <p><strong>{headline}</strong></p>'
+        f'  {queue_html}'
+        '  <p class="muted"><small>このページは 5 秒ごとに自動で更新されます。'
+        'ブラウザの戻る/閉じるを押しても取得は背後で続きます。'
+        'あとから同じ URL を開けば結果が見られます。</small></p>'
         '</div>'
         '<style>.loading-card{margin:24px 0;padding:24px;border:1px solid #ccc;border-radius:8px;background:#fafafa}'
         '.loading-card .muted{color:#555}</style>'

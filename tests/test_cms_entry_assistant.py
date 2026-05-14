@@ -486,6 +486,53 @@ def _wait_for_case_ready(app_module, case_id: str, timeout: float = 5.0) -> None
     )
 
 
+def test_pending_page_shows_queue_position_when_queued(monkeypatch):
+    """B: 複数アップロード時、キューで待たされている case には「前に N 件」表示。"""
+    import threading
+    from cms_entry_assistant.web import app as app_module
+
+    # max_workers=2 と仮定。前に 2 件 (running) + 自分 (queued) を仕込む。
+    gate = threading.Event()
+
+    def slow_fake_candidates(suggestions, **_kwargs):
+        gate.wait(timeout=5.0)
+        return {s.slot_key: [] for s in suggestions}
+
+    monkeypatch.setattr(app_module, "_fetch_candidates", slow_fake_candidates)
+    monkeypatch.setattr(app_module, "_BG_MAX_WORKERS", 2)
+
+    client, mod = _web_test_client()
+    locations: list[str] = []
+    for _ in range(3):
+        resp = client.post(
+            "/case",
+            files={"manuscript": ("sample.txt", MANUSCRIPT_TEXT.encode("utf-8"), "text/plain")},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        locations.append(resp.headers["location"])
+
+    # 3 件目 (最後にアップロードした case) は queued のはず。
+    last_case_id = locations[-1].rsplit("/", 1)[-1]
+    view = client.get(f"/case/{last_case_id}")
+    assert view.status_code == 200
+    body = view.text
+    assert "順番待ち" in body or "処理待ち" in body
+    assert "前に" in body
+    # ahead = pos - max_workers + 1 = 2 - 2 + 1 = 1
+    assert "1 件" in body or "1件" in body
+
+    # 1 件目 (running) は queue 文言が出ない。
+    first_case_id = locations[0].rsplit("/", 1)[-1]
+    first_view = client.get(f"/case/{first_case_id}")
+    assert "順番待ち" not in first_view.text
+    assert "素材候補を取得しています" in first_view.text
+
+    gate.set()
+    for loc in locations:
+        _wait_for_case_ready(mod, loc.rsplit("/", 1)[-1])
+
+
 def test_view_case_pending_renders_loading_page(monkeypatch):
     """codex perf review #1: POST 直後 (background 完了前) は読み込み中 HTML を返す。"""
     import threading
