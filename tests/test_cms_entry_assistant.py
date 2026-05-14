@@ -288,9 +288,9 @@ def test_photo_audit_renders_actual_and_cached_candidate_images(tmp_path):
     cache_path.write_text(
         """
 {
-  "インドカレー ナン レストラン 日本": {
+  "ネパール人経営 インドカレー店": {
     "fetched_at": "2026-05-14T00:00:00+00:00",
-    "query": "インドカレー ナン レストラン 日本",
+    "query": "ネパール人経営 インドカレー店",
     "hits": [
       {
         "asset_id": "123456789",
@@ -320,7 +320,7 @@ def test_photo_audit_renders_actual_and_cached_candidate_images(tmp_path):
     assert report.stats.suggestions_with_cached_hits >= 1
     assert "https://example.com/actual.jpg" in html
     assert "https://example.com/candidate.jpg" in html
-    assert "インドカレー ナン レストラン 日本" in html
+    assert "ネパール人経営 インドカレー店" in html
 
 
 def test_cli_convert_writes_expected_files(tmp_path):
@@ -1066,7 +1066,12 @@ def test_build_suggestion_v8_h4_uses_heading_plus_surrounding_paragraphs():
 
 
 def test_build_suggestion_v8_h4_slots_do_not_collapse_on_lead():
-    """h4 スロットは lead_text には引っ張られない。別 slot は別 query になる。"""
+    """h4 スロットは lead_text には引っ張られない。別 slot は別 query になる。
+
+    v2 期は lead_text/article_title の強語 (例: 腰痛) が全 slot に伝播して同じクエリに
+    なるバグがあった。v8 は h4_text + 直近段落のみを使うため、別段落の slot は別クエリ
+    になる。
+    """
     s_a = build_suggestion(
         "h4_1", "■見出しA", h4_text="見出しA",
         surrounding_paragraphs=["皇居の周辺を散策。"], lead_text="腰痛と寝たきり",
@@ -1075,8 +1080,14 @@ def test_build_suggestion_v8_h4_slots_do_not_collapse_on_lead():
         "h4_2", "■見出しB", h4_text="見出しB",
         surrounding_paragraphs=["半導体工場が拡大。"], lead_text="腰痛と寝たきり",
     )
-    assert "皇居" in s_a.query_ja
-    assert "半導体" in s_b.query_ja
+    # 各 slot は周辺段落由来の異なるクエリになる (lead_text に引っ張られない)
+    assert s_a.query_ja != s_b.query_ja
+    assert "皇居" in s_a.query_ja  # type A LANDMARKS にヒット
+    # s_b は周辺段落「半導体工場」由来 (半導体=E or 工場=A、どちらでも v2 期の "腰痛" にはならない)
+    assert ("半導体" in s_b.query_ja) or ("工場" in s_b.query_ja)
+    # 重要: どちらのスロットにも lead_text の "腰痛" が混入しない
+    assert "腰" not in s_a.query_ja
+    assert "腰" not in s_b.query_ja
 
 
 def test_build_suggestion_v8_no_mechanical_suffix():
