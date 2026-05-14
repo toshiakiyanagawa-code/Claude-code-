@@ -73,10 +73,13 @@ class CaseState:
 _cases: dict[str, CaseState] = {}
 
 # 候補生成 (LLM + iStock) を背後で走らせる用の executor。
-# 1 案件あたり 1-3 分かかるので、ユーザーが連続でアップロードしても詰まらない
-# 程度の並列度。値は CMS_ENTRY_ASSISTANT_CASE_WORKERS で上書き可能。
+# 1 案件あたり 1-3 分かかる。max_workers=4 で 4 件同時に進められる。
+# 4 案件 × per-slot 6 worker = 24 nominal だが、iStock のグローバル rate limit
+# (_MIN_SEARCH_INTERVAL_S=2.5s) があるので peak の Chromium 同時起動は ~6 件で
+# 留まる。Codespaces (2 vCPU) でも安全な範囲。
+# 値は CMS_ENTRY_ASSISTANT_CASE_WORKERS で上書き可能。
 import concurrent.futures as _futures
-_BG_MAX_WORKERS = int(os.getenv("CMS_ENTRY_ASSISTANT_CASE_WORKERS") or "2")
+_BG_MAX_WORKERS = int(os.getenv("CMS_ENTRY_ASSISTANT_CASE_WORKERS") or "4")
 _CANDIDATE_BG_POOL = _futures.ThreadPoolExecutor(
     max_workers=_BG_MAX_WORKERS, thread_name_prefix="cms-cand"
 )
