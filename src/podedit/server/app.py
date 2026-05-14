@@ -48,7 +48,7 @@ class NoCacheStaticFiles(StaticFiles):
 
 from ..annotations import build_annotation_payload
 from ..audio import probe as audio_probe
-from ..edit import EditSession, compile_timeline, sha256_of_file
+from ..edit import EditSession, TimelineSegment, compile_timeline, sha256_of_file
 from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
@@ -916,6 +916,177 @@ def create_app(config: ServeConfig) -> FastAPI:
 
         return FileResponse(
             link, media_type="audio/wav", filename=p.name,
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(_cleanup),
+        )
+
+    # ------- clip export (selection-only) -------
+    # Lets the editor cut just the highlighted range out of a 30-minute
+    # episode as a standalone file. Independent of preview/render: clips are
+    # short, the user usually only needs them once, and bypassing the long
+    # preview pipeline avoids burning the wav cache slot on a throwaway.
+    # Clip safety caps — keep a runaway / accidentally-huge clip from blowing
+    # disk + render budget. Editors normally cut 5-120 s segments, so these
+    # are generous but firm.
+    CLIP_MAX_KEEPS = 200
+    CLIP_MAX_DURATION_SEC = 1800.0  # 30 minutes
+
+    def _clip_number(v: object, field: str) -> float:
+        # Accept ints/floats (but NOT bool — isinstance(True, int) is True),
+        # reject NaN/Inf. Strings/None get rejected here instead of slipping
+        # through float() and behaving unpredictably down in the renderer.
+        import math
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise HTTPException(status_code=400, detail=f"{field} must be a number, got {type(v).__name__}")
+        f = float(v)
+        if not math.isfinite(f):
+            raise HTTPException(status_code=400, detail=f"{field} must be finite")
+        return f
+
+    @app.post("/api/export/clip")
+    def export_clip(body: dict) -> FileResponse:
+        require_active()
+        keeps_in = (body or {}).get("keeps")
+        fmt = (body or {}).get("fmt", "mp3")
+        if fmt not in ("wav", "mp3"):
+            raise HTTPException(status_code=400, detail="fmt must be 'wav' or 'mp3'")
+        if not isinstance(keeps_in, list) or not keeps_in:
+            raise HTTPException(status_code=400, detail="keeps[] required (selected source ranges)")
+        if len(keeps_in) > CLIP_MAX_KEEPS:
+            raise HTTPException(status_code=400, detail=f"too many keeps ({len(keeps_in)} > {CLIP_MAX_KEEPS})")
+        # Validate and snap keeps into TimelineSegments with edited offsets.
+        # Normalising on the server (not trusting UI-supplied edited times)
+        # means a buggy / hand-crafted client can't ask us to render
+        # overlapping or out-of-order segments.
+        with state.session_lock:
+            assert state.session is not None and state.audio_path is not None
+            source_duration = state.session.source_audio.duration_sec
+            snap_audio_path = state.audio_path
+            snap_work_dir = state.work_dir
+            snap_kpi_log = state.kpi_log_path
+            snap_audio_stem = state.audio_path.stem
+        segs: list[TimelineSegment] = []
+        cursor = 0.0
+        prev_end: float | None = None
+        for raw in keeps_in:
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail="each keep must be an object")
+            s = _clip_number(raw.get("source_start"), "source_start")
+            e = _clip_number(raw.get("source_end"), "source_end")
+            if not (0.0 <= s < e <= source_duration + 1e-3):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"keep [{s}, {e}] falls outside [0, {source_duration:.2f}] or is empty",
+                )
+            if prev_end is not None and s < prev_end - 1e-6:
+                raise HTTPException(status_code=400, detail="keeps must be ascending and non-overlapping")
+            length = e - s
+            segs.append(TimelineSegment(
+                source_start=s, source_end=e,
+                edited_start=cursor, edited_end=cursor + length,
+            ))
+            cursor += length
+            prev_end = e
+        if cursor <= 0:
+            raise HTTPException(status_code=400, detail="clip duration is zero")
+        if cursor > CLIP_MAX_DURATION_SEC:
+            raise HTTPException(
+                status_code=400,
+                detail=f"clip duration {cursor:.1f}s exceeds limit {CLIP_MAX_DURATION_SEC:.0f}s — use the full-episode Export instead",
+            )
+        # Hash keeps + fmt so two clicks on the same selection share output.
+        clip_key_blob = json.dumps(
+            {"keeps": [(s.source_start, s.source_end) for s in segs], "fmt": fmt,
+             "source": snap_audio_path.name, "renderer_version": RENDERER_VERSION},
+            sort_keys=True,
+        ).encode()
+        clip_key = hashlib.sha256(clip_key_blob).hexdigest()[:16]
+        wav_path = snap_work_dir / f"{snap_audio_stem}.clip.{clip_key}.wav"
+        out_path = wav_path if fmt == "wav" else snap_work_dir / f"{snap_audio_stem}.clip.{clip_key}.mp3"
+        with _lock_for(f"clip:{clip_key}"):
+            if not wav_path.exists():
+                t0 = time.time()
+                try:
+                    render_segments(
+                        snap_audio_path,
+                        segments=segs,
+                        output=wav_path,
+                        source_duration=source_duration,
+                        crossfade_ms=10.0,
+                        lufs_target=-16.0,
+                        true_peak_ceiling_dbtp=-1.0,
+                    )
+                except RenderError as e:
+                    raise HTTPException(status_code=500, detail=str(e)) from e
+                _append_jsonl(snap_kpi_log, {
+                    "server_ts": time.time(), "type": "server.clip.rendered",
+                    "clip_key": clip_key, "wall_sec": time.time() - t0,
+                    "keep_count": len(segs), "duration_out": cursor,
+                })
+            if fmt == "mp3" and not out_path.exists():
+                if shutil.which("ffmpeg") is None:
+                    raise HTTPException(status_code=500, detail="ffmpeg not found on PATH; cannot transcode")
+                try:
+                    wav_pinned = _pin_inode_via_hardlink(
+                        wav_path, dir=snap_work_dir,
+                        prefix=f".clipsrc-{clip_key}-", suffix=".wav",
+                    )
+                except OSError as e:
+                    raise HTTPException(status_code=500, detail=f"failed to pin clip wav: {e}") from e
+                fd, tmp_str = tempfile.mkstemp(
+                    prefix=f".{snap_audio_stem}.clip.{clip_key}.",
+                    suffix=".mp3", dir=str(snap_work_dir),
+                )
+                os.close(fd)
+                tmp = Path(tmp_str)
+                try:
+                    proc = subprocess.run(
+                        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                         "-i", str(wav_pinned), "-codec:a", "libmp3lame",
+                         "-q:a", "2", str(tmp)],
+                        check=False, timeout=300,
+                        capture_output=True, text=True,
+                    )
+                    if proc.returncode != 0:
+                        # Surface a one-line summary of ffmpeg's error log so
+                        # the UI can show something more useful than "500".
+                        err = (proc.stderr or "").strip().splitlines()[-1:][:1]
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"ffmpeg transcode failed: {err[0] if err else 'no stderr'}",
+                        )
+                    try:
+                        os.link(str(tmp), str(out_path))
+                    except FileExistsError:
+                        pass
+                except subprocess.TimeoutExpired:
+                    raise HTTPException(status_code=504, detail="ffmpeg transcode timed out") from None
+                finally:
+                    try: tmp.unlink()
+                    except OSError: pass
+                    try: wav_pinned.unlink()
+                    except OSError: pass
+        if not out_path.exists():
+            raise HTTPException(status_code=500, detail="clip output missing after render")
+        # Pin the served file via hardlink so a concurrent GC can't unlink it
+        # between this check and Starlette opening it (same as /api/export).
+        try:
+            link = _pin_inode_via_hardlink(
+                out_path, dir=snap_work_dir,
+                prefix=f".clipserve-{clip_key}-", suffix=f".{fmt}",
+            )
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"failed to pin clip output: {e}") from e
+
+        def _cleanup(path: Path = link) -> None:
+            try: path.unlink()
+            except OSError: pass
+
+        download_name = f"{snap_audio_stem}.clip.{fmt}"
+        return FileResponse(
+            link,
+            media_type="audio/mpeg" if fmt == "mp3" else "audio/wav",
+            filename=download_name,
             headers={"Cache-Control": "no-store"},
             background=BackgroundTask(_cleanup),
         )

@@ -28,6 +28,7 @@
   const $scrubber = $('scrubber');
   const $btnAudition = $('btn-audition');
   const $btnExport = $('btn-export');
+  const $btnExportClip = $('btn-export-clip');
   const $exportFormat = $('export-format');
   const $btnCopyTranscript = $('btn-copy-transcript');
   const $btnOpen = $('btn-open');
@@ -1802,6 +1803,11 @@
     $btnPlay.disabled = !state.hasActive;
     $scrubber.disabled = !state.hasActive;
     $exportFormat.disabled = !state.hasActive;
+    if ($btnExportClip) {
+      // Honour an in-progress clip export so refreshButtons() from a parallel
+      // path (autosave / op apply) can't re-enable the button mid-render.
+      $btnExportClip.disabled = state.exportingClip || !state.hasActive || !state.selection;
+    }
     updateFillerControls();
   }
 
@@ -2231,6 +2237,78 @@
     }
   }
   $btnExport.addEventListener('click', exportEditedAudio);
+
+  async function exportSelectedClip() {
+    if (!state.hasActive || !state.selection) return;
+    const sel = selectionRange();
+    if (!sel) return;
+    // Build keeps from the intersection of the selected source range and the
+    // current timeline. This way deletes inside the selection are honoured
+    // (the user gets the edited version of those 10 seconds, not the raw
+    // source-time slice with the cut audio re-introduced).
+    const keeps = [];
+    for (const seg of state.timeline) {
+      const s = Math.max(sel.start, seg.sourceStart);
+      const e = Math.min(sel.end, seg.sourceEnd);
+      if (e > s + 1e-6) keeps.push({ source_start: s, source_end: e });
+    }
+    if (keeps.length === 0) {
+      setModePill('error', 'empty clip');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 1500);
+      logKPI('ui.export.clip.empty', { sel_start: sel.start, sel_end: sel.end });
+      return;
+    }
+    const fmt = $exportFormat.value === 'wav' ? 'wav' : 'mp3';
+    const prevLabel = $btnExportClip.textContent;
+    state.exportingClip = true;
+    $btnExportClip.disabled = true;
+    $btnExportClip.textContent = fmt === 'mp3' ? 'render+mp3…' : 'render…';
+    const t0 = performance.now();
+    try {
+      // Flush autosave first so the timeline we just sampled keeps[] from
+      // matches what the server has on disk.
+      await flushSave();
+      const r = await fetch('/api/export/clip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keeps, fmt }),
+      });
+      if (!r.ok) {
+        let detail = `HTTP ${r.status}`;
+        try { const j = await r.json(); if (j.detail) detail = j.detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      // The clip route returns the bytes directly (no separate /export GET
+      // step). We stream into a blob URL so the browser save dialog fires.
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `clip.${fmt}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke after a short delay so the browser has time to actually
+      // download. Premature revoke can abort the save on some browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      logKPI('ui.export.clip', {
+        fmt, sel_start: sel.start, sel_end: sel.end,
+        keep_count: keeps.length, latency_ms: performance.now() - t0,
+        bytes: blob.size,
+      });
+    } catch (e) {
+      setModePill('error', 'clip error');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 2500);
+      logKPI('ui.export.clip.error', { error: e.message });
+    } finally {
+      state.exportingClip = false;
+      $btnExportClip.textContent = prevLabel || '選択範囲だけDL';
+      refreshButtons();
+    }
+  }
+  if ($btnExportClip) $btnExportClip.addEventListener('click', exportSelectedClip);
 
   async function writeClipboardText(text) {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
