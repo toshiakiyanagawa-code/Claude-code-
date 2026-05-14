@@ -2263,6 +2263,145 @@
   $btnPasteBefore.addEventListener('click', () => pasteClipboard('before'));
   $btnPasteAfter.addEventListener('click', () => pasteClipboard('after'));
 
+  // ------- transcript search -------
+  // Free-text search across the rendered words. Editors specifically asked
+  // for "type a phrase, jump to that moment" — much faster than scrubbing a
+  // 30-min episode when they remember the wording but not the time. Match
+  // is a case-insensitive substring on word.text; ja text is not normalised
+  // (no kana folding) since the query and the transcript both come from
+  // the same ASR output.
+  const $searchInput = $('search-input');
+  const $searchInfo = $('search-info');
+  const $btnSearchNext = $('btn-search-next');
+  const $btnSearchPrev = $('btn-search-prev');
+  let searchMatches = [];       // ascending word indices
+  let searchActiveIdx = -1;     // index INTO searchMatches
+  let searchPaintedActive = -1; // word idx currently wearing .search-active
+
+  function clearSearchHighlights() {
+    for (const i of searchMatches) {
+      const w = words[i];
+      if (w && w.el) w.el.classList.remove('search-hit', 'search-active');
+    }
+    if (searchPaintedActive >= 0 && words[searchPaintedActive]) {
+      words[searchPaintedActive].el.classList.remove('search-active');
+    }
+    searchPaintedActive = -1;
+  }
+  function updateSearchInfo() {
+    if (!$searchInfo) return;
+    if (searchMatches.length === 0) {
+      $searchInfo.hidden = !$searchInput.value;
+      $searchInfo.textContent = $searchInput.value ? '0 件' : '0 / 0';
+      $searchInfo.classList.toggle('no-hits', !!$searchInput.value);
+    } else {
+      $searchInfo.hidden = false;
+      $searchInfo.classList.remove('no-hits');
+      $searchInfo.textContent = `${searchActiveIdx + 1} / ${searchMatches.length}`;
+    }
+    if ($btnSearchNext) $btnSearchNext.disabled = searchMatches.length === 0;
+    if ($btnSearchPrev) $btnSearchPrev.disabled = searchMatches.length === 0;
+  }
+  function paintSearchActive() {
+    // Move .search-active off the previous match onto the current one.
+    // .search-hit stays on every match across navigation.
+    if (searchPaintedActive >= 0 && words[searchPaintedActive]) {
+      words[searchPaintedActive].el.classList.remove('search-active');
+    }
+    searchPaintedActive = -1;
+    if (searchActiveIdx < 0 || searchActiveIdx >= searchMatches.length) return;
+    const wIdx = searchMatches[searchActiveIdx];
+    const w = words[wIdx];
+    if (!w || !w.el) return;
+    w.el.classList.add('search-active');
+    searchPaintedActive = wIdx;
+    try { w.el.scrollIntoView({ block: 'center', behavior: 'auto' }); } catch (_) {}
+    if ($player && Number.isFinite(w.start)) $player.currentTime = w.start;
+    logKPI('ui.search.jump', { word_idx: wIdx, t: w.start, match_index: searchActiveIdx });
+  }
+  function runSearch(query) {
+    clearSearchHighlights();
+    searchMatches = [];
+    searchActiveIdx = -1;
+    const q = (query || '').trim();
+    if (!q) { updateSearchInfo(); return; }
+    const needle = q.toLowerCase();
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      const text = (w.el?.textContent || '').toLowerCase();
+      if (text.includes(needle)) {
+        searchMatches.push(i);
+        w.el.classList.add('search-hit');
+      }
+    }
+    if (searchMatches.length > 0) {
+      // Default to the first match at/after the current playhead so a
+      // mid-listening search jumps forward rather than back to t=0.
+      const t = $player ? $player.currentTime : 0;
+      let pick = 0;
+      for (let k = 0; k < searchMatches.length; k++) {
+        if (words[searchMatches[k]].start >= t - 0.05) { pick = k; break; }
+      }
+      searchActiveIdx = pick;
+      paintSearchActive();
+    }
+    updateSearchInfo();
+    logKPI('ui.search.query', { q, hits: searchMatches.length });
+  }
+  function searchNext() {
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx + 1) % searchMatches.length;
+    paintSearchActive(); updateSearchInfo();
+  }
+  function searchPrev() {
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx - 1 + searchMatches.length) % searchMatches.length;
+    paintSearchActive(); updateSearchInfo();
+  }
+  if ($searchInput) {
+    let searchDebounce = null;
+    $searchInput.addEventListener('input', () => {
+      clearTimeout(searchDebounce);
+      const val = $searchInput.value;
+      searchDebounce = setTimeout(() => {
+        runSearch(val);
+        $searchInput.dataset.lastQuery = val;
+      }, 120);
+    });
+    $searchInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        clearTimeout(searchDebounce);
+        if (searchMatches.length === 0 || $searchInput.value !== ($searchInput.dataset.lastQuery || '')) {
+          runSearch($searchInput.value);
+          $searchInput.dataset.lastQuery = $searchInput.value;
+          return;
+        }
+        if (ev.shiftKey) searchPrev(); else searchNext();
+        return;
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        $searchInput.value = '';
+        runSearch('');
+        $searchInput.dataset.lastQuery = '';
+        $searchInput.blur();
+      }
+    });
+  }
+  if ($btnSearchNext) $btnSearchNext.addEventListener('click', searchNext);
+  if ($btnSearchPrev) $btnSearchPrev.addEventListener('click', searchPrev);
+  // Focus the search box on "/" (Slack/GitHub/Twitter convention).
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== '/' || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const tag = (ev.target && ev.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (ev.target && ev.target.isContentEditable)) return;
+    if (!$searchInput) return;
+    ev.preventDefault();
+    $searchInput.focus();
+    $searchInput.select();
+  });
+
   // ------- custom player controls -------
   $btnPlay.addEventListener('click', () => {
     if (!state.hasActive) return;

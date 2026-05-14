@@ -45,6 +45,12 @@
   <button id="btn-follow-playhead" class="toolbar-toggle" data-active="false" title="再生位置に画面を自動追従させる (デフォルト OFF: 別の場所を自由に編集できる)">追従 <span id="follow-state">OFF</span></button>
   <span class="mode-pill" id="mode-pill">source</span>
   <span class="spacer"></span>
+  <span class="search-box">
+    <input id="search-input" type="search" placeholder="文字起こしを検索 (/)" aria-label="文字起こしを検索" autocomplete="off" />
+    <span class="search-info" id="search-info" hidden>0 / 0</span>
+    <button id="btn-search-prev" type="button" disabled title="前のマッチ (Shift+Enter)">‹</button>
+    <button id="btn-search-next" type="button" disabled title="次のマッチ (Enter)">›</button>
+  </span>
   <span class="skip-pill" id="skip-pill" title="Flashes red while playhead is inside a cut">no cut</span>
   <span class="clipboard-pill" id="clipboard-pill" hidden></span>
   <span class="stat"><strong id="kpi-time">0.00s</strong></span>
