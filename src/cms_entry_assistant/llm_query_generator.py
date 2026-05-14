@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
-PROMPT_VERSION = "llm-query-v1"
+PROMPT_VERSION = "llm-query-v2-editor-policy"
 ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
 ANTHROPIC_API_KEY_ENV = ANTHROPIC_API_KEY
 
@@ -295,21 +295,42 @@ def build_prompt(slot: Any, context: Any | None = None) -> str:
         payload["context"] = _jsonable(context)
 
     return (
-        "Create a compact search-query plan for finding reliable source material "
-        "for the CMS entry slot below.\n"
-        "Return JSON only. Do not wrap the response in markdown.\n"
-        "Treat slot_label / type_label / primary_query / rationale as the strongest "
-        "signals. The article_title_hint applies to the whole article and should be "
-        "used only as weak background context — never copy it into every query, or "
-        "all slots will look identical.\n"
-        "Use this schema:\n"
+        "あなたは日本の出版社「プレジデント社」(プレジデントオンライン) の CMS 入稿担当者の\n"
+        "アシスタントです。記事に添える iStock 写真を検索するためのクエリを生成してください。\n"
+        "\n"
+        "## 必須ルール (絶対遵守)\n"
+        "プレジデントオンライン編集部の写真選定ポリシー:\n"
+        "  1. **人物は必ず日本人**。\"japanese\", \"asian businessman\", \"日本人\" を必ず含める。\n"
+        "     白人 / 欧米人 / 西洋人を意図的に避ける (negative_keywords に\n"
+        "     \"caucasian\", \"western\", \"foreigner\", \"外国人\", \"white\" を入れる)。\n"
+        "  2. **人物の顔を写さない**。後ろ姿 (\"back view\", \"後ろ姿\")、手元 (\"hands\",\n"
+        "     \"手元\")、足元 (\"feet\", \"足元\")、シルエット (\"silhouette\")、影、\n"
+        "     ぼかし、伏し目構図のいずれかを必ず指定する。\n"
+        "     negative_keywords に \"face\", \"smiling\", \"portrait\", \"looking at camera\",\n"
+        "     \"顔\", \"笑顔\" を入れる。\n"
+        "  3. **抽象的・概念的なイメージを優先**。具体的人物よりも、ランドマーク、\n"
+        "     国旗、グラフ、シンボル、街並み、産業景観など「※写真はイメージです」\n"
+        "     キャプションで通せるカットを選ぶ。\n"
+        "  4. 政治家・著名人など実在人物の本物の写真が必要な場合は iStock では取れない\n"
+        "     ため、type_label が「報道/資料」相当ならクエリは抽象寄りでよい\n"
+        "     (negative_keywords は 1-2 のみ厳格化)。\n"
+        "\n"
+        "## クエリ生成方針\n"
+        "- slot_label / type_label / primary_query / rationale を最重視。\n"
+        "- article_title_hint は記事全体の弱い文脈。全クエリにコピーしない\n"
+        "  (全 slot が同じ写真になる)。\n"
+        "- 日本語と英語を混在させる (iStock は両方インデックスしている)。\n"
+        "- 1 クエリは 2-4 ワードで短く具体的に。\n"
+        "\n"
+        "## 出力\n"
+        "Return JSON only. Do not wrap the response in markdown. Use this schema:\n"
         "{\n"
-        '  "intent": "short description of what must be found",\n'
-        '  "keywords": ["important included terms"],\n'
-        '  "negative_keywords": ["terms to avoid"],\n'
-        '  "search_queries": ["query 1", "query 2"],\n'
-        '  "rationale": "brief reason these queries should work",\n'
-        '  "confidence": 0.0\n'
+        '  "intent": "見つけるべきイメージの 1 行説明",\n'
+        '  "keywords": ["含めるべき重要キーワード"],\n'
+        '  "negative_keywords": ["避けるべき語 (上記ルール 1/2 の禁止語を必ず含める)"],\n'
+        '  "search_queries": ["iStock 検索クエリ (上記ルールを反映)"],\n'
+        '  "rationale": "なぜこのクエリでポリシーに沿った写真が取れるか",\n'
+        '  "confidence": 0.0-1.0\n'
         "}\n\n"
         f"{json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)}"
     )

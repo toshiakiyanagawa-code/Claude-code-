@@ -58,6 +58,23 @@ class _StubClient:
 # ---------------------------------------------------------------------------
 
 
+def test_build_prompt_embeds_editor_policy_rules():
+    """Policy-2: build_prompt は編集部の写真ポリシー (日本人/顔なし/抽象) を
+    LLM に明示する。文言が消えるとポリシーが守られなくなるので回帰防止。"""
+    prompt = gen.build_prompt({"slot_key": "hero", "primary_query": "test"})
+    # 必須ルール 1: 日本人優先
+    assert "日本人" in prompt
+    assert "japanese" in prompt.lower()
+    # 必須ルール 2: 顔なし
+    assert "後ろ姿" in prompt or "back view" in prompt.lower()
+    assert "手元" in prompt or "hands" in prompt.lower()
+    # 必須ルール 3: negative_keywords に避ける語
+    assert "caucasian" in prompt.lower() or "外国人" in prompt
+    assert "face" in prompt.lower() and "smiling" in prompt.lower()
+    # プロンプトバージョンが v2 系で固定されている
+    assert gen.PROMPT_VERSION.startswith("llm-query-v2")
+
+
 def test_parse_llm_response_parses_json_object():
     payload = json.dumps(
         {
