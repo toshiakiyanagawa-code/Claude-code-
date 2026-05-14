@@ -244,6 +244,100 @@ def _maybe_generate_llm_plan(
     return plan
 
 
+def _process_slot(
+    s: IstockSearchSuggestion,
+    *,
+    mode: str,
+    prefs: PreferencesStore,
+    history: UsageHistory,
+    article_title: str,
+    hits_per_slot: int,
+) -> list[IstockSearchHit]:
+    """Run LLM + crawl + rerank for one slot. Used both serially and in a pool."""
+    llm_plan: Any | None = None
+    if mode in {"llm", "llm_rerank"}:
+        llm_plan = _maybe_generate_llm_plan(s, article_title=article_title)
+
+    seen_queries: set[str] = set()
+    guaranteed: list[str] = []
+    fallback_queries: list[str] = []
+
+    def _normalize(query: str) -> str:
+        return " ".join((query or "").split()).strip()
+
+    def _add(query: str, *, bucket: list[str]) -> None:
+        normalized = _normalize(query)
+        if not normalized or normalized in seen_queries:
+            return
+        seen_queries.add(normalized)
+        bucket.append(normalized)
+
+    # LLM の search_queries は上から優先度順なので、上位 N 件だけを guaranteed
+    # に積む。fresh iStock 取得 1 件あたり 2.5s 以上の rate limit が利くので、
+    # 全 5-7 件を毎回叩くと初回アップロードのレスポンスが Codespaces プロキシ
+    # の timeout を超える。CMS_ENTRY_ASSISTANT_MAX_LLM_QUERIES で上書き可能。
+    llm_query_cap = int(os.getenv("CMS_ENTRY_ASSISTANT_MAX_LLM_QUERIES") or "3")
+    if llm_plan is not None:
+        llm_queries = list(getattr(llm_plan, "search_queries", []) or [])
+        for q in llm_queries[:llm_query_cap]:
+            _add(q, bucket=guaranteed)
+    _add(s.query_ja, bucket=guaranteed)
+    for q in (getattr(s, "query_plan", []) or []):
+        _add(q, bucket=fallback_queries)
+
+    if not guaranteed and not fallback_queries:
+        return []
+
+    collected: list[IstockSearchHit] = []
+    seen: set[str] = set()
+    # llm_rerank の collect_until は元 30 件だったが、iStock crawler に
+    # _MIN_SEARCH_INTERVAL_S = 2.5s のグローバル rate limit があり、
+    # 多数 slot 並列でも iStock は直列化される。15 件で rerank の選別余地は
+    # 十分残り、初回アップロードでも Codespaces のプロキシタイムアウト内に
+    # 収まりやすくなる。CMS_ENTRY_ASSISTANT_RERANK_POOL_SIZE で上書き可能。
+    if mode == "llm_rerank":
+        collect_until = int(os.getenv("CMS_ENTRY_ASSISTANT_RERANK_POOL_SIZE") or "15")
+    else:
+        collect_until = hits_per_slot + 2
+
+    def _ingest(query: str) -> None:
+        try:
+            hits = _crawl_search_safe(query, limit=8)
+        except Exception:
+            return
+        for hit in hits:
+            identity_keys = _hit_identity_keys(hit)
+            if any(k in seen for k in identity_keys):
+                continue
+            seen.update(identity_keys)
+            collected.append(hit)
+
+    for query in guaranteed:
+        _ingest(query)
+    for query in fallback_queries:
+        if len(collected) >= collect_until:
+            break
+        _ingest(query)
+
+    if mode == "llm_rerank" and llm_plan is not None and collected:
+        try:
+            from cms_entry_assistant.candidate_reranker import (  # noqa: WPS433
+                rerank_candidates,
+            )
+            baseline = rank_hits(
+                collected, preferences=prefs, history=history, limit=30
+            )
+            view = _llm_plan_to_rerank_view(llm_plan)
+            ranked = rerank_candidates(baseline, view, prefs=prefs)
+            return [r.candidate for r in ranked[:hits_per_slot]]
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("rerank failed for %s: %s", s.slot_key, exc)
+
+    return rank_hits(
+        collected, preferences=prefs, history=history, limit=hits_per_slot
+    )
+
+
 def _fetch_candidates(
     suggestions: list[IstockSearchSuggestion],
     *,
@@ -260,6 +354,11 @@ def _fetch_candidates(
         フォールバックとして連結する。Rank は rank_hits。
       - llm_rerank: llm モード + 30 候補集めてから candidate_reranker で再順位付け。
         LLM が失敗したら legacy にフォールバックする。
+
+    並列化: LLM 呼び出し (~10s/slot) と iStock 取得が直列だと 6-7 slot で
+    1-2 分かかり、Codespaces プロキシのタイムアウトに引っかかる。ThreadPoolExecutor
+    で slot 単位に並列化する (max_workers は env CMS_ENTRY_ASSISTANT_SLOT_WORKERS、
+    デフォルト 6)。Anthropic SDK は thread-safe (HTTP client 経由)。
     """
     out: dict[str, list[IstockSearchHit]] = {}
     if not is_available():
@@ -273,94 +372,54 @@ def _fetch_candidates(
 
     prefs = PreferencesStore()
     history = UsageHistory()
-    attempts_by_slot: dict[str, dict[str, int]] = {}
 
+    if not suggestions:
+        return diversify_case_candidates(out)
+
+    max_workers = int(
+        os.getenv("CMS_ENTRY_ASSISTANT_SLOT_WORKERS") or "6"
+    )
+    workers = max(1, min(max_workers, len(suggestions)))
+
+    if workers == 1:
+        results = {
+            s.slot_key: _process_slot(
+                s,
+                mode=mode,
+                prefs=prefs,
+                history=history,
+                article_title=article_title,
+                hits_per_slot=hits_per_slot,
+            )
+            for s in suggestions
+        }
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_slot,
+                    s,
+                    mode=mode,
+                    prefs=prefs,
+                    history=history,
+                    article_title=article_title,
+                    hits_per_slot=hits_per_slot,
+                ): s
+                for s in suggestions
+            }
+            for future, slot in futures.items():
+                try:
+                    results[slot.slot_key] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("slot %s failed: %s", slot.slot_key, exc)
+                    results[slot.slot_key] = []
+
+    # Preserve original suggestions order.
     for s in suggestions:
-        llm_plan: Any | None = None
-        if mode in {"llm", "llm_rerank"}:
-            llm_plan = _maybe_generate_llm_plan(s, article_title=article_title)
-
-        # codex Phase 3 must-fix #1:
-        # LLM が broad / title 汚染された query を返しても、legacy primary は必ず
-        # 実行する。そこで queries を 2 段に分ける:
-        #   - guaranteed: LLM の search_queries + legacy primary。早い break の対象外。
-        #   - fallback: legacy query_plan。pool が collect_until を超えたら break OK。
-        seen_queries: set[str] = set()
-        guaranteed: list[str] = []
-        fallback_queries: list[str] = []
-
-        def _normalize(query: str) -> str:
-            return " ".join((query or "").split()).strip()
-
-        def _add(query: str, *, bucket: list[str]) -> None:
-            normalized = _normalize(query)
-            if not normalized or normalized in seen_queries:
-                return
-            seen_queries.add(normalized)
-            bucket.append(normalized)
-
-        if llm_plan is not None:
-            for q in getattr(llm_plan, "search_queries", []) or []:
-                _add(q, bucket=guaranteed)
-        _add(s.query_ja, bucket=guaranteed)
-        for q in (getattr(s, "query_plan", []) or []):
-            _add(q, bucket=fallback_queries)
-
-        if not guaranteed and not fallback_queries:
-            out[s.slot_key] = []
-            continue
-
-        attempts: dict[str, int] = {}
-        attempts_by_slot[s.slot_key] = attempts
-        collected: list[IstockSearchHit] = []
-        seen: set[str] = set()
-        # llm_rerank は 30 件まで集めて再順位付け。それ以外は diversify 用に +2。
-        collect_until = 30 if mode == "llm_rerank" else hits_per_slot + 2
-
-        def _ingest(query: str) -> None:
-            try:
-                hits = _crawl_search_safe(query, limit=8)
-            except Exception:
-                attempts[query] = -1
-                return
-            attempts[query] = len(hits)
-            for hit in hits:
-                identity_keys = _hit_identity_keys(hit)
-                if any(k in seen for k in identity_keys):
-                    continue
-                seen.update(identity_keys)
-                collected.append(hit)
-
-        # 1. guaranteed: 全部回す (legacy primary 含めて必ず候補プールに入れる)
-        for query in guaranteed:
-            _ingest(query)
-        # 2. fallback: collect_until に達したら止める
-        for query in fallback_queries:
-            if len(collected) >= collect_until:
-                break
-            _ingest(query)
-
-        if mode == "llm_rerank" and llm_plan is not None and collected:
-            try:
-                from cms_entry_assistant.candidate_reranker import (  # noqa: WPS433
-                    rerank_candidates,
-                )
-                # codex Phase 3 must-fix #2: rank_hits (preferences + history)
-                # の既存 signal を rerank 前に通し、tie-break として残す。
-                baseline = rank_hits(
-                    collected, preferences=prefs, history=history, limit=30
-                )
-                view = _llm_plan_to_rerank_view(llm_plan)
-                ranked = rerank_candidates(baseline, view, prefs=prefs)
-                out[s.slot_key] = [r.candidate for r in ranked[:hits_per_slot]]
-                continue
-            except Exception as exc:  # noqa: BLE001
-                _log.warning("rerank failed for %s: %s", s.slot_key, exc)
-                # fall through to rank_hits
-
-        out[s.slot_key] = rank_hits(
-            collected, preferences=prefs, history=history, limit=hits_per_slot
-        )
+        out[s.slot_key] = results.get(s.slot_key, [])
 
     return diversify_case_candidates(out)
 

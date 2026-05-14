@@ -36,7 +36,14 @@ from typing import Iterable
 DEFAULT_CACHE_PATH = Path("data/istock_search_cache.json")
 
 # Process-wide rate limit. iStock is sensitive — keep this generous.
-_MIN_SEARCH_INTERVAL_S = 2.5
+# iStock 側のブロック (HTTP failure) を引き起こさないために 2.5s をデフォルトに戻す。
+# Codespaces 側のタイムアウト緩和は別の手段 (slot 並列化 + LLM/iStock 両方の cache)
+# で吸収する。緊急時のみ CMS_ENTRY_ASSISTANT_ISTOCK_INTERVAL_S で下げてよい。
+import os as _os
+_MIN_SEARCH_INTERVAL_S = float(
+    _os.getenv("CMS_ENTRY_ASSISTANT_ISTOCK_INTERVAL_S") or "2.5"
+)
+del _os
 _LAST_SEARCH_AT: float = 0.0
 
 
