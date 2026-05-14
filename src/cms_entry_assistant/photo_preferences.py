@@ -239,30 +239,50 @@ def rank_hits(
     return [h for _, h in scored][:limit]
 
 
-def _editorial_people_policy_score(hit, query_context: str) -> int:
-    context = (query_context or "").lower()
-    if not any(
-        token in context
-        for token in (
-            "日本人",
-            "顔なし",
-            "後ろ姿",
-            "手元",
-            "japanese",
-            "no face",
-            "back view",
-            "hands",
-        )
-    ):
-        return 0
+# 編集者ポリシー (2026-05-13 確定、再適用 2026-05-14):
+# - 人物は日本人に絞る
+# - 顔はうつさない (後ろ姿 / 手元 / 足元 / シルエット を優先)
+# - 抽象的な写真 / シンボル / イメージ を優先
+# 旧実装は query_context に "日本人 顔なし ..." の機械的接尾辞が入っているか
+# どうかで gate していたが、codex Phase 2 で接尾辞が外れたため永久に発火しない
+# 状態になっていた。gate を hit alt の人物指標に変更し、人物が写ってる候補だけ
+# にポリシーを当てる (landmark / 抽象シンボルなど人物が写っていない hit は
+# 影響を受けない)。
+_PEOPLE_INDICATORS = (
+    "人", "人物", "男", "女", "笑顔", "ポートレート", "顔",
+    "people", "person", "man", "woman", "men", "women",
+    "face", "smiling", "portrait", "boy", "girl", "child",
+    "family", "team", "group", "couple",
+)
+_NO_FACE_INDICATORS = (
+    "後ろ姿", "背中", "手元", "足元", "シルエット", "顔なし",
+    "back view", "rear view", "from behind", "hands", "feet", "silhouette", "no face",
+)
 
+
+def _editorial_people_policy_score(hit, query_context: str) -> int:
+    """Apply editor policy (Japanese / no-face / abstract) for people-bearing hits.
+
+    人物が写っている (alt に人物指標がある) 候補だけスコア対象。
+    landmark / 抽象シンボル等の人物無し hit は触らない。
+    """
     alt = (getattr(hit, "alt", "") or "").lower()
     detail = (getattr(hit, "detail_url", "") or "").lower()
     haystack = f"{alt} {detail}"
+
+    # 1) hit 自体が "顔なし" 構図 (後ろ姿/手元 etc.) なら、人物指標がなくても
+    #    ポジティブ判定を残す (こういう hit は積極的に上に上げたい)。
+    is_no_face_composition = any(t in haystack for t in _NO_FACE_INDICATORS)
+
+    # 2) hit に人物指標があるか? 無ければポリシー無関係なので 0。
+    is_people_bearing = any(t in haystack for t in _PEOPLE_INDICATORS)
+    if not is_people_bearing and not is_no_face_composition:
+        return 0
+
     score = 0
     if any(token in haystack for token in ("日本人", "日本の", "japanese", "asian")):
         score += 8
-    if any(token in haystack for token in ("後ろ姿", "背中", "手元", "足元", "シルエット", "顔なし", "back view", "hands", "feet", "silhouette", "no face")):
+    if is_no_face_composition:
         score += 8
     if any(token in haystack for token in ("顔", "笑顔", "ポートレート", "カメラ目線", "face", "smiling", "portrait", "looking at camera")):
         score -= 8

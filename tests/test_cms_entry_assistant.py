@@ -243,6 +243,62 @@ def test_rank_hits_prioritizes_japanese_no_face_people_policy(tmp_path):
     assert ranked[0].asset_id == "2"
 
 
+def test_rank_hits_applies_policy_without_magic_query_suffix(tmp_path):
+    """編集者ポリシー (日本人優先 / 顔なし / 抽象) は query に「日本人 顔なし」を
+    含めなくても、hit alt に人物指標があれば自動発火する (2026-05-14 修正)。"""
+    class Hit:
+        def __init__(self, asset_id: str, alt: str):
+            self.asset_id = asset_id
+            self.alt = alt
+            self.detail_url = ""
+            self.photographer_username = ""
+
+    hits = [
+        Hit("foreign-face", "笑顔の白人男性 経営者 ポートレート"),
+        Hit("japanese-hands", "日本人 ビジネスマン 手元 書類"),
+        Hit("foreign-back", "白人女性 後ろ姿 街を歩く"),
+    ]
+
+    # query_context は普通の業務ワードのみ。旧実装ではゲートが閉じて全 hit 0 点だった。
+    ranked = rank_hits(
+        hits,
+        preferences=PreferencesStore(tmp_path / "prefs.json"),
+        history=UsageHistory(tmp_path / "history.json"),
+        query_context="会議 ビジネス",
+    )
+
+    # 日本人 + 顔なし composition が最上位、白人 face が最下位。
+    assert ranked[0].asset_id == "japanese-hands"
+    assert ranked[-1].asset_id == "foreign-face"
+
+
+def test_rank_hits_policy_leaves_non_people_hits_neutral(tmp_path):
+    """landmark / 抽象シンボル系 (人物指標が alt に無い) hit はポリシー対象外で
+    スコアを下げられない。"""
+    class Hit:
+        def __init__(self, asset_id: str, alt: str):
+            self.asset_id = asset_id
+            self.alt = alt
+            self.detail_url = ""
+            self.photographer_username = ""
+
+    hits = [
+        Hit("landmark-tokyo", "東京タワー 夜景 街並み"),
+        Hit("abstract-graph", "経済 グラフ 折れ線 イメージ"),
+        Hit("landmark-bldg", "高層ビル 摩天楼 都市景観"),
+    ]
+
+    ranked = rank_hits(
+        hits,
+        preferences=PreferencesStore(tmp_path / "prefs.json"),
+        history=UsageHistory(tmp_path / "history.json"),
+        query_context="経済",
+    )
+
+    # 全 hit が中立スコア → 入力順がそのまま維持される (stable sort)
+    assert [h.asset_id for h in ranked] == ["landmark-tokyo", "abstract-graph", "landmark-bldg"]
+
+
 def test_photo_audit_renders_actual_and_cached_candidate_images(tmp_path):
     manuscripts_dir = tmp_path / "manuscripts"
     manuscripts_dir.mkdir()
