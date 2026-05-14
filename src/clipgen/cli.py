@@ -180,6 +180,7 @@ def _candidate_plan(
     target_format: str,
     aggressiveness: int | None,
     provider=None,
+    highlight_status_override: str | None = None,
 ) -> dict:
     """1候補に対し、ハイライト/タイトル/サムネをまとめて生成する."""
     highlights = []
@@ -187,6 +188,8 @@ def _candidate_plan(
         cues = parse_srt(srt_text)
         highlights = detect_highlights(cues, target_format=target_format)
     highlight_status = "no_srt" if srt_text is None else ("no_highlight" if not highlights else "ok")
+    if highlight_status_override is not None:
+        highlight_status = highlight_status_override
     top_highlight = highlights[0] if highlights else None
     titles = generate_titles(
         candidate,
@@ -235,12 +238,25 @@ def cmd_plan(args: argparse.Namespace) -> int:
     audit = _make_audit_logger(args.audit_log)
 
     srt_text: str | None = None
+    highlight_status_override: str | None = None
     if args.srt:
         srt_path = Path(args.srt)
         if not srt_path.exists():
             print(f"srt file not found: {srt_path}", file=sys.stderr)
             return 2
         srt_text = srt_path.read_text(encoding="utf-8")
+    elif args.from_youtube:
+        from .transcripts import fetch_youtube_transcript, transcript_to_srt
+
+        cues = fetch_youtube_transcript(args.from_youtube)
+        if cues:
+            srt_text = transcript_to_srt(cues)
+        else:
+            print(
+                f"warning: no transcript found for YouTube video: {args.from_youtube}",
+                file=sys.stderr,
+            )
+            highlight_status_override = "no_transcript"
 
     aggressiveness = args.aggressiveness
 
@@ -270,6 +286,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     target_format=fmt,
                     aggressiveness=aggressiveness,
                     provider=provider,
+                    highlight_status_override=highlight_status_override,
                 )
             )
 
@@ -320,8 +337,8 @@ def cmd_compliance_check(args) -> int:
 
     candidates = load_candidates(Path(args.input))
     takedowns = load_takedown_list(Path(args.takedown_list))
-    passed, blocked = apply_takedown(candidates, takedowns)
 
+    passed, blocked = apply_takedown(candidates, takedowns)
     payload = {"passed": passed, "blocked": blocked}
     if args.out:
         write_compliance_result(Path(args.out), passed, blocked)
@@ -353,10 +370,7 @@ def cmd_extract(args) -> int:
         raise SystemExit("plan JSON must be an object or list")
 
     out_root = Path(args.out_root)
-    extracts = [
-        plan_to_extract(plan, output_root=out_root)
-        for plan in plans[: args.top]
-    ]
+    extracts = [plan_to_extract(plan, output_root=out_root) for plan in plans[: args.top]]
 
     _audit_call(
         audit,
@@ -480,7 +494,6 @@ def _write_review_tsv(path: Path, items: list[dict[str, Any]]) -> None:
 def cmd_review(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     _, items = _load_items_payload(input_path)
-    # Normalize threshold to percent scale (matches _score_as_percent).
     threshold = args.score_threshold * 100.0 if 0.0 <= args.score_threshold <= 1.0 else args.score_threshold
     result = _review_items(items, threshold)
 
@@ -570,7 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="出力フォーマット (short / long / both)",
     )
     pp.add_argument("--dry-run", action="store_true")
-    pp.add_argument("--srt", help="ハイライト検出に使う SRT/VTT ファイル")
+    transcript_group = pp.add_mutually_exclusive_group()
+    transcript_group.add_argument("--srt", help="ハイライト検出に使う SRT/VTT ファイル")
+    transcript_group.add_argument("--from-youtube", help="YouTube video ID から字幕を取得して使う")
     pp.add_argument("--top", type=int, default=5, help="各フォーマットで処理する候補数")
     pp.add_argument(
         "--aggressiveness",
