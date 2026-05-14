@@ -254,6 +254,14 @@ main {
 }
 .word {
   cursor: pointer;
+  /* Drag-to-select is app-owned. user-select: none stops the browser
+     from blue-highlighting / starting a drag-image while the user is
+     extending an edit selection — a real source of stuck drags on
+     Safari / Codespaces forwarded viewers. Applied per-.word (not on
+     <main>) so that ordinary text copy elsewhere in the pane still
+     works. */
+  user-select: none;
+  -webkit-user-select: none;
   /* Vertical pad stays at 2px so the selection background reads as a
      contiguous pill across a run of words; horizontal pad cut to 1px
      for tight Japanese (no inter-word spaces in source). */

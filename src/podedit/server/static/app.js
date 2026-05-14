@@ -728,7 +728,15 @@
   }
 
   function wordFromPoint(x, y) {
-    let el = document.elementFromPoint(x, y);
+    // Clamp to viewport interior so a pointer dragged just past the
+    // bottom (or top) edge still hit-tests the boundary-most visible
+    // word. Without this, document.elementFromPoint returns null
+    // whenever y exceeds window.innerHeight, freezing the selection at
+    // whatever was on screen when the cursor crossed the edge — this
+    // teamed up with the mouseleave bug to produce the "30 sec wall".
+    const cx = Math.max(1, Math.min(window.innerWidth - 1, x));
+    const cy = Math.max(1, Math.min(window.innerHeight - 1, y));
+    let el = document.elementFromPoint(cx, cy);
     while (el && !el.classList?.contains('word')) el = el.parentElement;
     if (el && el.classList.contains('word')) {
       const i = parseInt(el.dataset.idx, 10);
@@ -890,11 +898,16 @@
     if (dragAnchor !== null) finishSelectionDrag();
   });
 
-  // Drag can be aborted by leaving the window mid-drag; treat it as cancel for
-  // move-drag and as release for selection-drag so dragAnchor never sticks.
+  // Selection drag does NOT end on mouseleave: the user routinely drags
+  // past the viewport edge to keep extending the selection while the
+  // transcript auto-scrolls. Pointer capture + pointerup/pointercancel
+  // already cover legitimate drag-end. Killing the drag here was the
+  // real "30 sec wall" — the moment pointer y crossed the document edge,
+  // dragAnchor went null and every subsequent rAF tick did nothing.
+  // Move-drag still cancels here because dropping into another window
+  // can't produce a meaningful target word.
   document.addEventListener('mouseleave', () => {
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
   });
 
   // Backstop for sensitivity: track pointer position during selection drag and
