@@ -171,6 +171,17 @@
       "permission_evidence": "YouTubeネイティブ番組。切り抜き許諾は概要欄要確認。",
       "permission_scope": "official_speech",
       "notes": "切り抜き許諾は概要欄要確認。"
+    },
+    {
+      "channel_id": "UCTxDz8sXbnpYAfulQMRFNEQ",
+      "handle": "@takeda-tsuneyasu",
+      "name": "竹田恒泰チャンネル2",
+      "category": "youtube_native_allowed",
+      "source_url": "https://www.youtube.com/channel/UCTxDz8sXbnpYAfulQMRFNEQ",
+      "permission_checked_at": "2026-05-14",
+      "permission_evidence": "本人公式チャンネル。第三者切り抜き許諾は概要欄等で都度確認。",
+      "permission_scope": "official_speech",
+      "notes": "断定的な事実主張は元発言準拠で扱う。動画ごとに概要欄の許諾範囲を確認。"
     }
   ]
 }
