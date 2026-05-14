@@ -468,6 +468,15 @@
   const wordById = new Map();
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
   let activeIdx = -1;  // current word highlight; must exist before initial load/rerender
+  // Search index state (lazily built on first query, invalidated when the
+  // transcript changes). Declared up here next to `words` so the
+  // loadActiveAndRender path can reset it without tripping the temporal
+  // dead zone — the search wiring further down only adds the build/query
+  // logic, not these flag variables.
+  let searchFullText = '';
+  let searchWordStart = null;   // Int32Array, length = words.length
+  let searchWordEnd = null;     // Int32Array, length = words.length
+  let searchIndexBuiltFor = -1; // words.length at index-build time
 
   // Auto-follow the playhead with the transcript scroll position. Default OFF
   // so the editor can scroll to a distant part of the audio (e.g. 5:00) while
@@ -590,6 +599,12 @@
     kpi.opsCount = 0;
     words.length = 0;
     wordById.clear();
+    // Invalidate the search index so the new transcript doesn't see hits
+    // against the previous file's full-text buffer. Cheap (just a flag).
+    searchIndexBuiltFor = -1;
+    searchFullText = '';
+    searchWordStart = null;
+    searchWordEnd = null;
     $tx.innerHTML = '';
     $skipPill.textContent = 'no cut';
     if ($clipboardPill) $clipboardPill.hidden = true;
@@ -2289,6 +2304,45 @@
   let searchMatches = [];       // ascending word indices
   let searchActiveIdx = -1;     // index INTO searchMatches
   let searchPaintedActive = -1; // word idx currently wearing .search-active
+  // searchFullText / searchWordStart / searchWordEnd / searchIndexBuiltFor
+  // are declared up next to `words` so loadActiveAndRender() can reset
+  // them before this wiring runs (otherwise TDZ would crash boot).
+  function buildSearchIndex() {
+    const N = words.length;
+    if (searchIndexBuiltFor === N) return;
+    let buf = '';
+    const starts = new Int32Array(N);
+    const ends = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      starts[i] = buf.length;
+      // Normalise on the way in (NFKC) so full-width / half-width / kana-
+      // width differences between the editor's query and the ASR output
+      // don't cause silent misses. Lowercase for case-insensitive ASCII.
+      const t = (words[i].el?.textContent || '').normalize('NFKC').toLowerCase();
+      buf += t;
+      ends[i] = buf.length;
+    }
+    searchFullText = buf;
+    searchWordStart = starts;
+    searchWordEnd = ends;
+    searchIndexBuiltFor = N;
+  }
+  function wordIndexAtChar(c) {
+    // Binary search: find the word whose [start, end) contains char c.
+    // Used to map match boundaries back to word ranges.
+    if (!searchWordStart) return -1;
+    const N = searchWordStart.length;
+    if (N === 0 || c < 0) return -1;
+    let lo = 0, hi = N - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (c < searchWordStart[mid]) hi = mid - 1;
+      else if (c >= searchWordEnd[mid]) lo = mid + 1;
+      else return mid;
+    }
+    // Past the last word's end — clamp to last (callers use this for end-1).
+    return c >= searchWordEnd[N - 1] ? N - 1 : -1;
+  }
 
   function clearSearchHighlights() {
     for (const i of searchMatches) {
@@ -2337,19 +2391,46 @@
     searchActiveIdx = -1;
     const q = (query || '').trim();
     if (!q) { updateSearchInfo(); return; }
+    buildSearchIndex();
     // Split on whitespace so the editor can paste several candidate
-    // spellings at once (ASR routinely mis-recognises proper nouns and
-    // hands them back inconsistently). Each token is matched independently
-    // and any word containing any token counts as a hit. Empty tokens
-    // after split are dropped so trailing spaces don't false-positive.
-    const needles = q.toLowerCase().split(/\s+/).filter(Boolean);
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i];
-      const text = (w.el?.textContent || '').toLowerCase();
-      if (needles.some((n) => text.includes(n))) {
-        searchMatches.push(i);
-        w.el.classList.add('search-hit');
+    // spellings at once. NFKC + lowercase to align with the index. Tokens
+    // shorter than 2 chars are dropped — single ja chars ("と", "の") would
+    // false-positive on most of the transcript. ASCII "AI" etc. is allowed
+    // when the user types it explicitly via a longer phrase context.
+    const needles = q.normalize('NFKC').toLowerCase().split(/\s+/)
+      .filter(Boolean)
+      .filter((n) => n.length >= 2);
+    if (needles.length === 0) {
+      // The user typed only single-char tokens; still log so we can tell
+      // "no hits because filtered" apart from "no hits because no match".
+      updateSearchInfo();
+      logKPI('ui.search.query', { q, tokens: 0, hits: 0, dropped_short: true });
+      return;
+    }
+    // Full-text scan: find every (overlapping-safe) occurrence of every
+    // needle in the concatenated transcript, then walk the affected char
+    // span back to the word indices it covers. Words are de-duped via Set
+    // so two needles hitting the same word don't double-count.
+    const hitSet = new Set();
+    for (const n of needles) {
+      let from = 0;
+      while (true) {
+        const idx = searchFullText.indexOf(n, from);
+        if (idx < 0) break;
+        const startWord = wordIndexAtChar(idx);
+        const endWord = wordIndexAtChar(idx + n.length - 1);
+        if (startWord >= 0 && endWord >= 0) {
+          for (let i = startWord; i <= endWord; i++) hitSet.add(i);
+        }
+        // Advance by 1 so overlapping matches ("ABA" in "ABABA") aren't
+        // skipped. Word-level dedup above keeps the cost bounded.
+        from = idx + 1;
       }
+    }
+    searchMatches = Array.from(hitSet).sort((a, b) => a - b);
+    for (const i of searchMatches) {
+      const w = words[i];
+      if (w && w.el) w.el.classList.add('search-hit');
     }
     if (searchMatches.length > 0) {
       // Default to the first match at/after the current playhead so a
