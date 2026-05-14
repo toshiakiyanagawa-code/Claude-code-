@@ -530,8 +530,10 @@
     state.undoStack = [];
     state.redoStack = [];
     state.selection = null;
+    state.selectionPainted = null;  // old indices point to torn-down DOM
     state.clipboard = null;
     state.pasteAnchor = null;
+    state.pasteAnchorPainted = null;
     state.sessionTemplate = null;
     state.saveStatus = 'idle';
     if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
@@ -1022,11 +1024,27 @@
   // Backstop for sensitivity: track pointer position during selection drag and
   // resolve the word directly under the cursor each rAF. mouseenter alone
   // misses words when dragging fast across line breaks or inter-word gaps.
+  // Keep the last pointer position (no per-frame null-ing) so edge auto-scroll
+  // continues even if the user holds the pointer still at the viewport edge.
+  // Without this, drag-to-select can't pull the transcript past whatever's
+  // visible — the user reported being capped around 30 seconds because
+  // wordFromPoint can only see what's already painted on screen.
   function dragMoveTick() {
-    if (pendingDragMove && dragAnchor !== null) {
-      const w = wordFromPoint(pendingDragMove.x, pendingDragMove.y);
+    if (pendingDragMove && dragAnchor !== null && !moveDrag) {
+      const x = pendingDragMove.x;
+      const y = pendingDragMove.y;
+      let velocity = 0;
+      if (y < MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
+        velocity = -((MOVE_DRAG_AUTOSCROLL_EDGE_PX - y) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
+      } else if (y > window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
+        velocity = ((y - (window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX)) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
+      }
+      if (velocity !== 0) $tx.scrollTop += velocity;
+      const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
-      pendingDragMove = null;
+      // Intentionally NOT clearing pendingDragMove: a stationary pointer
+      // at the edge must keep auto-scrolling. extendSelectionDrag is
+      // idempotent for the same extent thanks to the no-op guard.
     }
     requestAnimationFrame(dragMoveTick);
   }
@@ -1040,21 +1058,60 @@
   }
 
   function renderSelection() {
+    // Differential paint: only flip classes on the symmetric difference
+    // between the previously-painted range and the new range. Drag
+    // selection on a 30-min podcast hits this at ~60Hz, so the old
+    // "iterate every word" loop was the dominant cost (1000+ classList
+    // ops per frame). The diff path touches at most ~2 words per frame.
     const r = selectionRange();
-    for (const w of words) w.el.classList.remove('selected');
-    if (r) for (let i = r.ws; i <= r.we; i++) words[i].el.classList.add('selected');
+    const prev = state.selectionPainted || null;
+    if (prev && r && prev.ws === r.ws && prev.we === r.we) {
+      // identical range — no DOM work
+    } else {
+      if (prev) {
+        for (let i = prev.ws; i <= prev.we; i++) {
+          if (!r || i < r.ws || i > r.we) {
+            const w = words[i];
+            if (w) w.el.classList.remove('selected');
+          }
+        }
+      }
+      if (r) {
+        for (let i = r.ws; i <= r.we; i++) {
+          if (!prev || i < prev.ws || i > prev.we) {
+            const w = words[i];
+            if (w) w.el.classList.add('selected');
+          }
+        }
+      }
+      state.selectionPainted = r ? { ws: r.ws, we: r.we } : null;
+    }
     $btnDelete.disabled = !state.hasActive || !r;
     $btnCut.disabled = !state.hasActive || !r;
     $btnClear.disabled = !state.hasActive || !r;
   }
 
   function setSelection(anchor, extent) {
+    // No-op when the selection didn't actually change — keeps mouseenter
+    // + rAF backstop from doing redundant work on the same word.
+    if (state.selection && state.selection.anchor === anchor && state.selection.extent === extent) return;
     state.selection = { anchor, extent };
     renderSelection();
   }
 
   function renderPasteAnchor() {
-    for (const w of words) w.el.classList.toggle('paste-anchor', state.pasteAnchor === w.idx);
+    // Differential paint: flip the class only on the word whose paste
+    // anchor membership changed. The previous version iterated every
+    // word — cheap for short clips, but unnecessary churn elsewhere.
+    if (state.pasteAnchorPainted !== state.pasteAnchor) {
+      if (state.pasteAnchorPainted != null && words[state.pasteAnchorPainted]) {
+        words[state.pasteAnchorPainted].el.classList.remove('paste-anchor');
+      }
+      if (state.pasteAnchor != null && words[state.pasteAnchor]) {
+        words[state.pasteAnchor].el.classList.add('paste-anchor');
+      }
+      state.pasteAnchorPainted = state.pasteAnchor;
+    }
     const canPaste = state.hasActive && !!state.clipboard && state.pasteAnchor != null;
     $btnPasteBefore.disabled = !canPaste;
     $btnPasteAfter.disabled = !canPaste;
