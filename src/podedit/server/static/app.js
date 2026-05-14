@@ -4087,6 +4087,158 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && $snapshotsModal && !$snapshotsModal.hidden) hideSnapshotsModal();
   });
+
+  // ------- dictionary modal (P0-I: ASR post-processing replacements) -------
+  const $btnDictionary = $('btn-dictionary');
+  const $dictionaryModal = $('dictionary-modal');
+  const $btnDictionaryClose = $('btn-dictionary-close');
+  const $dictTbody = $('dictionary-tbody');
+  const $dictStatus = $('dictionary-status');
+  const $btnDictAdd = $('btn-dict-add');
+  const $btnDictSave = $('btn-dict-save');
+
+  function setDictStatus(msg, isError) {
+    if (!$dictStatus) return;
+    $dictStatus.textContent = msg || '·';
+    $dictStatus.classList.toggle('error', !!isError);
+  }
+  function buildDictRow(entry) {
+    const tr = document.createElement('tr');
+    const tdFrom = document.createElement('td');
+    tdFrom.className = 'col-from';
+    const inputFrom = document.createElement('input');
+    inputFrom.type = 'text';
+    inputFrom.value = entry.from || '';
+    inputFrom.placeholder = '例: 黒だ';
+    inputFrom.maxLength = 200;
+    inputFrom.dataset.field = 'from';
+    tdFrom.appendChild(inputFrom);
+
+    const tdTo = document.createElement('td');
+    tdTo.className = 'col-to';
+    const inputTo = document.createElement('input');
+    inputTo.type = 'text';
+    inputTo.value = entry.to || '';
+    inputTo.placeholder = '例: クロード';
+    inputTo.maxLength = 200;
+    inputTo.dataset.field = 'to';
+    tdTo.appendChild(inputTo);
+
+    const tdEnabled = document.createElement('td');
+    tdEnabled.className = 'col-enabled';
+    const inputEnabled = document.createElement('input');
+    inputEnabled.type = 'checkbox';
+    inputEnabled.checked = entry.enabled !== false;
+    inputEnabled.dataset.field = 'enabled';
+    tdEnabled.appendChild(inputEnabled);
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'col-actions';
+    const btnDel = document.createElement('button');
+    btnDel.type = 'button';
+    btnDel.textContent = '削除';
+    btnDel.addEventListener('click', () => { tr.remove(); renderEmptyHint(); });
+    tdActions.appendChild(btnDel);
+
+    tr.append(tdFrom, tdTo, tdEnabled, tdActions);
+    return tr;
+  }
+  function renderEmptyHint() {
+    if (!$dictTbody) return;
+    const existing = $dictTbody.querySelector('tr.row-empty-wrapper');
+    if (existing) existing.remove();
+    const rows = $dictTbody.querySelectorAll('tr:not(.row-empty-wrapper)');
+    if (rows.length === 0) {
+      const tr = document.createElement('tr');
+      tr.className = 'row-empty-wrapper';
+      const td = document.createElement('td');
+      td.colSpan = 4;
+      td.className = 'row-empty';
+      td.textContent = 'まだ辞書エントリがありません。「+ 行を追加」から登録してください。';
+      tr.appendChild(td);
+      $dictTbody.appendChild(tr);
+    }
+  }
+  function collectDictRows() {
+    const entries = [];
+    if (!$dictTbody) return entries;
+    const rows = $dictTbody.querySelectorAll('tr:not(.row-empty-wrapper)');
+    for (const tr of rows) {
+      const from = tr.querySelector('input[data-field="from"]').value;
+      const to = tr.querySelector('input[data-field="to"]').value;
+      const enabled = tr.querySelector('input[data-field="enabled"]').checked;
+      if (!from.trim()) continue;  // skip empty rows silently
+      entries.push({ from, to, enabled });
+    }
+    return entries;
+  }
+  async function loadDictionary() {
+    setDictStatus('読み込み中…');
+    if ($dictTbody) $dictTbody.innerHTML = '';
+    try {
+      const r = await fetch('/api/dictionary');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const entries = data.entries || [];
+      for (const e of entries) $dictTbody.appendChild(buildDictRow(e));
+      renderEmptyHint();
+      setDictStatus(`${entries.length} 件`);
+    } catch (e) {
+      setDictStatus(`一覧取得に失敗: ${e.message}`, true);
+    }
+  }
+  async function saveDictionary() {
+    const entries = collectDictRows();
+    setDictStatus('保存中…');
+    $btnDictSave.disabled = true;
+    try {
+      const r = await fetch('/api/dictionary', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entries }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.dictionary.save', { entries: entries.length });
+      setDictStatus(`保存しました (${entries.length} 件)`);
+    } catch (e) {
+      setDictStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnDictSave.disabled = false;
+    }
+  }
+  function showDictionaryModal() {
+    if (!$dictionaryModal) return;
+    $dictionaryModal.hidden = false;
+    loadDictionary();
+    logKPI('ui.dictionary.modal_open');
+  }
+  function hideDictionaryModal() {
+    if ($dictionaryModal) $dictionaryModal.hidden = true;
+  }
+  if ($btnDictionary) $btnDictionary.addEventListener('click', showDictionaryModal);
+  if ($btnDictionaryClose) $btnDictionaryClose.addEventListener('click', hideDictionaryModal);
+  if ($dictionaryModal) {
+    $dictionaryModal.addEventListener('click', (ev) => {
+      if (ev.target === $dictionaryModal) hideDictionaryModal();
+    });
+  }
+  if ($btnDictAdd) {
+    $btnDictAdd.addEventListener('click', () => {
+      const empty = $dictTbody.querySelector('tr.row-empty-wrapper');
+      if (empty) empty.remove();
+      const tr = buildDictRow({ from: '', to: '', enabled: true });
+      $dictTbody.appendChild(tr);
+      const firstInput = tr.querySelector('input[type="text"]');
+      if (firstInput) firstInput.focus();
+    });
+  }
+  if ($btnDictSave) $btnDictSave.addEventListener('click', saveDictionary);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $dictionaryModal && !$dictionaryModal.hidden) hideDictionaryModal();
+  });
   if ($btnLibraryUpload && $libraryFileInput) {
     $btnLibraryUpload.addEventListener('click', () => {
       logKPI('ui.library.upload.button_clicked');

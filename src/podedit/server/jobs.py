@@ -33,6 +33,12 @@ from pathlib import Path
 from typing import Literal
 
 from ..asr import ASRConfig, transcribe
+from ..asr_dictionary import (
+    apply_dictionary,
+    dict_ops_path_for,
+    load_dictionary,
+    write_dict_ops,
+)
 from ..audio import probe as audio_probe, to_wav_16k_mono
 from ..edit import sha256_of_file
 
@@ -323,7 +329,16 @@ class TranscriptionJobManager:
             # entries don't suddenly start failing mismatch checks later.
             tx.source_audio.sha256 = sha256_of_file(audio_path)
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(tx.to_dict(), ensure_ascii=False, indent=2)
+            tx_dict = tx.to_dict()
+            # P0-I: post-processing dictionary replacement. Empty / missing
+            # dictionary => no-op (transcript unchanged, no sidecar). The
+            # canonical transcript is published with corrections baked in;
+            # sidecar (<stem>.transcript.dict-ops.jsonl) is written only
+            # after a successful publish so undo history can't drift from
+            # transcript content if publish fails.
+            dictionary = load_dictionary(self._work_dir / "dictionary.json")
+            tx_dict, dict_ops = apply_dictionary(tx_dict, dictionary)
+            payload = json.dumps(tx_dict, ensure_ascii=False, indent=2)
             # Atomic, no-clobber publish: write the payload to a sibling
             # tempfile, then ``os.link`` it to the final path. ``link`` is
             # atomic on POSIX and fails with FileExistsError if the target
@@ -364,6 +379,19 @@ class TranscriptionJobManager:
                 f"({len(tx.segments)} segs, "
                 f"{sum(len(s.words) for s in tx.segments)} words)",
             )
+            # Sidecar after publish — keeps undo history aligned with what's
+            # actually on disk. If sidecar write fails the transcript still
+            # exists and editors can fall back to manual fixes.
+            if dict_ops:
+                try:
+                    write_dict_ops(dict_ops_path_for(transcript_path), dict_ops)
+                    self._append_log(
+                        job, f"dict applied: {len(dict_ops)} replacement(s)"
+                    )
+                except OSError as e:
+                    self._append_log(
+                        job, f"dict sidecar write failed (transcript ok): {e}"
+                    )
             self._set(job, status="done", finished_at=time.time())
         except Exception as e:
             tb = traceback.format_exc(limit=4)

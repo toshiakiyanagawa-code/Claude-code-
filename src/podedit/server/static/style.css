@@ -487,3 +487,29 @@ main {
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }
+
+/* Dictionary modal (P0-I): post-processing ASR replacement table. */
+.dictionary-hint { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.dictionary-actions-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+}
+.dictionary-actions-row .spacer { flex: 1; }
+.dictionary-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.dictionary-table th, .dictionary-table td {
+  padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.dictionary-table th { font-weight: 600; color: var(--muted); font-size: 11px; }
+.dictionary-table input[type="text"] {
+  width: 100%; box-sizing: border-box; padding: 4px 6px;
+  background: var(--panel); color: inherit;
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.dictionary-table td.col-from { width: 38%; }
+.dictionary-table td.col-to { width: 38%; }
+.dictionary-table td.col-enabled { width: 10%; text-align: center; }
+.dictionary-table td.col-actions { width: 14%; text-align: right; }
+.dictionary-table .row-empty {
+  color: var(--muted); text-align: center; padding: 18px 0;
+}

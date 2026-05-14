@@ -49,6 +49,13 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 from ..annotations import build_annotation_payload
+from ..asr_dictionary import (
+    DICTIONARY_VERSION,
+    DictEntry,
+    Dictionary,
+    load_dictionary,
+    save_dictionary,
+)
 from ..audio import probe as audio_probe
 from ..edit import EditSession, TimelineSegment, compile_timeline, sha256_of_file
 from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
@@ -1946,6 +1953,101 @@ def create_app(config: ServeConfig) -> FastAPI:
             {"job": snap},
             headers={"Cache-Control": "no-store"},
         )
+
+    # ----- P0-I: post-processing dictionary management -----
+    # Single shared dictionary at <work_dir>/dictionary.json. The transcribe
+    # worker applies enabled entries to a freshly produced transcript before
+    # publish; the UI just edits the JSON via these endpoints.
+
+    def _dict_path() -> Path:
+        return state.work_dir / "dictionary.json"
+
+    def _dict_to_payload(d: Dictionary) -> dict:
+        return {
+            "version": DICTIONARY_VERSION,
+            "entries": [
+                {
+                    "id": e.id,
+                    "from": e.from_,
+                    "to": e.to,
+                    "enabled": e.enabled,
+                    "priority": e.priority,
+                    "max_words": e.max_words,
+                    "max_conf": e.max_conf,
+                }
+                for e in d.entries
+            ],
+        }
+
+    @app.get("/api/dictionary")
+    def get_dictionary() -> JSONResponse:
+        d = load_dictionary(_dict_path())
+        return JSONResponse(_dict_to_payload(d), headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/dictionary")
+    def put_dictionary(body: dict) -> JSONResponse:
+        import math
+        raw_entries = (body or {}).get("entries")
+        if not isinstance(raw_entries, list):
+            raise HTTPException(status_code=400, detail="entries must be a list")
+        if len(raw_entries) > 2000:
+            raise HTTPException(status_code=400, detail="too many entries (max 2000)")
+        entries: list[DictEntry] = []
+        seen_ids: set[str] = set()
+        for i, raw in enumerate(raw_entries):
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail=f"entry {i} must be an object")
+            from_ = raw.get("from")
+            to = raw.get("to")
+            if not isinstance(from_, str) or not isinstance(to, str):
+                raise HTTPException(status_code=400, detail=f"entry {i}: from/to must be strings")
+            if not from_.strip():
+                raise HTTPException(status_code=400, detail=f"entry {i}: from must be non-empty")
+            if len(from_) > 200 or len(to) > 200:
+                raise HTTPException(status_code=400, detail=f"entry {i}: from/to too long (max 200)")
+            entry_id = raw.get("id")
+            if entry_id is None:
+                entry_id = f"dict_{i:04d}"
+            elif not isinstance(entry_id, str) or not entry_id:
+                raise HTTPException(status_code=400, detail=f"entry {i}: id must be non-empty string")
+            elif len(entry_id) > 128:
+                raise HTTPException(status_code=400, detail=f"entry {i}: id too long (max 128)")
+            if entry_id in seen_ids:
+                raise HTTPException(status_code=400, detail=f"entry {i}: duplicate id {entry_id!r}")
+            seen_ids.add(entry_id)
+            enabled = raw.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise HTTPException(status_code=400, detail=f"entry {i}: enabled must be bool")
+            priority = raw.get("priority", 100)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                raise HTTPException(status_code=400, detail=f"entry {i}: priority must be int")
+            max_words = raw.get("max_words", 5)
+            if not isinstance(max_words, int) or isinstance(max_words, bool) or max_words < 1 or max_words > 20:
+                raise HTTPException(status_code=400, detail=f"entry {i}: max_words must be int in [1,20]")
+            max_conf = raw.get("max_conf")
+            if max_conf is not None:
+                if isinstance(max_conf, bool) or not isinstance(max_conf, (int, float)):
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be number or null")
+                if not math.isfinite(float(max_conf)):
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be finite")
+                if not 0.0 <= float(max_conf) <= 1.0:
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be in [0.0, 1.0]")
+                max_conf = float(max_conf)
+            entries.append(
+                DictEntry(
+                    id=entry_id, from_=from_, to=to,
+                    enabled=enabled, priority=priority,
+                    max_words=max_words, max_conf=max_conf,
+                )
+            )
+        d = Dictionary(entries=tuple(entries))
+        save_dictionary(_dict_path(), d)
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.dictionary.saved",
+            "entries": len(entries),
+        })
+        return JSONResponse(_dict_to_payload(d), headers={"Cache-Control": "no-store"})
 
     app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
