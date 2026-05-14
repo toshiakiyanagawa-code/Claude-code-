@@ -472,7 +472,7 @@ def test_web_app_pick_endpoint_updates_canonical(monkeypatch):
     from cms_entry_assistant.istock_crawler import IstockSearchHit
 
     # Inject a single fake candidate for each slot so pick can succeed.
-    def fake_candidates(suggestions, hits_per_slot=5):
+    def fake_candidates(suggestions, hits_per_slot=5, **_kwargs):
         return {
             s.slot_key: [
                 IstockSearchHit(
@@ -568,7 +568,7 @@ def test_web_app_rejects_unknown_asset_id(monkeypatch):
     from cms_entry_assistant.web import app as app_module
     from cms_entry_assistant.istock_crawler import IstockSearchHit
 
-    def fake_candidates(suggestions, hits_per_slot=5):
+    def fake_candidates(suggestions, hits_per_slot=5, **_kwargs):
         return {
             s.slot_key: [
                 IstockSearchHit(asset_id="111", thumbnail_url="", alt="", photographer_username="", detail_url="")
@@ -841,7 +841,7 @@ def test_photos_tab_renders_unknown_slot_as_muted_other_group(monkeypatch):
     # 通常スロット (hero) と未知スロットを 1 つずつ仕込む
     captured: dict = {}
 
-    def fake_fetch(suggestions, hits_per_slot=5):
+    def fake_fetch(suggestions, hits_per_slot=5, **_kwargs):
         captured["suggestions"] = suggestions
         return {s.slot_key: [] for s in suggestions}
 
@@ -1000,6 +1000,113 @@ def test_fetch_candidates_isolates_per_slot_failure(monkeypatch):
     assert calls == ["FAIL me", "working query"]
 
 
+def test_fetch_candidates_llm_mode_prepends_llm_queries(monkeypatch):
+    """search_mode='llm' は LLM の search_queries を先頭に積み増す。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+
+    queries_seen: list[str] = []
+    def fake_crawl(query, limit=8):
+        queries_seen.append(query)
+        return [IstockSearchHit(asset_id=query, thumbnail_url="", alt=query, photographer_username="", detail_url=f"https://x/{query}")]
+
+    monkeypatch.setattr(app_module, "crawl_search", fake_crawl)
+
+    # LLM が "llm-fresh" を返す stub
+    fake_plan = gen_module.LlmQueryPlan(
+        search_queries=["llm-fresh"],
+        intent="test",
+        keywords=[],
+        negative_keywords=[],
+    )
+    fake_result = gen_module.QueryPlanResult(
+        slot_hash="x", plan=fake_plan, model="stub"
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_maybe_generate_llm_plan",
+        lambda suggestion, article_title="": fake_plan,
+    )
+
+    suggestions = [
+        IstockSearchSuggestion(slot_key="hero", slot_label="hero", query_ja="legacy-primary"),
+    ]
+    out = app_module._fetch_candidates(suggestions, search_mode="llm")
+
+    # 先頭は LLM の query。1 件で十分集まったらそこで止まる。
+    assert queries_seen[0] == "llm-fresh"
+    assert out["hero"]
+    assert out["hero"][0].asset_id == "llm-fresh"
+
+
+def test_fetch_candidates_llm_rerank_uses_rerank_order(monkeypatch):
+    """search_mode='llm_rerank' は candidate_reranker を経由して並べ替える。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant import llm_query_generator as gen_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+
+    def fake_crawl(query, limit=8):
+        # 2 件返す: 順序を逆転させたいので alt を変える
+        return [
+            IstockSearchHit(asset_id="off", thumbnail_url="", alt="unrelated", photographer_username="", detail_url="https://x/off"),
+            IstockSearchHit(asset_id="hit", thumbnail_url="", alt="shanghai skyline", photographer_username="", detail_url="https://x/hit"),
+        ]
+
+    monkeypatch.setattr(app_module, "crawl_search", fake_crawl)
+
+    fake_plan = gen_module.LlmQueryPlan(
+        search_queries=["shanghai"],
+        intent="shanghai skyline",
+        keywords=["shanghai", "skyline"],
+        negative_keywords=[],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_maybe_generate_llm_plan",
+        lambda suggestion, article_title="": fake_plan,
+    )
+
+    suggestions = [
+        IstockSearchSuggestion(slot_key="hero", slot_label="hero", query_ja="legacy"),
+    ]
+    out = app_module._fetch_candidates(suggestions, search_mode="llm_rerank")
+
+    # intent_terms = "shanghai skyline" にマッチする hit が先頭に来る
+    assert out["hero"][0].asset_id == "hit"
+
+
+def test_fetch_candidates_legacy_mode_skips_llm_call(monkeypatch):
+    """search_mode='legacy' は LLM を一切呼ばない (互換維持)。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+    monkeypatch.setattr(app_module, "crawl_search", lambda q, limit=8: [
+        IstockSearchHit(asset_id="x", thumbnail_url="", alt="", photographer_username="", detail_url="https://x/x")
+    ])
+
+    llm_called: list[bool] = []
+    def boom(suggestion, article_title=""):
+        llm_called.append(True)
+        return None
+
+    monkeypatch.setattr(app_module, "_maybe_generate_llm_plan", boom)
+
+    suggestions = [
+        IstockSearchSuggestion(slot_key="hero", slot_label="hero", query_ja="something"),
+    ]
+    app_module._fetch_candidates(suggestions, search_mode="legacy")
+    assert llm_called == []
+
+
 def test_rebuild_canonical_preserves_original_photo_instructions(monkeypatch):
     """未選択時、submission の既存 photo_instructions は破壊されない。"""
     from cms_entry_assistant.web import app as app_module
@@ -1009,7 +1116,7 @@ def test_rebuild_canonical_preserves_original_photo_instructions(monkeypatch):
     monkeypatch.setattr(
         app_module,
         "_fetch_candidates",
-        lambda suggestions, hits_per_slot=5: {
+        lambda suggestions, hits_per_slot=5, **_kwargs: {
             s.slot_key: [IstockSearchHit(asset_id=f"orig{i}", thumbnail_url="", alt="", photographer_username="", detail_url="")]
             for i, s in enumerate(suggestions)
         },

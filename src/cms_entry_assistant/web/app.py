@@ -19,12 +19,16 @@ from __future__ import annotations
 import html
 import io
 import json
+import logging
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -101,34 +105,142 @@ def _parse_manuscript_bytes(filename: str, blob: bytes) -> Manuscript:
 # ---------------------------------------------------------------------------
 
 
+# Feature flag: legacy / llm / llm_rerank。
+# CMS_ENTRY_ASSISTANT_SEARCH_MODE で切り替え。未設定なら legacy (既存動作)。
+CMS_SEARCH_MODE_ENV = "CMS_ENTRY_ASSISTANT_SEARCH_MODE"
+_SEARCH_MODES = {"legacy", "llm", "llm_rerank"}
+
+
+def _get_default_search_mode() -> str:
+    mode = (os.getenv(CMS_SEARCH_MODE_ENV) or "legacy").strip().lower()
+    return mode if mode in _SEARCH_MODES else "legacy"
+
+
+@dataclass
+class _ReRankPlanView:
+    """Adapter exposing LlmQueryPlan in the shape candidate_reranker expects.
+
+    reranker は intent_terms / query_terms / avoid_terms の 3 属性を見る。
+    generator が返す LlmQueryPlan は intent (str) / search_queries / keywords /
+    negative_keywords を持つので、ここでブリッジする。
+    """
+
+    intent_terms: list[str]
+    query_terms: list[str]
+    avoid_terms: list[str]
+
+
+def _llm_plan_to_rerank_view(plan: Any) -> _ReRankPlanView:
+    intent_text = " ".join(
+        v for v in [getattr(plan, "intent", "") or ""] if v
+    ).strip()
+    keywords = list(getattr(plan, "keywords", []) or [])
+    intent_terms: list[str] = []
+    if intent_text:
+        intent_terms.append(intent_text)
+    intent_terms.extend(keywords)
+
+    query_terms = list(getattr(plan, "search_queries", []) or [])
+    avoid_terms = list(getattr(plan, "negative_keywords", []) or [])
+    return _ReRankPlanView(
+        intent_terms=intent_terms,
+        query_terms=query_terms,
+        avoid_terms=avoid_terms,
+    )
+
+
+def _maybe_generate_llm_plan(
+    suggestion: IstockSearchSuggestion, *, article_title: str
+) -> Any | None:
+    """Call the LLM query generator. Returns None on any failure (incl. missing key).
+
+    LLM/ネットワーク障害は legacy フローへフォールバックさせる。明示的な
+    LlmUnavailableError も同様に None で握る。
+    """
+    try:
+        from cms_entry_assistant.llm_query_generator import (  # noqa: WPS433
+            LlmUnavailableError,
+            generate_query_plan,
+        )
+    except Exception:  # anthropic 未インストール等
+        return None
+
+    slot_payload = {
+        "slot_key": suggestion.slot_key,
+        "slot_label": suggestion.slot_label,
+        "type_code": suggestion.type_code,
+        "type_label": suggestion.type_label,
+        "primary_query": suggestion.query_ja,
+        "rationale": suggestion.rationale,
+        "note": suggestion.note,
+        "article_title": article_title,
+        "fallback_queries": list(suggestion.query_plan or []),
+    }
+    try:
+        result = generate_query_plan(slot_payload)
+    except LlmUnavailableError:
+        return None
+    except Exception as exc:  # noqa: BLE001 — 例外を握って legacy 復帰
+        _log.warning("LLM plan generation failed for %s: %s", suggestion.slot_key, exc)
+        return None
+
+    if not getattr(result, "ok", False):
+        return None
+    return result.plan
+
+
 def _fetch_candidates(
-    suggestions: list[IstockSearchSuggestion], *, hits_per_slot: int = 5
+    suggestions: list[IstockSearchSuggestion],
+    *,
+    hits_per_slot: int = 5,
+    search_mode: str | None = None,
+    article_title: str = "",
 ) -> dict[str, list[IstockSearchHit]]:
     """Return {slot_key: ranked_hits}. Uses the istock_crawler cache.
 
-    query_plan 対応 (codex Phase 2):
-      - 各 suggestion の query_plan を順に試し、累積で hits_per_slot 以上集まったら止める
-      - 失敗 query は -1 で attempts に記録 (デバッグ用)
-      - 取得後、diversify_case_candidates で hero/h4 の先頭重複を解消
-    Per-slot try/except: 1 つのスロットで iStock 取得が失敗しても、案件全体は失敗させない。
+    Three modes (CMS_ENTRY_ASSISTANT_SEARCH_MODE env or `search_mode` arg):
+      - legacy (default): suggestion.query_plan の順で iStock を叩き、rank_hits +
+        diversify_case_candidates で並べる (従来通り)。
+      - llm: LLM が返した search_queries を先頭に積み増し、その後 legacy plan を
+        フォールバックとして連結する。Rank は rank_hits。
+      - llm_rerank: llm モード + 30 候補集めてから candidate_reranker で再順位付け。
+        LLM が失敗したら legacy にフォールバックする。
     """
     out: dict[str, list[IstockSearchHit]] = {}
     if not is_available():
         for s in suggestions:
             out[s.slot_key] = []
         return diversify_case_candidates(out)
+
+    mode = (search_mode or _get_default_search_mode()).lower()
+    if mode not in _SEARCH_MODES:
+        mode = "legacy"
+
     prefs = PreferencesStore()
     history = UsageHistory()
     attempts_by_slot: dict[str, dict[str, int]] = {}
 
     for s in suggestions:
-        # query_plan に primary も含む。空・重複を除いた順序付きリストを構築。
+        llm_plan: Any | None = None
+        if mode in {"llm", "llm_rerank"}:
+            llm_plan = _maybe_generate_llm_plan(s, article_title=article_title)
+
+        # Build ordered, unique query list.
+        # LLM queries 先頭 → 既存 primary + plan を後段フォールバック。
         queries: list[str] = []
-        plan = list(getattr(s, "query_plan", []) or [])
-        for query in [s.query_ja, *plan]:
+
+        def _add_query(query: str) -> None:
             normalized = " ".join((query or "").split()).strip()
             if normalized and normalized not in queries:
                 queries.append(normalized)
+
+        if llm_plan is not None:
+            for q in getattr(llm_plan, "search_queries", []) or []:
+                _add_query(q)
+
+        legacy_plan = list(getattr(s, "query_plan", []) or [])
+        for query in [s.query_ja, *legacy_plan]:
+            _add_query(query)
 
         if not queries:
             out[s.slot_key] = []
@@ -138,9 +250,8 @@ def _fetch_candidates(
         attempts_by_slot[s.slot_key] = attempts
         collected: list[IstockSearchHit] = []
         seen: set[str] = set()
-        # primary が hits_per_slot 件取れても、後段 diversify で先頭重複が起きた
-        # 場合に入れ替え候補が無いと困るため、少し余分に集める (codex Phase 4)。
-        collect_until = hits_per_slot + 2
+        # llm_rerank は 30 件まで集めて再順位付け。それ以外は diversify 用に +2。
+        collect_until = 30 if mode == "llm_rerank" else hits_per_slot + 2
 
         for query in queries:
             try:
@@ -159,6 +270,19 @@ def _fetch_candidates(
 
             if len(collected) >= collect_until:
                 break
+
+        if mode == "llm_rerank" and llm_plan is not None and collected:
+            try:
+                from cms_entry_assistant.candidate_reranker import (  # noqa: WPS433
+                    rerank_candidates,
+                )
+                view = _llm_plan_to_rerank_view(llm_plan)
+                ranked = rerank_candidates(collected, view, prefs=prefs)
+                out[s.slot_key] = [r.candidate for r in ranked[:hits_per_slot]]
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("rerank failed for %s: %s", s.slot_key, exc)
+                # fall through to rank_hits
 
         out[s.slot_key] = rank_hits(
             collected, preferences=prefs, history=history, limit=hits_per_slot
@@ -358,7 +482,16 @@ async def create_case(manuscript: UploadFile = File(...)) -> Any:
         return _page_shell(_upload_form_html(error=f"原稿の解析に失敗: {exc}"))
     submission = derive_from_manuscript(parsed)
     draft = convert(parsed, submission, config=ConversionConfig(allow_network=False))
-    candidates = _fetch_candidates(draft.photo_suggestions)
+    article_title = (
+        getattr(draft, "selected_title", "")
+        or (parsed.title_candidates[0] if parsed.title_candidates else "")
+        or submission.title
+        or ""
+    )
+    candidates = _fetch_candidates(
+        draft.photo_suggestions,
+        article_title=article_title,
+    )
     case = CaseState(
         case_id=_new_case_id(),
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
