@@ -851,6 +851,18 @@
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   }
 
+  function scrollViewportBy(dy) {
+    // Most layouts have <main id="transcript"> as the scrolling container
+    // (overflow-y: auto). On narrow viewports / large fonts the document
+    // itself becomes the scroller instead, leaving $tx.scrollTop pinned at
+    // 0. Try the pane first and fall back to window — this is what the
+    // user hit when they said drag-to-select stopped around 30 seconds.
+    if (dy === 0) return;
+    const before = $tx.scrollTop;
+    $tx.scrollTop += dy;
+    if ($tx.scrollTop === before) window.scrollBy(0, dy);
+  }
+
   function wordFromPoint(x, y) {
     let el = document.elementFromPoint(x, y);
     while (el && !el.classList?.contains('word')) el = el.parentElement;
@@ -1039,7 +1051,7 @@
       } else if (y > window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX) {
         velocity = ((y - (window.innerHeight - MOVE_DRAG_AUTOSCROLL_EDGE_PX)) / MOVE_DRAG_AUTOSCROLL_EDGE_PX) * 18;
       }
-      if (velocity !== 0) $tx.scrollTop += velocity;
+      if (velocity !== 0) scrollViewportBy(velocity);
       const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
       // Intentionally NOT clearing pendingDragMove: a stationary pointer
@@ -1157,6 +1169,89 @@
     }
     setSelection(anchor, next);
     logKPI('ui.keyboard.select', { anchor, extent: next, direction: dir });
+  }
+
+  function extendSelectionByLine(dir) {
+    // Shift+ArrowDown / Shift+ArrowUp: jump the extent one *visual line*
+    // instead of one word. Walk neighbouring words by index until rect.top
+    // changes (= we crossed a line break), then keep scanning that new
+    // line for the word whose horizontal centre is closest to the current
+    // extent's x. Linear in line length, not in word count.
+    if (dir !== -1 && dir !== 1 || words.length === 0) return;
+    let anchor, extent;
+    const hadSelection = !!state.selection;
+    if (hadSelection) {
+      anchor = state.selection.anchor;
+      extent = state.selection.extent;
+    } else {
+      if (activeIdx < 0) return;
+      anchor = activeIdx;
+      extent = activeIdx;
+    }
+    const cur = words[extent];
+    if (!cur) return;
+    const curRect = cur.el.getBoundingClientRect();
+    const targetX = curRect.left + curRect.width / 2;
+    const startLineTop = curRect.top;
+    const LINE_EPS = 2;  // tolerate sub-pixel rounding
+
+    // Phase 1: scan to the first word on a different line in `dir`.
+    let i = extent + dir;
+    let nextLineTop = null;
+    while (i >= 0 && i < words.length) {
+      const r = words[i].el.getBoundingClientRect();
+      if (Math.abs(r.top - startLineTop) > LINE_EPS) { nextLineTop = r.top; break; }
+      i += dir;
+    }
+    if (nextLineTop === null) {
+      // Already on the first/last visual line — collapse caret to whichever
+      // edge the user asked for, matching native textarea behaviour.
+      const edge = dir > 0 ? words.length - 1 : 0;
+      setSelection(anchor, edge);
+      logKPI('ui.keyboard.select.line', { anchor, extent: edge, direction: dir, edge: true });
+      return;
+    }
+
+    // Phase 2: scan that entire line, pick the word whose centre is
+    // closest to targetX. `i` is the first word on the new line.
+    let bestIdx = i;
+    let bestDist = Math.abs((() => {
+      const r = words[i].el.getBoundingClientRect();
+      return r.left + r.width / 2 - targetX;
+    })());
+    let j = i + dir;
+    while (j >= 0 && j < words.length) {
+      const r = words[j].el.getBoundingClientRect();
+      if (Math.abs(r.top - nextLineTop) > LINE_EPS) break;
+      const dx = Math.abs(r.left + r.width / 2 - targetX);
+      if (dx < bestDist) { bestDist = dx; bestIdx = j; }
+      j += dir;
+    }
+
+    const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+    const candidateTLSeg = wordTimelineSegmentIndex(words[bestIdx]);
+    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+      // Don't cross a move-op timeline boundary; clamp at the last word
+      // that's still inside the anchor's segment.
+      let clamped = bestIdx;
+      while (clamped !== extent) {
+        const seg = wordTimelineSegmentIndex(words[clamped]);
+        if (seg === anchorTLSeg) break;
+        clamped += dir > 0 ? -1 : 1;
+      }
+      if (clamped !== extent) {
+        setSelection(anchor, clamped);
+        const clampedWord = words[clamped];
+        if (clampedWord) clampedWord.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+        logKPI('ui.keyboard.select.line', { anchor, extent: clamped, direction: dir, clamped: true });
+      }
+      return;
+    }
+    setSelection(anchor, bestIdx);
+    // Scroll the new extent into view so the user can see where they are.
+    const newExt = words[bestIdx];
+    if (newExt) newExt.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+    logKPI('ui.keyboard.select.line', { anchor, extent: bestIdx, direction: dir });
   }
 
   // ------- ops -------
@@ -2109,8 +2204,19 @@
     if (e.shiftKey && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
       const t = document.activeElement;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      // Don't grab the arrow keys while the IME conversion window is up —
+      // otherwise the IME loses focus on its candidate list.
+      if (e.isComposing || isIMEComposing) return;
       e.preventDefault();
       extendSelectionByKeyboard(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
+    if (e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (e.isComposing || isIMEComposing) return;
+      e.preventDefault();
+      extendSelectionByLine(e.key === 'ArrowDown' ? 1 : -1);
       return;
     }
     if (mod && (e.key === 'z' || e.key === 'Z')) {
