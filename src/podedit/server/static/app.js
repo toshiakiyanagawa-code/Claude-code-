@@ -423,6 +423,24 @@
     state.editedDuration = state.timeline.reduce((sum, r) => sum + (r.sourceEnd - r.sourceStart), 0);
   }
 
+  // Selection boundary guards exist to stop the user from picking up
+  // "arbitrary source content" when the DOM order has diverged from the
+  // source-time order — that only happens once a Move/Reorder reshuffles
+  // segments. Delete just removes spans, so segments stay in source order
+  // and the guard is purely an obstacle (the famous "30 sec wall" was
+  // exactly this: 13 cumulative Delete ops created a segment boundary at
+  // ~30 s and the guard refused to let Shift+Down cross it). Treat the
+  // timeline as "safe to cross" whenever the source ranges are still in
+  // ascending order — that captures Delete-only sessions and pre-Move
+  // states, and excludes only post-Move arrangements.
+  function isTimelineMonotonic() {
+    if (!state.timeline || state.timeline.length < 2) return true;
+    for (let i = 1; i < state.timeline.length; i++) {
+      if (state.timeline[i].sourceStart < state.timeline[i - 1].sourceEnd) return false;
+    }
+    return true;
+  }
+
   function editedToSource(t) {
     if (!state.timeline.length) return 0;
     t = Math.max(0, Math.min(t, state.editedDuration));
@@ -663,9 +681,50 @@
   function onWordPointerDown(i, ev) {
     if (ev.button !== undefined && ev.button !== 0) return;  // left button only
     if (ev.isComposing || isIMEComposing) return;
-    if (ev.shiftKey && state.selection) {
-      state.selection = { anchor: state.selection.anchor, extent: i };
+    if (ev.shiftKey) {
+      // Shift+Click range select. Bypasses the drag-to-select path entirely
+      // so the user can pick a 2-minute range without fighting auto-scroll.
+      // Anchor priority: existing selection anchor > last plain click > self.
+      let anchor = i;
+      if (state.selection) anchor = state.selection.anchor;
+      else if (lastPlainClickIdx >= 0) anchor = lastPlainClickIdx;
+      // Only clamp when the DOM order has diverged from source order
+      // (post-Move/Reorder). Delete-only sessions stay monotonic, so the
+      // user can Shift+Click across a deleted gap without picking up
+      // arbitrary content — the cut words have pointer-events:none.
+      let extent = i;
+      if (!isTimelineMonotonic()) {
+        const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+        const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
+        if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+          const step = i > anchor ? -1 : 1;
+          let j = i;
+          while (j !== anchor && wordTimelineSegmentIndex(words[j]) !== anchorTLSeg) {
+            j += step;
+          }
+          extent = j;
+          logKPI('ui.shift_click.clamped', {
+            requested_extent: i, clamped_to: extent, anchor,
+            anchor_seg: anchorTLSeg, click_seg: candidateTLSeg,
+          });
+        }
+      }
+      state.selection = { anchor, extent };
       renderSelection();
+      const ws = Math.min(anchor, extent);
+      const we = Math.max(anchor, extent);
+      const wStart = words[ws];
+      const wEnd = words[we];
+      if (wStart) $player.currentTime = wStart.start;
+      // Reset double-click tracking — a Shift+Click is a deliberate range
+      // gesture, not a candidate for the "next click plays" rule.
+      lastPlainClickIdx = -1;
+      lastPlainClickAt = 0;
+      refreshButtons();
+      logKPI('ui.shift_click.range', {
+        anchor, extent, ws, we,
+        duration: wStart && wEnd ? wEnd.end - wStart.start : null,
+      });
       ev.preventDefault();
       return;
     }
@@ -749,14 +808,15 @@
 
   function extendSelectionDrag(i) {
     if (dragAnchor === null) return;
-    // Selection in the UI maps to a *single* contiguous source range
-    // (the anchor's timeline segment). After a Move op the DOM is in edited
-    // order, so a user dragging across timeline-segment boundaries would
-    // pick up arbitrary source content. Refuse to extend across boundaries:
-    // the selection stops at whichever side of the boundary the anchor lives.
-    const anchorTLSeg = wordTimelineSegmentIndex(words[dragAnchor]);
-    const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
-    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) return;
+    // Boundary guard only matters once a Move/Reorder put the DOM out of
+    // source order. While timeline is still monotonic (Delete-only or no
+    // edits yet) the user can safely drag across deleted gaps — the cut
+    // words have pointer-events:none so they aren't actually picked up.
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[dragAnchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) return;
+    }
     if (i !== dragAnchor) dragMoved = true;
     if (!state.selection || state.selection.extent !== i) {
       state.selection = { anchor: dragAnchor, extent: i };
@@ -1285,11 +1345,13 @@
     }
 
     const next = Math.max(0, Math.min(words.length - 1, extent + dir));
-    const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
-    const candidateTLSeg = wordTimelineSegmentIndex(words[next]);
-    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
-      if (!hadSelection) setSelection(anchor, anchor);
-      return;
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[next]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+        if (!hadSelection) setSelection(anchor, anchor);
+        return;
+      }
     }
     setSelection(anchor, next);
     logKPI('ui.keyboard.select', { anchor, extent: next, direction: dir });
@@ -1352,24 +1414,26 @@
       j += dir;
     }
 
-    const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
-    const candidateTLSeg = wordTimelineSegmentIndex(words[bestIdx]);
-    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
-      // Don't cross a move-op timeline boundary; clamp at the last word
-      // that's still inside the anchor's segment.
-      let clamped = bestIdx;
-      while (clamped !== extent) {
-        const seg = wordTimelineSegmentIndex(words[clamped]);
-        if (seg === anchorTLSeg) break;
-        clamped += dir > 0 ? -1 : 1;
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[bestIdx]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+        // Don't cross a move-op timeline boundary; clamp at the last word
+        // that's still inside the anchor's segment.
+        let clamped = bestIdx;
+        while (clamped !== extent) {
+          const seg = wordTimelineSegmentIndex(words[clamped]);
+          if (seg === anchorTLSeg) break;
+          clamped += dir > 0 ? -1 : 1;
+        }
+        if (clamped !== extent) {
+          setSelection(anchor, clamped);
+          const clampedWord = words[clamped];
+          if (clampedWord) clampedWord.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+          logKPI('ui.keyboard.select.line', { anchor, extent: clamped, direction: dir, clamped: true });
+        }
+        return;
       }
-      if (clamped !== extent) {
-        setSelection(anchor, clamped);
-        const clampedWord = words[clamped];
-        if (clampedWord) clampedWord.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
-        logKPI('ui.keyboard.select.line', { anchor, extent: clamped, direction: dir, clamped: true });
-      }
-      return;
     }
     setSelection(anchor, bestIdx);
     // Scroll the new extent into view so the user can see where they are.

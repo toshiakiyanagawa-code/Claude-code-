@@ -377,6 +377,11 @@ main {
 .toolbar .mode-pill.mode-preview { background: #2b4663; color: white; }
 .toolbar .mode-pill.mode-rendering { background: #f7c46a; color: #0f1115; }
 .toolbar .mode-pill.mode-error { background: #ff5050; color: white; }
+.toolbar .hint-pill {
+  display: inline-block; padding: 3px 8px; border-radius: 3px;
+  font-size: 11px; background: #1f2a36; color: #9fc4ff;
+  cursor: help;
+}
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }
