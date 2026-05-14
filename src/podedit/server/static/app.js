@@ -881,6 +881,9 @@
     }
     if (dragAnchor === null) return;
     pendingDragMove = { x: e.clientX, y: e.clientY };
+    // Stamp the last real pointer motion so the rAF auto-scroll tick can
+    // tell "moving" from "held still at edge" — Word/Docs style.
+    _lastSelectionPointerMoveAt = performance.now();
   });
 
   document.addEventListener('pointerup', (e) => {
@@ -913,11 +916,92 @@
   // Backstop for sensitivity: track pointer position during selection drag and
   // resolve the word directly under the cursor each rAF. mouseenter alone
   // misses words when dragging fast across line breaks or inter-word gaps.
+  // Selection-drag uses a centre-based auto-scroll (Word / Google Docs
+  // style) rather than the move-drag's 80px edge zone. Real-user KPI on
+  // 2026-05-14 showed users keep their pointer near the vertical middle
+  // (y ~= innerHeight * 0.6) while dragging — they never get within
+  // 80px of the bottom edge, so the transcript never scrolled and
+  // selection stalled at ~30 sec of already-painted words. Dead zone
+  // ±60px in the centre, then velocity ramps linearly toward each edge.
+  // Auto-scroll only fires while the pointer is actually moving (last
+  // pointermove within 500ms) so a held-still pointer can't slowly
+  // drift the page in a direction the user no longer wants.
+  // Dead zone covers only the very centre; outside it, we want even a
+  // small drift past the edge to start scrolling immediately (3px/frame
+  // ≈ 180px/sec at 60Hz) and ramp up to MAX at the viewport edge.
+  // Avoid the previous MIN_VELOCITY trap that zeroed out the just-past-
+  // dead-zone region right where the user was actually holding pointer
+  // (y=538 on a 911px viewport).
+  const SELECTION_AUTOSCROLL_DEAD_ZONE_PX = 60;
+  const SELECTION_AUTOSCROLL_MAX_VELOCITY = 24;
+  const SELECTION_AUTOSCROLL_BASE_VELOCITY = 3;
+  const SELECTION_AUTOSCROLL_ACTIVITY_MS = 500;
+  let _lastSelectionPointerMoveAt = 0;
+  let _dragDebugLastEmitAt = 0;
+
+  function scrollViewportBy(dy) {
+    // Most layouts have <main id="transcript"> as the scrolling
+    // container (overflow-y: auto). On narrow viewports / large fonts
+    // the document itself becomes the scroller instead, leaving
+    // $tx.scrollTop pinned at 0 — fall back to window.scrollBy in that
+    // case so the user always gets some movement.
+    if (dy === 0) return;
+    const before = $tx.scrollTop;
+    $tx.scrollTop += dy;
+    if ($tx.scrollTop === before) window.scrollBy(0, dy);
+  }
+
   function dragMoveTick() {
-    if (pendingDragMove && dragAnchor !== null) {
-      const w = wordFromPoint(pendingDragMove.x, pendingDragMove.y);
+    if (pendingDragMove && dragAnchor !== null && !moveDrag) {
+      const x = pendingDragMove.x;
+      const y = pendingDragMove.y;
+      const now = performance.now();
+      const recentlyMoved = (now - _lastSelectionPointerMoveAt) < SELECTION_AUTOSCROLL_ACTIVITY_MS;
+      const centerY = window.innerHeight / 2;
+      const distFromCenter = Math.abs(y - centerY);
+      let velocity = 0;
+      if (recentlyMoved && distFromCenter > SELECTION_AUTOSCROLL_DEAD_ZONE_PX) {
+        const effectiveDist = distFromCenter - SELECTION_AUTOSCROLL_DEAD_ZONE_PX;
+        const maxDist = Math.max(1, centerY - SELECTION_AUTOSCROLL_DEAD_ZONE_PX);
+        const sign = y < centerY ? -1 : 1;
+        const fraction = Math.min(1, effectiveDist / maxDist);
+        // Start at BASE the instant we leave the dead zone, ramp up to
+        // MAX at the viewport edge. Never drops to zero again until the
+        // pointer comes back into the centre band.
+        velocity = sign * (SELECTION_AUTOSCROLL_BASE_VELOCITY
+          + fraction * (SELECTION_AUTOSCROLL_MAX_VELOCITY - SELECTION_AUTOSCROLL_BASE_VELOCITY));
+      }
+      const beforeTxTop = $tx.scrollTop;
+      const beforeWinY = window.scrollY;
+      if (velocity !== 0) scrollViewportBy(velocity);
+      const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
-      pendingDragMove = null;
+      // Throttled diagnostic KPI so we can confirm from server-side
+      // logs that auto-scroll is firing and the extent is advancing.
+      if (now - _dragDebugLastEmitAt > 250) {
+        _dragDebugLastEmitAt = now;
+        logKPI('ui.drag.tick_debug', {
+          x, y,
+          innerH: window.innerHeight,
+          recentlyMoved,
+          dist: distFromCenter,
+          dead_zone: SELECTION_AUTOSCROLL_DEAD_ZONE_PX,
+          velocity,
+          tx_top_before: beforeTxTop,
+          tx_top_after: $tx.scrollTop,
+          tx_scroll_height: $tx.scrollHeight,
+          tx_client_height: $tx.clientHeight,
+          win_y_before: beforeWinY,
+          win_y_after: window.scrollY,
+          hit_word_idx: w ? w.idx : null,
+          extent: state.selection ? state.selection.extent : null,
+        });
+      }
+      // Intentionally NOT nulling pendingDragMove: a stationary pointer
+      // must keep the rAF tick running so when the user resumes
+      // moving (within ACTIVITY_MS) scroll picks back up. The "no-op
+      // for same extent" guard in extendSelectionDrag keeps per-frame
+      // work tiny.
     }
     requestAnimationFrame(dragMoveTick);
   }
