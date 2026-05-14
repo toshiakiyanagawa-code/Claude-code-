@@ -50,7 +50,7 @@ foreach ($url in $urls) {
     New-Item -ItemType Directory -Path $jobDir -ErrorAction SilentlyContinue | Out-Null
     $mp4 = Join-Path $jobDir "source.mp4"
 
-    if ((Test-Path $mp4) -and ((Get-Item $mp4).Length -gt 100MB)) {
+    if ((Test-Path $mp4) -and ((Get-Item $mp4).Length -gt 10MB)) {
         Log "INFO: $vid は既にDL済み、アップロードのみ"
     }
     else {
@@ -64,14 +64,14 @@ foreach ($url in $urls) {
             Log "INFO: $vid 取得 (Chrome cookies、Chrome 終了が必要)"
         }
         $outTemplate = Join-Path $jobDir "source.%(ext)s"
-        $fmt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]"
+        $fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]"
         & yt-dlp @cookieArg -f $fmt --merge-output-format mp4 --write-auto-subs --sub-lang ja --convert-subs srt -o $outTemplate $url
         if ($LASTEXITCODE -ne 0) {
             Log "FAIL: $vid yt-dlp exit $LASTEXITCODE"
             Add-Content $Failed "$vid $url"
             continue
         }
-        if (-not (Test-Path $mp4) -or (Get-Item $mp4).Length -lt 100MB) {
+        if (-not (Test-Path $mp4) -or (Get-Item $mp4).Length -lt 10MB) {
             Log "FAIL: $vid source.mp4 が無いかサイズ不足"
             Add-Content $Failed "$vid $url"
             continue
