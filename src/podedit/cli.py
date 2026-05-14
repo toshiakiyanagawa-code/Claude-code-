@@ -564,6 +564,12 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
               help="Directory holding transcripts and sessions. Defaults to the parent dir of --transcript.")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, show_default=True, type=int)
+@click.option("--auth-password", default=None, envvar="PODEDIT_AUTH_PASSWORD",
+              help="Require HTTP Basic auth (username: podedit). "
+                   "Also reads PODEDIT_AUTH_PASSWORD. Recommended when "
+                   "exposing the UI beyond 127.0.0.1 (Codespaces public port, "
+                   "shared LAN, etc.). Prefer the env-var form over a literal "
+                   "CLI arg — args end up in shell history and `ps`.")
 def serve_cmd(
     audio: Path | None,
     transcript: Path | None,
@@ -573,6 +579,7 @@ def serve_cmd(
     work_dir: Path | None,
     host: str,
     port: int,
+    auth_password: str | None,
 ) -> None:
     """Start the local web UI on http://host:port."""
     import uvicorn
@@ -598,6 +605,7 @@ def serve_cmd(
             kpi_log_path=kpi_log,
             library_dir=library_dir,
             work_dir=work_dir,
+            auth_password=auth_password,
         ))
     except AudioTranscriptMismatch as e:
         _fatal(str(e))
@@ -618,6 +626,20 @@ def serve_cmd(
         console.print("  Open the UI and use Open (O) to upload or select audio.")
     console.print(f"  Session: {session_path}  ({'exists' if session_path.exists() else 'will be created'})")
     console.print(f"  KPI log: {kpi_log}")
+    # Friendly hint when binding non-loopback without a password — it's the
+    # one combination where someone on the same network (or in the same
+    # Codespace with the port public) gets full access by default.
+    if auth_password:
+        console.print(
+            "  [green]Auth:[/green] HTTP Basic enabled (username: [bold]podedit[/bold]). "
+            "Share the URL and password with your editing team only."
+        )
+    elif host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            "  [yellow]WARNING:[/yellow] binding to non-loopback host without --auth-password. "
+            "Anyone who can reach this URL can read and edit your sessions. "
+            "Set PODEDIT_AUTH_PASSWORD (or pass --auth-password) before sharing."
+        )
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

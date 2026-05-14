@@ -196,6 +196,44 @@ The duration and current-time shown above the transcript reflect the **edited**
 timeline. Delete the first 5 seconds and `0:00` becomes the first kept word.
 Move a range to a new position and the transcript visually reflows.
 
+### Share with editing team (Codespaces port + password)
+
+To let a few colleagues use the same podedit instance over the internet:
+
+1. **Set a password.** Use the env-var form so the secret doesn't end up in
+   shell history or `ps` output:
+
+   ```bash
+   read -srp 'podedit password: ' PODEDIT_AUTH_PASSWORD && export PODEDIT_AUTH_PASSWORD
+   uv run podedit serve --host 0.0.0.0
+   ```
+
+   The server now requires HTTP Basic auth — username is `podedit`, password
+   is what you set. Without `PODEDIT_AUTH_PASSWORD`, binding to `0.0.0.0`
+   prints a warning because the URL would otherwise be open to anyone who
+   can reach it. `--auth-password` is also accepted but discouraged for
+   non-throwaway secrets (it shows up in shell history and process listings).
+
+2. **Make the Codespace port public** so colleagues can hit the forwarded URL.
+   Either:
+
+   - In the **Ports** panel: right-click port `8765` → Port Visibility → Public.
+   - Or `gh codespace ports visibility 8765:public -c <codespace-name>`.
+
+   Copy the forwarded URL (looks like `https://<codespace>-8765.app.github.dev`).
+   GitHub serves it over HTTPS, so the Basic Auth password isn't sent in clear.
+
+3. **Share the URL and password out-of-band** (a Slack DM is fine; don't put
+   them in the same message). Anyone who has both can log in as `podedit` and
+   edit. Sessions and snapshots are stored per audio file under
+   `work_dir/<stem>.session.json` and `<stem>.snapshots/`, so two editors
+   working on **different** files won't overwrite each other. Coordinating on
+   the *same* file is still a manual step for now (use snapshots to fork off
+   "draft 1 / draft 2" if you want parallel cuts).
+
+To revoke access: change `PODEDIT_AUTH_PASSWORD` and restart the server, or
+flip port visibility back to **Private** in the Ports panel.
+
 ## How the audio actually plays past cuts
 
 `<audio>` keeps streaming the source m4a/wav; the UI runs a small mapping layer

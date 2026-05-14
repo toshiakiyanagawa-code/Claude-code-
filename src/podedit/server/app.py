@@ -9,6 +9,8 @@ process, configured at startup via ``create_app``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -77,6 +79,11 @@ class ServeConfig:
     kpi_log_path: Path  # JSONL; one line per UI event
     library_dir: Path | None = None  # parent dir for the library file picker; defaults to audio_path's parent
     work_dir: Path | None = None  # parent dir for transcripts/sessions; defaults to session_path's parent
+    # Shared-deployment knob: if set, every request must carry a matching
+    # HTTP Basic Authorization header. Leave None for local CLI use so the
+    # single-user flow stays one-click. Username is fixed to "podedit" since
+    # we only need a shared secret, not per-user accounts.
+    auth_password: str | None = None
 
 
 class ServeState:
@@ -423,6 +430,38 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     app = FastAPI(title="podedit", docs_url="/api/docs", redoc_url=None)
     no_audio_detail = "no audio loaded yet — pick a file via the Open dialog"
+
+    # Shared-deployment HTTP Basic Auth. Wired before any route runs so a
+    # bad credential can never reach a handler. Uses secrets.compare_digest
+    # for the password compare. When config.auth_password is None we skip
+    # the middleware entirely so the local CLI flow stays unchanged.
+    if config.auth_password:
+        auth_user = "podedit"
+        auth_pw = config.auth_password
+
+        @app.middleware("http")
+        async def basic_auth(request, call_next):
+            header = request.headers.get("authorization", "")
+            # Scheme is RFC-defined as case-insensitive ("Basic" / "basic" /
+            # "BASIC" all valid). Compare on the lowercased prefix so a
+            # spec-compliant client isn't rejected for cosmetic reasons.
+            if header[:6].lower() == "basic ":
+                token = header[6:].strip()
+                try:
+                    decoded = base64.b64decode(token, validate=True).decode("utf-8")
+                    user, _, pw = decoded.partition(":")
+                    if (
+                        secrets.compare_digest(user, auth_user)
+                        and secrets.compare_digest(pw, auth_pw)
+                    ):
+                        return await call_next(request)
+                except (binascii.Error, ValueError, UnicodeDecodeError):
+                    pass
+            return JSONResponse(
+                {"detail": "authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="podedit"'},
+            )
 
     def require_active() -> None:
         if not state.has_active():
