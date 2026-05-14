@@ -46,6 +46,7 @@ class NoCacheStaticFiles(StaticFiles):
         response.headers["Expires"] = "0"
         return response
 
+from ..annotations import build_annotation_payload
 from ..audio import probe as audio_probe
 from ..edit import EditSession, compile_timeline, sha256_of_file
 from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
@@ -438,6 +439,14 @@ def create_app(config: ServeConfig) -> FastAPI:
     def transcript() -> JSONResponse:
         require_active()
         return JSONResponse(state.transcript_data)
+
+    @app.get("/api/annotations/fillers")
+    def filler_annotations() -> JSONResponse:
+        require_active()
+        return JSONResponse(
+            build_annotation_payload(state.transcript_data),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/audio/info")
     def audio_info() -> dict:

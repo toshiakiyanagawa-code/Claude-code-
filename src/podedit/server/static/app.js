@@ -42,6 +42,8 @@
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
+  const $btnAddFillers = $('btn-add-fillers');
+  const $fillerCount = $('filler-count');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -277,6 +279,7 @@
     saveTimer: null,
     saveDirty: false,
     saveSeq: 0,        // monotonic; only the latest save can claim 'saved'
+    annotations: [],   // computed transcript annotations, currently filler/aizuchi candidates
   };
 
   function recomputeMergedDeletes() {
@@ -440,8 +443,10 @@
     if (next) return next.editedStart;
     return state.editedDuration;
   }
-  const words = [];    // [{el, start, end, idx, segIdx}]
+  const words = [];    // [{el, start, end, idx, segIdx, wordId}]
+  const wordById = new Map();
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
+  let activeIdx = -1;  // current word highlight; must exist before initial load/rerender
 
   // Diagnostic logging: if seeks are silently ignored, we still see seeking/
   // seeked/error events in the KPI log. Wired once at boot so a SPA-style
@@ -469,15 +474,19 @@
     const mySeq = ++loadSeq;
     const stale = () => mySeq !== loadSeq;
     const t0 = performance.now();
-    let info, tx, session;
+    let info, tx, session, annotations;
     let nextHasActive = true;
     let loadError = null;
     try {
       tx = await fetchJSONDetailed('/api/transcript');
       if (stale()) return false;
-      [info, session] = await Promise.all([
+      [info, session, annotations] = await Promise.all([
         fetchJSON('/api/audio/info'),
         fetchJSON('/api/session'),
+        fetchJSON('/api/annotations/fillers').catch((e) => {
+          logKPI('ui.annotations.error', { error: e.message });
+          return { annotations: [] };
+        }),
       ]);
       if (stale()) return false;
     } catch (e) {
@@ -487,6 +496,7 @@
         info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
         tx = { segments: [] };
         session = { ops: [] };
+        annotations = { annotations: [] };
       } else {
         loadError = e;
       }
@@ -527,6 +537,7 @@
     if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
     state.saveDirty = false;
     state.saveSeq = (state.saveSeq || 0) + 1;  // any in-flight autosave is no longer ours
+    state.annotations = [];
     // KPI counters are per-file too: a fresh switch starts a fresh editing
     // session so downstream metrics (time-to-first-op, ops-per-session) are
     // not contaminated by the previous file's history.
@@ -534,6 +545,7 @@
     kpi.firstOpAt = null;
     kpi.opsCount = 0;
     words.length = 0;
+    wordById.clear();
     $tx.innerHTML = '';
     $skipPill.textContent = 'no cut';
     if ($clipboardPill) $clipboardPill.hidden = true;
@@ -558,6 +570,9 @@
 
     state.sessionTemplate = session;
     state.ops = session.ops || [];
+    state.annotations = Array.isArray(annotations && annotations.annotations)
+      ? annotations.annotations
+      : [];
     state.sourceDuration = info.duration_sec;
     logKPI('ui.loaded', {
       latency_ms: performance.now() - t0,
@@ -592,14 +607,18 @@
         time.className = 'seg-time';
         time.textContent = fmt(seg.start);
         div.appendChild(time);
-        (seg.words || []).forEach((w) => {
+        const segmentId = seg.id || `s${segIdx}`;
+        (seg.words || []).forEach((w, wordIdxInSeg) => {
           const span = document.createElement('span');
           span.className = 'word';
           const wordIdx = idx;
+          const wordId = String(w.id != null ? w.id : `${segmentId}-w${wordIdxInSeg}`);
           span.dataset.idx = String(wordIdx);
+          span.dataset.wordId = wordId;
           span.textContent = w.text;
-          const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
+          const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx, wordId };
           words.push(word);
+          wordById.set(wordId, word);
           span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
           span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
           div.appendChild(span);
@@ -608,6 +627,7 @@
         $tx.appendChild(div);
       });
     }
+    renderAnnotations();
 
     if (state.hasActive) rerenderOps();
     else { syncTimelineUI(); updateStats(); }
@@ -1084,22 +1104,37 @@
 
   // ------- ops -------
   function applyDeleteRange(start, end) {
-    if (end <= start) return;
+    return applyDeleteRanges([{ start, end, note: null }], 'manual');
+  }
+
+  function applyDeleteRanges(ranges, source) {
+    const valid = ranges.filter((r) => r && r.end > r.start);
+    if (valid.length === 0) return 0;
     // Any edit invalidates the rendered preview — jump back to the source so
     // the user isn't auditioning a stale render. revertToSource bumps
     // renderSeq, so any in-flight Audition response is also discarded.
     if (state.previewMode) revertToSource('apply-delete');
     else state.renderSeq += 1;  // still bump so a stale response can't land on us
-    const op = { op_id: newOpId(), op: 'delete', start, end, note: null };
-    state.ops.push(op);
-    state.undoStack.push({ type: 'add', op });
+    for (const r of valid) {
+      const op = { op_id: newOpId(), op: 'delete', start: r.start, end: r.end, note: r.note || null };
+      state.ops.push(op);
+      state.undoStack.push({ type: 'add', op });
+      logKPI('ui.op.delete', {
+        op_id: op.op_id,
+        start: r.start,
+        end: r.end,
+        duration: r.end - r.start,
+        source,
+        note: op.note,
+      });
+    }
     state.redoStack = [];
-    kpi.opsCount += 1;
+    kpi.opsCount += valid.length;
     if (!kpi.firstOpAt) kpi.firstOpAt = Date.now() / 1000;
-    logKPI('ui.op.delete', { op_id: op.op_id, start, end, duration: end - start });
     rerenderOps();
     refreshButtons();
     scheduleSave();
+    return valid.length;
   }
 
   function deleteSelected() {
@@ -1235,6 +1270,7 @@
       const inCut = !inCompiledTimeline || state.mergedDeletes.some(([s, e]) => w.start >= s && w.end <= e);
       w.el.classList.toggle('deleted', inCut);
     }
+    renderAnnotations();
     renderPasteAnchor();
     updateStats();
   }
@@ -1310,6 +1346,90 @@
     }
   }
 
+  function recommendedFillerAnnotations() {
+    return state.annotations.filter((ann) =>
+      ann
+      && ann.type === 'filler'
+      && ann.delete_recommended
+      && Number.isFinite(ann.start)
+      && Number.isFinite(ann.end)
+      && ann.end > ann.start
+    );
+  }
+
+  function rangeCoveredByDelete(start, end) {
+    const eps = 1e-3;
+    return state.mergedDeletes.some(([s, e]) => s <= start + eps && e >= end - eps);
+  }
+
+  function rangeOverlapsAnyDelete(start, end) {
+    // Codex review: partial overlap between a recommended filler and an
+    // existing delete would otherwise stay "addable" and produce a second
+    // overlapping delete op. Filter them out — the user can still delete
+    // any leftover word manually.
+    const eps = 1e-3;
+    return state.mergedDeletes.some(([s, e]) => e > start + eps && s < end - eps);
+  }
+
+  function addableFillerAnnotations() {
+    return recommendedFillerAnnotations().filter((ann) =>
+      !rangeCoveredByDelete(ann.start, ann.end)
+      && !rangeOverlapsAnyDelete(ann.start, ann.end)
+    );
+  }
+
+  function renderAnnotations() {
+    for (const w of words) {
+      w.el.classList.remove('annotation-filler', 'annotation-aizuchi', 'annotation-recommended');
+      w.el.removeAttribute('data-annotation');
+      w.el.title = '';
+    }
+    for (const ann of state.annotations) {
+      const ids = Array.isArray(ann.word_ids) ? ann.word_ids : [];
+      const cls = ann.type === 'filler' ? 'annotation-filler'
+        : ann.type === 'aizuchi' ? 'annotation-aizuchi'
+        : null;
+      if (!cls) continue;
+      const title = ann.type === 'filler'
+        ? `フィラー候補 (${Math.round((ann.confidence || 0) * 100)}%)`
+        : `相槌候補 (${Math.round((ann.confidence || 0) * 100)}%)`;
+      for (const rawId of ids) {
+        const word = wordById.get(String(rawId));
+        if (!word) continue;
+        word.el.classList.add(cls);
+        if (ann.delete_recommended) word.el.classList.add('annotation-recommended');
+        word.el.dataset.annotation = ann.type;
+        word.el.title = title;
+      }
+    }
+    updateFillerControls();
+  }
+
+  function updateFillerControls() {
+    if (!$btnAddFillers || !$fillerCount) return;
+    const count = state.hasActive ? addableFillerAnnotations().length : 0;
+    $fillerCount.textContent = String(count);
+    $btnAddFillers.disabled = !state.hasActive || count === 0;
+    $btnAddFillers.title = count > 0
+      ? `${count} 件の推奨フィラー候補を削除候補に追加`
+      : '推奨フィラー候補はありません';
+  }
+
+  function addRecommendedFillers() {
+    const candidates = addableFillerAnnotations();
+    if (!candidates.length) return;
+    const ranges = candidates.map((ann) => ({
+      start: ann.start,
+      end: ann.end,
+      note: `filler:${ann.id}`,
+    }));
+    const added = applyDeleteRanges(ranges, 'annotation.filler');
+    if (added > 0) {
+      clearSelection();
+      logKPI('ui.annotation.fillers.added', { count: added });
+    }
+  }
+
   function refreshButtons() {
     $btnUndo.disabled = !state.hasActive || state.undoStack.length === 0;
     $btnRedo.disabled = !state.hasActive || state.redoStack.length === 0;
@@ -1319,6 +1439,7 @@
     $btnPlay.disabled = !state.hasActive;
     $scrubber.disabled = !state.hasActive;
     $exportFormat.disabled = !state.hasActive;
+    updateFillerControls();
   }
 
   function updateStats() {
@@ -1398,7 +1519,6 @@
   }
 
   // ------- preview-skip + highlight -------
-  let activeIdx = -1;
   function findActive(t) {
     let lo = 0, hi = words.length - 1, ans = -1;
     while (lo <= hi) {
@@ -2730,6 +2850,7 @@
       $btnLibraryUpload.textContent = prev;
     }
   }
+  if ($btnAddFillers) $btnAddFillers.addEventListener('click', addRecommendedFillers);
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
   if ($btnLibraryUpload && $libraryFileInput) {

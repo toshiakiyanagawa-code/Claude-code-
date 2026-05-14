@@ -266,6 +266,15 @@ main {
   font-size: inherit;
 }
 .word:hover { background: var(--hover-bg); }
+.word.annotation-filler {
+  box-shadow: inset 0 -2px 0 rgba(247, 196, 106, 0.65);
+}
+.word.annotation-aizuchi {
+  box-shadow: inset 0 -2px 0 rgba(98, 174, 255, 0.55);
+}
+.word.annotation-recommended {
+  background: rgba(247, 196, 106, 0.10);
+}
 .word.selected { background: var(--selected-bg); }
 .word.selected.move-source { opacity: 0.45; }
 .word.paste-anchor {

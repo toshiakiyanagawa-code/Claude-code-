@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,18 @@ from .edit import EditSession, compile_timeline, sha256_of_file
 from .render import RenderError, render_cuts, render_segments
 
 console = Console()
+
+
+def _browser_url(host: str, port: int) -> str:
+    codespace = os.environ.get("CODESPACE_NAME")
+    forwarding_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
+    if codespace and forwarding_domain:
+        return f"https://{codespace}-{port}.{forwarding_domain}"
+    if host in {"0.0.0.0", "::"}:
+        return f"http://127.0.0.1:{port}"
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
 
 
 @click.group()
@@ -590,16 +603,17 @@ def serve_cmd(
         _fatal(str(e))
     except FileNotFoundError as e:
         _fatal(str(e))
+    browser_url = _browser_url(host, port)
     if audio is not None and transcript is not None:
         console.print(
             f"[green]podedit UI[/green] serving "
             f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
-            f"at [link]http://{host}:{port}[/link]"
+            f"at [link]{browser_url}[/link]"
         )
     else:
         console.print(
             f"[green]podedit UI[/green] serving empty state "
-            f"at [link]http://{host}:{port}[/link]"
+            f"at [link]{browser_url}[/link]"
         )
         console.print("  Open the UI and use Open (O) to upload or select audio.")
     console.print(f"  Session: {session_path}  ({'exists' if session_path.exists() else 'will be created'})")
