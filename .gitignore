@@ -28,3 +28,6 @@ benchmarks.jsonl
 # Per-user Claude Code permission settings (shared .claude/settings.json,
 # if any, stays tracked — by convention .local is personal-only).
 .claude/settings.local.json
+
+# clipgen test_b1 - YouTube cookies (do NOT commit)
+output/test_b1/cookies.txt

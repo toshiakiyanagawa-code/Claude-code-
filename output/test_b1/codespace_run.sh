@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Codespace 内で実行するスクリプト。
-# 先にローカル PC で local_fetch.sh を実行し、source.mp4 / source.ja.srt を
-# output/test_b1/extract/AHqwNShdSGI_long/ にアップロードしてください。
+# Codespace 内で全部走らせるスクリプト。yt-dlp で素材取得から combined.mp4 まで一気通貫。
+# Codespace IP は YouTube に bot 判定されるので、cookies.txt が必須。
 #
-# このスクリプトは long (≥8分) と short (≤60秒) の両方を生成します。
+# cookies.txt の取得方法:
+# 1) ローカル Chrome に "Get cookies.txt LOCALLY" 拡張を入れ、youtube.com で Export
+# 2) または: yt-dlp --cookies-from-browser chrome --cookies cookies.txt --get-id
+# 3) VS Code 経由で Codespace の output/test_b1/cookies.txt にドラッグ&ドロップ
 
 SOURCE_MOCK="output/test_b1/source_mock.json"
 OUT_ROOT="output/test_b1/extract"
 VIDEO_ID="AHqwNShdSGI"
+VIDEO_URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+COOKIES="output/test_b1/cookies.txt"
 LONG_DIR="${OUT_ROOT}/${VIDEO_ID}_long"
 SHORT_DIR="${OUT_ROOT}/${VIDEO_ID}_short"
 SOURCE_MP4="${LONG_DIR}/source.mp4"
@@ -38,19 +42,35 @@ parts_all_present() {
   return 0
 }
 
-# ── pre-check ────────────────────────────────────────────────────────────
-if [ ! -f "${SOURCE_MP4}" ] || [ "$(mp4_bytes "${SOURCE_MP4}")" -lt "${MIN_MP4_BYTES}" ]; then
-  echo "ERROR: ${SOURCE_MP4} が見つからないかサイズが小さすぎます (要 100MB 以上)。" >&2
-  echo "ローカルで local_fetch.sh 実行後、source.mp4 / source.ja.srt を" >&2
-  echo "VS Code にドラッグ&ドロップで Codespace の同じパスに置いてください。" >&2
-  exit 1
-fi
+# ── [0/5] cookies + yt-dlp で source.mp4 + source.ja.srt を取得 ──────────
+mkdir -p "${LONG_DIR}"
 
-SRT_ARG=()
-if [ -s "${SOURCE_SRT}" ]; then
-  SRT_ARG=(--srt "${SOURCE_SRT}")
+if [ -f "${SOURCE_MP4}" ] && [ "$(mp4_bytes "${SOURCE_MP4}")" -ge "${MIN_MP4_BYTES}" ] && [ -s "${SOURCE_SRT}" ]; then
+  echo "[0/5] SKIP: 既に source.mp4 ($(mp4_bytes "${SOURCE_MP4}") bytes) と source.ja.srt があります。"
 else
-  echo "WARN: ${SOURCE_SRT} なし。字幕なしで進めますがハイライト 0 件になります。" >&2
+  if [ ! -s "${COOKIES}" ]; then
+    echo "ERROR: ${COOKIES} が見つかりません。" >&2
+    echo "  Chrome に \"Get cookies.txt LOCALLY\" 拡張を入れて youtube.com で Export し、" >&2
+    echo "  VS Code 経由で ${COOKIES} にドラッグ&ドロップしてください。" >&2
+    exit 1
+  fi
+  chmod 600 "${COOKIES}" || true
+  echo "[0/5] yt-dlp で素材取得 (cookies 使用)..."
+  yt-dlp \
+    --cookies "${COOKIES}" \
+    -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]" \
+    --merge-output-format mp4 \
+    --write-auto-subs --sub-lang ja --convert-subs srt \
+    -o "${LONG_DIR}/source.%(ext)s" \
+    "${VIDEO_URL}"
+
+  if [ "$(mp4_bytes "${SOURCE_MP4}")" -lt "${MIN_MP4_BYTES}" ]; then
+    echo "ERROR: ${SOURCE_MP4} が小さすぎます (要 100MB 以上)。" >&2
+    exit 1
+  fi
+  if [ ! -s "${SOURCE_SRT}" ]; then
+    echo "WARN: ${SOURCE_SRT} が見つかりません。自動字幕がついていない可能性があります。" >&2
+  fi
 fi
 
 if [ ! -f ".venv/bin/activate" ]; then
@@ -59,9 +79,9 @@ if [ ! -f ".venv/bin/activate" ]; then
 fi
 source .venv/bin/activate
 
-# ── 1 フォーマット分のパイプラインを走らせる ────────────────────────────────
+# ── 1 フォーマット分のパイプラインを走らせる ────────────────────────────
 run_format() {
-  local fmt="$1"            # long or short
+  local fmt="$1"
   local plan_json="output/test_b1/plan_${fmt}.json"
   local extract_dir="${OUT_ROOT}/${VIDEO_ID}_${fmt}"
   local combined_mp4="${extract_dir}/combined.mp4"
@@ -71,14 +91,17 @@ run_format() {
   echo "[${fmt}] 開始"
   echo "============================================================"
 
-  # short の場合は source.mp4/source.ja.srt を long ディレクトリから symlink する
-  # ln -sfn は broken symlink でも上書きで張り直せる
   if [ "${fmt}" = "short" ]; then
     mkdir -p "${extract_dir}"
     ln -sfn "../${VIDEO_ID}_long/source.mp4" "${extract_dir}/source.mp4"
     if [ -s "${SOURCE_SRT}" ]; then
       ln -sfn "../${VIDEO_ID}_long/source.ja.srt" "${extract_dir}/source.ja.srt"
     fi
+  fi
+
+  local SRT_ARG=()
+  if [ -s "${SOURCE_SRT}" ]; then
+    SRT_ARG=(--srt "${SOURCE_SRT}")
   fi
 
   # [1/4] plan
@@ -122,7 +145,6 @@ run_format() {
   fi
 
   # [3/4] cut
-  # parts は source.mp4 / cut.sh / concat.txt より新しい必要がある
   if [ -s "${extract_dir}/cut.sh" ]; then
     local cut_needs_rerun=1
     if parts_all_present "${extract_dir}"; then
@@ -184,7 +206,6 @@ if [ "${#missing[@]}" -gt 0 ]; then
     echo "  - ${m}" >&2
   done
   echo "ハイライト検出 0 件、SRT 取得失敗、cut/combine 失敗のいずれかが原因です。" >&2
-  echo "config-check --job-dir ${LONG_DIR} で原因を切り分けてください。" >&2
   exit 1
 fi
 
@@ -199,8 +220,7 @@ echo
 echo "--- タイトル候補 (long) ---"
 python - "output/test_b1/plan_long.json" <<'PY'
 import json, sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as f:
+with open(sys.argv[1], encoding="utf-8") as f:
     payload = json.load(f)
 plans = payload.get("plans", [])
 if not plans:
@@ -217,8 +237,7 @@ echo
 echo "--- タイトル候補 (short) ---"
 python - "output/test_b1/plan_short.json" <<'PY'
 import json, sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as f:
+with open(sys.argv[1], encoding="utf-8") as f:
     payload = json.load(f)
 plans = payload.get("plans", [])
 if not plans:

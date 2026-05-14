@@ -1,99 +1,87 @@
 # テスト版 B1 実行手順書 (竹田恒泰チャンネル2 / AHqwNShdSGI)
 
 **素材**: 「日本が危ない！中国の『AI世論操作』はここまで進んでいる！…」 (2026-05-08 公開)
-**チャンネル**: 竹田恒泰チャンネル2 (https://www.youtube.com/@takeda-tsuneyasu)
+**チャンネル**: 竹田恒泰チャンネル2 (https://www.youtube.com/channel/UCTxDz8sXbnpYAfulQMRFNEQ)
 **生成対象**: ロング (≥8 分) + ショート (≤60 秒) の両方
+**推奨ルート**: cookies.txt を Codespace にアップロード → Codespace 側で全部生成
 
-## ステップ 1 — ローカル PC で素材を取得
+## 推奨ルート: cookies.txt 方式 (ローカル作業は cookies 取得のみ)
 
-ローカル PC (Mac / Windows) で以下を実行。
+Codespace の IP は YouTube から bot 判定されるため、Codespace で yt-dlp を走らせるには
+ローカル Chrome の cookies が必要です。cookies.txt (数KB) だけアップロードすれば、
+200MB の mp4 をローカルで落とす必要がなくなります。
 
-### 前提
+### ステップ 1 — ローカル PC で cookies.txt を取得
 
-- `yt-dlp` インストール済み (`brew install yt-dlp` または `pip install -U yt-dlp`)
-- Chrome に YouTube ログイン済み (cookies 経由で取得)
-- このリポジトリを clone 済み、`feat/clipgen-m0-m4` ブランチをチェックアウト済み
+Chrome に拡張機能 **「Get cookies.txt LOCALLY」** をインストール (Chrome ウェブストア):
+https://chromewebstore.google.com/search/Get%20cookies.txt%20LOCALLY
 
-### 実行
+1. Chrome で https://www.youtube.com を開く (ログイン状態を確認)
+2. 拡張機能アイコンをクリック → 「Export」ボタン → `cookies.txt` がダウンロードされる
 
-```bash
-cd <リポジトリのパス>
-bash output/test_b1/local_fetch.sh
-```
+> 代替: `yt-dlp --cookies-from-browser chrome --cookies /tmp/cookies.txt --skip-download --print '' "https://www.youtube.com"` でも同等のファイルが取得できます。
 
-成功すると `output/test_b1/extract/AHqwNShdSGI_long/` に以下が落ちます:
+### ステップ 2 — VS Code から cookies.txt を Codespace にアップロード
 
-- `source.mp4` (720p MP4、推定 200MB 以上)
-- `source.ja.srt` (自動生成字幕、SRT 形式)
+VS Code の左サイドバー (エクスプローラ) で `output/test_b1/` ディレクトリを開き、
+`cookies.txt` を**そこにドラッグ&ドロップ**。
 
-### よくある失敗
+- アップロード先: `output/test_b1/cookies.txt`
+- 通常は数 KB なのですぐ終わる
+- `.gitignore` で commit されないようにしてあります(誤って public 化されない)
 
-- **`Sign in to confirm you're not a bot`** → Chrome に YouTube ログインしているか確認。`--cookies-from-browser firefox` に変えてもよい
-- **mp4 が 100MB 未満** → ネットワーク中断の可能性。再実行(冪等)
-- **`.srt` が出ない** → 元動画に自動字幕がついていない可能性。codespace_run.sh は字幕なしでも走るがハイライト 0 件になる
-
-## ステップ 2 — Codespace へ 2 ファイルをアップロード
-
-VS Code で当該 Codespace を開く。アップロード先ディレクトリが無ければ事前作成:
-
-```bash
-mkdir -p output/test_b1/extract/AHqwNShdSGI_long
-```
-
-その後、エクスプローラの `output/test_b1/extract/AHqwNShdSGI_long/` にドラッグ&ドロップ:
-
-1. `source.mp4`
-2. `source.ja.srt`
-
-> 大容量ファイル (>100MB) のアップロードは数分かかります。
-
-## ステップ 3 — Codespace で事前検証
+### ステップ 3 — Codespace で一括実行
 
 ```bash
 cd /workspaces/Claude-code-
-source .venv/bin/activate
-PYTHONPATH=src python -m clipgen.cli config-check \
-  --job-dir output/test_b1/extract/AHqwNShdSGI_long
-```
-
-期待される出力:
-
-```
-情報: ffmpeg バージョン: ffmpeg version ...
-情報: yt-dlp バージョン: ...
-情報: source.mp4 を確認しました: ... (XXX.XMB)
-情報: source.ja.srt を解析しました: NNN 区間
-```
-
-エラーが出たらアップロードし直し。
-
-## ステップ 4 — Codespace で本処理 (long + short 両方を生成)
-
-```bash
 bash output/test_b1/codespace_run.sh
 ```
 
 中で以下が走ります:
 
+- `[0/5]` yt-dlp で `source.mp4` + `source.ja.srt` をダウンロード (cookies 使用、数分)
 - `[long 1/4]` plan_long.json 生成 (字幕からハイライト検出、≥8 分用)
 - `[long 2/4]` extract 設定生成 (cut.sh, combine.sh, concat.txt)
 - `[long 3/4]` ffmpeg でハイライト窓を切り出し → parts/*.mp4
 - `[long 4/4]` 切り出し片を連結 → `combined.mp4` (ロング版)
-- `[short 1/4]` plan_short.json 生成 (短尺向けハイライト検出、≤60 秒用)
-- `[short 2/4-4/4]` 同様の流れでショート版 combined.mp4 を生成
+- `[short 1/4-4/4]` ショート版を同じ流れで生成
 
-冪等性: 既存の生成物が plan/SRT より新しければスキップします。再実行で壊れません。
-
-## ステップ 5 — 完成物の確認
+完成物:
 
 ```
 output/test_b1/extract/AHqwNShdSGI_long/combined.mp4   (ロング)
 output/test_b1/extract/AHqwNShdSGI_short/combined.mp4  (ショート)
 ```
 
-`scp` または VS Code 経由でローカルに落とせます。
+冪等性: 既存の生成物が plan/SRT より新しければスキップ。再実行で壊れません。
 
-タイトル候補は標準出力に表示されますし、`plan_long.json` / `plan_short.json` の `plans[0].title_candidates` にも残っています。
+### ステップ 4 — 完成物のダウンロード
+
+VS Code エクスプローラで `combined.mp4` を右クリック → Download。
+
+タイトル候補は標準出力に表示され、`plan_long.json` / `plan_short.json` の
+`plans[0].title_candidates` にも残っています。
+
+## よくある失敗と対処
+
+- **`ERROR: output/test_b1/cookies.txt が見つかりません`** → ステップ 2 を完了
+- **`Sign in to confirm you're not a bot`** → cookies.txt が古い・ログアウト状態で取った可能性。Chrome に YouTube ログインしているか確認して再取得
+- **`source.mp4 が小さすぎます (要 100MB 以上)`** → ネットワーク中断。再実行(冪等)
+- **`source.ja.srt` がない** → 元動画に自動字幕がついていない。長さ 0 件になるので別動画推奨
+
+## 代替ルート: 完全ローカル方式 (cookies アップロードしたくない場合)
+
+ローカル PC で動画+字幕を取得し、両ファイルを Codespace にアップロードする方式:
+
+```bash
+# ローカル PC で実行
+bash output/test_b1/local_fetch.sh
+# → source.mp4 (200MB+) と source.ja.srt が落ちる
+```
+
+その後、VS Code で `output/test_b1/extract/AHqwNShdSGI_long/` に source.mp4 と
+source.ja.srt をドラッグ&ドロップしてから、Codespace で `codespace_run.sh` を実行。
+cookies.txt が無くても source.mp4 が既にあれば yt-dlp ステップはスキップされます。
 
 ## 編集者向けチェックリスト (公開前)
 
@@ -108,16 +96,8 @@ output/test_b1/extract/AHqwNShdSGI_short/combined.mp4  (ショート)
 ## 完全に作り直したい場合
 
 ```bash
-# 字幕→plan→extract→cut→combine 全部やり直す
-rm -f output/test_b1/plan_long.json output/test_b1/plan_short.json
-rm -rf output/test_b1/extract/AHqwNShdSGI_long/parts
-rm -rf output/test_b1/extract/AHqwNShdSGI_short
-rm -f output/test_b1/extract/AHqwNShdSGI_long/combined.mp4 \
-      output/test_b1/extract/AHqwNShdSGI_long/cut.sh \
-      output/test_b1/extract/AHqwNShdSGI_long/combine.sh \
-      output/test_b1/extract/AHqwNShdSGI_long/concat.txt \
-      output/test_b1/extract/AHqwNShdSGI_long/manifest.json
+rm -rf output/test_b1/extract output/test_b1/plan_*.json
 bash output/test_b1/codespace_run.sh
 ```
 
-source.mp4 / source.ja.srt は残します(ダウンロードし直さない)。
+cookies.txt は残ります(ダウンロードし直すだけ)。
