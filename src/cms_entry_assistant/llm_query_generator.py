@@ -16,7 +16,7 @@ ANTHROPIC_API_KEY_ENV = ANTHROPIC_API_KEY
 DEFAULT_MODEL = (
     os.getenv("CMS_ENTRY_ASSISTANT_ANTHROPIC_MODEL")
     or os.getenv("ANTHROPIC_MODEL")
-    or "claude-3-5-haiku-latest"
+    or "claude-haiku-4-5"
 )
 DEFAULT_MAX_TOKENS = 1000
 CACHE_SCHEMA_VERSION = 1

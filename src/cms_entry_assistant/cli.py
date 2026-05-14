@@ -220,8 +220,16 @@ def photo_audit_cmd(
 def serve_cmd(host: str, port: int) -> None:
     """Start the merged CMS入稿アシスト Web UI (.docx → 4-tab workflow)."""
 
+    import logging
     import uvicorn
 
+    # cms_entry_assistant モジュールの _log.warning / info を stdout に流す
+    # (LLM fallback / 取得失敗の運用追跡用)。uvicorn のロガーとは独立。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
     uvicorn.run("cms_entry_assistant.web.app:app", host=host, port=port, reload=False)
 
 
