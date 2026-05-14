@@ -219,111 +219,6 @@ def test_format_canonical_is_pasteable():
     assert "・新規著者〇" in canonical
 
 
-def test_photo_suggestions_follow_people_policy():
-    suggestion = build_suggestion(
-        "hero",
-        "カンバン",
-        "銀座のママがLINE交換しない？と聞かれたときの断り方",
-        "上司や取引先からの依頼を断る場面です。",
-        "",
-    )
-
-    assert "日本人" in suggestion.query_ja
-    assert "顔なし" in suggestion.query_ja
-    assert "手元" in suggestion.query_ja
-    assert "no face" in suggestion.query_en
-    assert suggestion.note
-
-
-def test_photo_suggestions_prefer_concrete_subjects():
-    curry = build_suggestion(
-        "hero",
-        "カンバン",
-        "なぜインネパが日本に定着したのか",
-        "ネパール人経営のインドカレー店について。",
-        "",
-    )
-    posture = build_suggestion(
-        "hero",
-        "カンバン",
-        "丸まった背中の死亡リスク",
-        "高齢者の姿勢と健康について。",
-        "",
-    )
-    war = build_suggestion(
-        "hero",
-        "カンバン",
-        "広島に原爆が落とされても戦争をやめる気はなかった",
-        "終戦直前の日本の戦争指導者について。",
-        "",
-    )
-
-    assert "インドカレー" in curry.query_ja
-    assert "レストラン" in curry.query_ja
-    assert "背中" in posture.query_ja
-    assert "顔なし" in posture.query_ja
-    assert war.type_code == "F"
-    assert "資料写真" in war.query_ja
-    assert "資料写真" in war.note
-
-
-def test_photo_suggestions_cover_audit_miss_patterns():
-    mountain = build_suggestion(
-        "hero",
-        "カンバン",
-        "富士山より遭難者が多発する低山・高尾山の危険",
-        "登山者が下山できないケースについて。",
-        "",
-    )
-    food = build_suggestion(
-        "hero",
-        "カンバン",
-        "60代以降は酒・ラーメンを我慢しなくていい",
-        "外食や肉を食べること、食事制限について。",
-        "",
-    )
-    ancient_china = build_suggestion(
-        "hero",
-        "カンバン",
-        "中国の古代王朝で生贄が民衆に喜ばれた理由",
-        "遺跡から人骨が見つかり、甲骨文字から上帝信仰を読み解く。",
-        "",
-    )
-    wagashi = build_suggestion(
-        "hero",
-        "カンバン",
-        "藤井聡太名人の勝負おやつに選ばれた鯱もなか",
-        "名古屋の老舗和菓子店について。",
-        "",
-    )
-    city_hall = build_suggestion(
-        "hero",
-        "カンバン",
-        "市役所が困り果てたクレーマー市民を新人職員が撃退",
-        "公務員の窓口対応について。",
-        "",
-    )
-    office_health = build_suggestion(
-        "hero",
-        "カンバン",
-        "突然死に至る会社員はどんな生活をしているのか",
-        "産業医が長時間労働と残業の健康リスク、食習慣の悪化を解説する。",
-        "",
-    )
-
-    assert "登山" in mountain.query_ja
-    assert "顔なし" in mountain.query_ja
-    assert food.type_code == "I"
-    assert "食卓" in food.query_ja
-    assert ancient_china.type_code == "F"
-    assert "遺跡" in ancient_china.query_ja
-    assert wagashi.type_code == "I"
-    assert "和菓子" in wagashi.query_ja
-    assert "市役所" in city_hall.query_ja
-    assert "会社員" in office_health.query_ja
-    assert "顔なし" in office_health.query_ja
-
-
 def test_rank_hits_prioritizes_japanese_no_face_people_policy(tmp_path):
     class Hit:
         def __init__(self, asset_id: str, alt: str, photographer: str = ""):
@@ -1004,68 +899,6 @@ def test_web_app_cms_html_pre_escapes_critical_html_characters(monkeypatch):
     assert "</pre>" not in pre_inner
 
 
-def test_build_suggestion_does_not_propagate_article_title_to_h4_slots():
-    """記事タイトル由来の強語が全 h4 スロットに伝播しないこと (B改修正の回帰防止)。
-
-    例: タイトルが「腰痛対策」でも、h4 が「ストレッチ」「座り方」「食事と運動」なら
-    腰痛クエリにならず、各見出し固有のクエリになるべき。
-    """
-    title = "和田秀樹 シニアの腰痛対策で寝たきりを防ぐ"
-    s1 = build_suggestion("h4_2", "■毎日のストレッチが鍵", "毎日のストレッチが鍵",
-                          body_text="本文 ストレッチ", article_title=title)
-    s2 = build_suggestion("h4_3", "■座り方を見直す", "座り方を見直す",
-                          body_text="本文", article_title=title)
-    s3 = build_suggestion("h4_4", "■食事と運動のバランス", "食事と運動のバランス",
-                          body_text="バランスを取る", article_title=title)
-    assert "腰" not in s1.query_ja, f"h4_2 がタイトルの '腰痛' に汚染: {s1.query_ja}"
-    assert "腰" not in s2.query_ja, f"h4_3 がタイトルの '腰痛' に汚染: {s2.query_ja}"
-    assert "腰" not in s3.query_ja, f"h4_4 がタイトルの '腰痛' に汚染: {s3.query_ja}"
-    # それぞれ見出し固有のクエリ
-    assert "ストレッチ" in s1.query_ja
-    assert "姿勢" in s2.query_ja or "座" in s2.query_ja
-    assert any(k in s3.query_ja for k in ("食卓", "食事", "運動", "ウォーキング"))
-
-
-def test_build_suggestion_hero_still_uses_article_title():
-    """hero は article_title 由来の単語も使う (カンバンは記事全体を代表)。"""
-    title = "和田秀樹 シニアの腰痛対策で寝たきりを防ぐ"
-    s = build_suggestion("hero", "カンバン(冒頭)", title, body_text="", article_title=title)
-    # hero は article-wide で「腰痛」を反映してよい
-    assert "腰" in s.query_ja
-
-
-def test_build_suggestion_h4_falls_back_to_heading_plus_body_then_generic():
-    """h4 で heading にルールが無い場合、heading+body → generic にフォールバックする。"""
-    title = "経済記事"
-    # heading にルール語なし、body に「タワマン」 (= 再開発ルールにヒット) → heading+body マッチ
-    s = build_suggestion(
-        "h4_1", "■近年の動向", "近年の動向",
-        body_text="タワマンが増え続けている。", article_title=title,
-    )
-    assert "再開発" in s.query_ja or "タワーマンション" in s.query_ja
-    assert "matched_source=heading+body" in s.rationale
-
-
-def test_build_suggestion_h4_uses_heading_only_when_rule_hits():
-    """h4 で heading に直接ルール語があれば、body を見るまでもなくマッチ。"""
-    s = build_suggestion(
-        "h4_1", "■腰痛対策", "腰痛対策",
-        body_text="", article_title="無関係なタイトル",
-    )
-    assert "腰" in s.query_ja
-    assert "matched_source=heading)" in s.rationale  # heading のみで終わる
-
-
-def test_build_suggestion_rationale_includes_matched_source_for_debug():
-    """rationale に matched_source ラベルが入る (回帰時のデバッグ用)。"""
-    # ストレッチ系
-    s = build_suggestion(
-        "h4_2", "■毎日のストレッチが鍵", "毎日のストレッチが鍵",
-        body_text="", article_title="無関係",
-    )
-    assert "matched_source=" in s.rationale
-
-
 def test_crawl_search_does_not_persist_error_entries(tmp_path, monkeypatch):
     """エラー時はディスクキャッシュに永続化しない (再試行で自己回復)。"""
     import json
@@ -1201,3 +1034,65 @@ def test_rebuild_canonical_preserves_original_photo_instructions(monkeypatch):
     canonical = app_module._rebuild_canonical(case)
     # 未選択スロットでも、既存の手入力指示 "共同通信 MANUAL999" が canonical に残る
     assert "MANUAL999" in canonical
+
+def test_build_suggestion_v8_hero_uses_lead_or_h4_text():
+    """hero スロットは lead_text を context に使う (記事代表)。"""
+    s = build_suggestion(
+        "hero",
+        "カンバン",
+        h4_text="和田秀樹 シニアの腰痛対策で寝たきりを防ぐ",
+        surrounding_paragraphs=[],
+        lead_text="リードに病院を取り上げる。",
+    )
+    # lead_text の「病院」が type A (ランドマーク) ルールでヒットする
+    assert "病院" in s.query_ja or "hospital" in s.query_en
+    # 余分な「日本人 顔なし 手元」サフィックスは付かない (v2-era 廃止仕様の回帰防止)
+    assert "顔なし" not in s.query_ja
+    assert "手元" not in s.query_ja
+
+
+def test_build_suggestion_v8_h4_uses_heading_plus_surrounding_paragraphs():
+    """h4 は h4_text + 直近 2 段落の context を使い、lead_text には反応しない (slot-local)。"""
+    s = build_suggestion(
+        "h4_2",
+        "■毎日のストレッチが鍵",
+        h4_text="毎日のストレッチが鍵",
+        surrounding_paragraphs=["運動が大事です。", "毎朝の習慣にしましょう。"],
+        lead_text="無関係のリード。",
+    )
+    assert s.type_code == "D"  # 「運動」が ACTIONS にヒット
+    assert "運動" in s.query_ja
+    assert "顔なし" not in s.query_ja  # 機械サフィックス禁止
+
+
+def test_build_suggestion_v8_h4_slots_do_not_collapse_on_lead():
+    """h4 スロットは lead_text には引っ張られない。別 slot は別 query になる。"""
+    s_a = build_suggestion(
+        "h4_1", "■見出しA", h4_text="見出しA",
+        surrounding_paragraphs=["皇居の周辺を散策。"], lead_text="腰痛と寝たきり",
+    )
+    s_b = build_suggestion(
+        "h4_2", "■見出しB", h4_text="見出しB",
+        surrounding_paragraphs=["半導体工場が拡大。"], lead_text="腰痛と寝たきり",
+    )
+    assert "皇居" in s_a.query_ja
+    assert "半導体" in s_b.query_ja
+
+
+def test_build_suggestion_v8_no_mechanical_suffix():
+    """機械的な「日本人 顔なし 後ろ姿 手元」suffix を 付与しないこと (v2 廃止仕様)。"""
+    s = build_suggestion(
+        "hero", "カンバン",
+        h4_text="高齢者の生活",
+        surrounding_paragraphs=[],
+        lead_text="高齢者の老後について",
+    )
+    for forbidden in ("顔なし", "後ろ姿", "手元", "no face"):
+        assert forbidden not in s.query_ja, f"{forbidden} が混入: {s.query_ja}"
+        assert forbidden not in s.query_en, f"{forbidden} が混入: {s.query_en}"
+
+
+def test_build_suggestion_v8_keeps_5_types_only():
+    """A〜E の 5 type のみが返ること (旧 F/G/H/I は v8 復活で廃止)。"""
+    s = build_suggestion("hero", "カンバン", h4_text="病院での出来事", surrounding_paragraphs=[])
+    assert s.type_code in {"A", "B", "C", "D", "E"}, f"unexpected type: {s.type_code}"
