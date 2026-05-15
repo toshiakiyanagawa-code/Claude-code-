@@ -3403,9 +3403,8 @@
       }
       // Delete button: remove the audio and ALL its derivatives. Hidden
       // for the currently-active audio (the server would 409 anyway, but
-      // hiding the button avoids tempting the editor). ``active`` /
-      // ``activePath`` are in the closure from populateLibrary.
-      const isActive = (active && e.name === active) || (activePath && e.path === activePath);
+      // hiding the button avoids tempting the editor). Reuse the
+      // ``isActive`` declared at the top of this loop iteration.
       const isTranscribingThis =
         transcribeJob && transcribeJob.status &&
         (transcribeJob.status === 'running' || transcribeJob.status === 'queued') &&
