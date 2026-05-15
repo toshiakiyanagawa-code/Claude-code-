@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0",
+  "source_audio": {
+    "path": "samples/speech_ja.wav",
+    "duration_sec": 0.0
+  },
+  "asr_audio": {
+    "path": "samples/speech_ja.wav",
+    "duration_sec": 0.0
+  },
+  "language": "ja",
+  "model_config": {
+    "model": "small",
+    "language": "ja",
+    "requested_device": "auto",
+    "resolved_device": "cpu",
+    "compute_type": "int8",
+    "beam_size": 5,
+    "vad_filter": true
+  },
+  "created_at": "2026-05-14T00:00:00Z",
+  "segments": [
+    {
+      "id": "s0",
+      "start": 0.0,
+      "end": 0.0,
+      "text": "ポッドキャストのテストです。",
+      "words": [
+        {
+          "id": "s0-w0",
+          "start": 0.0,
+          "end": 0.0,
+          "text": "ポッドキャスト",
+          "confidence": null
+        },
+        {
+          "id": "s0-w1",
+          "start": 0.0,
+          "end": 0.0,
+          "text": "の",
+          "confidence": null
+        },
+        {
+          "id": "s0-w2",
+          "start": 0.0,
+          "end": 0.0,
+          "text": "テスト",
+          "confidence": null
+        },
+        {
+          "id": "s0-w3",
+          "start": 0.0,
+          "end": 0.0,
+          "text": "です。",
+          "confidence": null
+        }
+      ]
+    }
+  ]
+}

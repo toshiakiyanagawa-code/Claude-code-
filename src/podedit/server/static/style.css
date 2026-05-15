@@ -88,6 +88,34 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   font-family: inherit;
 }
 .toolbar select:hover { border-color: var(--accent); }
+.toolbar .search-box { display: inline-flex; align-items: center; gap: 4px; }
+.toolbar .search-box input {
+  background: #1a1d28; color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; font-size: 12px; font-family: inherit;
+  width: 180px; min-width: 120px;
+}
+.toolbar .search-box input:focus { outline: none; border-color: var(--accent); background: #14171f; }
+.toolbar .search-info {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  min-width: 50px; text-align: right;
+}
+.toolbar .search-info.no-hits { color: var(--red); }
+.toolbar .search-box button { padding: 2px 8px; font-size: 14px; line-height: 1; min-width: 24px; }
+/* Quiet outline + tint for every match; the active one gets a thicker border
+   so the editor can still tell which one is currently focused without any
+   pulsing animation (editor explicitly asked: "no glowing, just a box"). */
+.word.search-hit {
+  background: rgba(255, 196, 106, 0.18);
+  border-radius: 2px;
+  outline: 1px solid rgba(247, 196, 106, 0.7);
+  outline-offset: 1px;
+}
+.word.search-active {
+  background: rgba(255, 196, 106, 0.30);
+  outline: 2px solid rgba(247, 196, 106, 1);
+  outline-offset: 1px;
+}
 .toolbar button:hover:not(:disabled) { background: #2b303f; }
 .toolbar button:disabled { opacity: 0.35; cursor: not-allowed; }
 .toolbar .spacer { flex: 1; }
@@ -192,6 +220,15 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   white-space: nowrap;
 }
 .library-breadcrumb-sep { color: var(--muted); }
+.library-env-banner {
+  font-size: 12px; color: var(--text);
+  background: rgba(120, 180, 255, 0.10);
+  border: 1px solid rgba(120, 180, 255, 0.35);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.library-env-banner strong { color: var(--accent); }
 .library-hint { font-size: 11px; color: var(--muted); margin-top: 12px; }
 .library-hint code {
   background: #1a1d28; padding: 1px 4px; border-radius: 3px;
@@ -208,6 +245,11 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 .library-action:hover:not(:disabled) { background: #2b303f; border-color: var(--accent); }
 .library-action:disabled { opacity: 0.4; cursor: not-allowed; }
+.library-delete-btn { color: #ff8080; border-color: rgba(255, 128, 128, 0.35); }
+.library-delete-btn:hover:not(:disabled) {
+  background: rgba(255, 128, 128, 0.15);
+  border-color: rgba(255, 128, 128, 0.65);
+}
 .library-list li.transcribing {
   background: rgba(247, 196, 106, 0.07);
   border-color: rgba(247, 196, 106, 0.35);
@@ -222,6 +264,12 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
 }
 
 main {
+  /* Drag-to-select is owned by the app, not the browser. Disable the
+     native text selection layer so it can't grey/blue-highlight or start
+     a "drag image" while the user is extending an edit selection — this
+     was a real source of stuck drags on Safari/Codespaces. */
+  user-select: none;
+  -webkit-user-select: none;
   padding: 12px 16px; max-width: 920px; width: 100%; margin: 0 auto;
   /* line-height: 1.4 had ~5px extra gap per line on a 14px font; user
      wanted ~half that. 1.25 is the comfortable spot — slightly more
@@ -257,6 +305,15 @@ main {
   font-size: inherit;
 }
 .word:hover { background: var(--hover-bg); }
+.word.annotation-filler {
+  box-shadow: inset 0 -2px 0 rgba(247, 196, 106, 0.65);
+}
+.word.annotation-aizuchi {
+  box-shadow: inset 0 -2px 0 rgba(98, 174, 255, 0.55);
+}
+.word.annotation-recommended {
+  background: rgba(247, 196, 106, 0.10);
+}
 .word.selected { background: var(--selected-bg); }
 .word.selected.move-source { opacity: 0.45; }
 .word.paste-anchor {
@@ -353,6 +410,125 @@ main {
 .toolbar .mode-pill.mode-preview { background: #2b4663; color: white; }
 .toolbar .mode-pill.mode-rendering { background: #f7c46a; color: #0f1115; }
 .toolbar .mode-pill.mode-error { background: #ff5050; color: white; }
+.toolbar .hint-pill {
+  display: inline-block; padding: 3px 8px; border-radius: 3px;
+  font-size: 11px; background: #1f2a36; color: #9fc4ff;
+  cursor: help;
+}
+.toolbar-toggle[data-active="true"] {
+  background: #2b4663; color: white; border-color: #4a7ab8;
+}
+.toolbar-toggle[data-active="true"] #follow-state { color: #b9d8ff; }
+.toolbar .btn-primary {
+  background: #2b6cb0; color: white; border-color: #3b82c4; font-weight: 600;
+}
+.toolbar .btn-primary:hover { background: #3578bf; }
+.toolbar .btn-primary:disabled { background: #1f3a55; color: #7a8aa0; }
+
+.snapshots-create-row {
+  display: flex; gap: 8px; padding: 4px 0 10px;
+  border-bottom: 1px solid var(--border); margin-bottom: 10px;
+}
+.snapshots-create-row input {
+  flex: 1; padding: 6px 10px; background: var(--input-bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; font-size: 13px;
+}
+.snapshots-create-row input:focus { outline: none; border-color: var(--accent); }
+.snapshots-list { list-style: none; padding: 0; margin: 0; }
+.snapshots-list li {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 4px; margin-bottom: 4px;
+}
+.snapshots-list li:hover { background: var(--hover-bg); border-color: var(--border); }
+.snapshots-list .snapshot-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 600;
+}
+.snapshots-list .snapshot-meta {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  margin-right: 8px;
+}
+.snapshots-list button {
+  font-size: 11px; padding: 3px 8px;
+}
+.snapshots-list .danger { color: #ff8080; }
+
+.fillers-actions-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0 10px;
+  border-bottom: 1px solid var(--border); margin-bottom: 10px;
+}
+.fillers-actions-row .spacer { flex: 1; }
+.fillers-selected-count {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  margin-left: 8px;
+}
+.fillers-list {
+  list-style: none; padding: 0; margin: 0;
+  max-height: 480px; overflow-y: auto;
+}
+.fillers-list li {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border: 1px solid transparent; border-radius: 4px; margin-bottom: 3px;
+}
+.fillers-list li:hover { background: var(--hover-bg); border-color: var(--border); }
+.fillers-list label {
+  flex: 1; cursor: pointer; display: flex; align-items: center; gap: 10px;
+}
+.fillers-list .filler-time {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  white-space: nowrap; min-width: 64px;
+}
+.fillers-list .filler-text { flex: 1; overflow: hidden; }
+.fillers-list .filler-target {
+  background: rgba(255, 200, 80, 0.18); color: #ffd47a;
+  padding: 1px 4px; border-radius: 3px; font-weight: 600;
+}
+.fillers-list .filler-context { color: var(--muted); font-size: 12px; }
+.fillers-list .filler-conf {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  margin-left: 6px;
+}
+.fillers-list button.preview { font-size: 11px; padding: 3px 8px; }
 
 .status { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
 .error { color: var(--red); }
+
+/* Dictionary modal (P0-I): post-processing ASR replacement table. */
+.dictionary-hint { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.dictionary-actions-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+}
+.dictionary-actions-row .spacer { flex: 1; }
+.dictionary-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.dictionary-table th, .dictionary-table td {
+  padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.dictionary-table th { font-weight: 600; color: var(--muted); font-size: 11px; }
+.dictionary-table input[type="text"] {
+  width: 100%; box-sizing: border-box; padding: 4px 6px;
+  background: var(--panel); color: inherit;
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.dictionary-table td.col-from { width: 38%; }
+.dictionary-table td.col-to { width: 38%; }
+.dictionary-table td.col-enabled { width: 10%; text-align: center; }
+.dictionary-table td.col-actions { width: 14%; text-align: right; }
+.dictionary-table .row-empty {
+  color: var(--muted); text-align: center; padding: 18px 0;
+}
+
+/* Glossary modal (P0-H): single textarea, comma-/newline-separated terms. */
+.glossary-hint { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+#glossary-textarea {
+  width: 100%; box-sizing: border-box; min-height: 240px;
+  background: var(--panel); color: inherit;
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px 10px; font-family: inherit; font-size: 13px; line-height: 1.5;
+  resize: vertical;
+}
+.glossary-actions-row {
+  display: flex; align-items: center; gap: 8px; margin-top: 10px;
+}
+.glossary-actions-row .spacer { flex: 1; }

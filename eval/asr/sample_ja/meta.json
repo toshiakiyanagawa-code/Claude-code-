@@ -1,0 +1,9 @@
+{
+  "case_id": "sample_ja",
+  "title": "Japanese ASR sample",
+  "duration_sec": 0.0,
+  "notes": "Small placeholder evaluation set. Place audio.wav, audio.mp3, or audio.m4a in this directory before running podedit asr-eval sample_ja.",
+  "glossary": [
+    "ポッドキャスト"
+  ]
+}

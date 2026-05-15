@@ -33,8 +33,15 @@ from pathlib import Path
 from typing import Literal
 
 from ..asr import ASRConfig, transcribe
+from ..asr_dictionary import (
+    apply_dictionary,
+    dict_ops_path_for,
+    load_dictionary,
+    write_dict_ops,
+)
 from ..audio import probe as audio_probe, to_wav_16k_mono
 from ..edit import sha256_of_file
+from ..glossary import load_terms
 
 
 # Subdirectory under work_dir for derived 16k mono wavs. We deliberately namespace
@@ -45,6 +52,49 @@ ASR_DERIVED_SUBDIR = "_podedit_asr"
 
 
 JobStatus = Literal["queued", "running", "done", "error"]
+
+
+DEFAULT_JA_PODCAST_PROMPT = "日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。"
+
+
+def resolve_prompt_and_hotwords(
+    *,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    glossary_terms: list[str],
+    default_prompt: str = DEFAULT_JA_PODCAST_PROMPT,
+) -> tuple[str, str | None, int]:
+    """Combine caller inputs with the editor-curated glossary.
+
+    Rules (P0-H):
+      * ``initial_prompt is None`` → use ``default_prompt`` and, if the
+        glossary has terms, append a ``"固有名詞: ..."`` suffix.
+      * ``initial_prompt == ""`` → caller asked for raw decoding; do not
+        inject glossary into the prompt.
+      * Any other string → use the caller's prompt verbatim; glossary does
+        not get appended.
+      * Hotwords: only auto-fill from glossary when *both* ``initial_prompt``
+        and ``hotwords`` were absent — if the caller customised either
+        signal, treat that as an opt-out from auto-biasing.
+
+    Returns ``(effective_prompt, effective_hotwords, glossary_terms_used)``.
+    ``glossary_terms_used`` is for logging.
+    """
+    from ..glossary import render_hotwords, render_prompt_suffix
+
+    glossary_count = 0
+    if initial_prompt is None:
+        effective_prompt = default_prompt
+        suffix = render_prompt_suffix(glossary_terms)
+        if suffix:
+            effective_prompt = f"{effective_prompt} {suffix}"
+            glossary_count = len(glossary_terms)
+    else:
+        effective_prompt = initial_prompt  # may be ""
+    effective_hotwords = hotwords
+    if effective_hotwords is None and initial_prompt is None and glossary_terms:
+        effective_hotwords = render_hotwords(glossary_terms)
+    return effective_prompt, effective_hotwords, glossary_count
 
 
 @dataclass
@@ -122,7 +172,10 @@ class TranscriptionJobManager:
     # to avoid over-biasing toward a single topic; podcast-shaped so the
     # decoder favors conversational form (です/ます, aizuchi) over news-
     # script form. Empty string means "let faster-whisper default win".
-    DEFAULT_JA_PODCAST_PROMPT = "日本語のポッドキャスト会話。話し言葉、自然な相槌、固有名詞を含みます。"
+    # Single source of truth lives at module scope; class attribute kept as
+    # an alias so existing callers (e.g. ``self.DEFAULT_JA_PODCAST_PROMPT``)
+    # keep working without churn.
+    DEFAULT_JA_PODCAST_PROMPT: str = DEFAULT_JA_PODCAST_PROMPT  # type: ignore[misc]
 
     def start(
         self,
@@ -135,6 +188,8 @@ class TranscriptionJobManager:
         beam_size: int = 1,
         initial_prompt: str | None = None,
         hotwords: str | None = None,
+        batched: bool = False,
+        batch_size: int = 4,
     ) -> dict:
         """Start a new transcription job. Raises RuntimeError if one is in flight.
 
@@ -180,7 +235,7 @@ class TranscriptionJobManager:
         # Spawn worker outside the lock so the start() call returns fast.
         t = threading.Thread(
             target=self._run_job,
-            args=(job, audio_path, transcript_path, model, language, beam_size, prompt, hw),
+            args=(job, audio_path, transcript_path, model, language, beam_size, prompt, hw, batched, batch_size),
             daemon=True,
             name=f"podedit-transcribe-{job.job_id}",
         )
@@ -200,25 +255,36 @@ class TranscriptionJobManager:
         with self._lock:
             job.log.append(line)
 
-    def _get_or_load_model(self, model: str, compute_type: str):
-        """Return a cached WhisperModel for (model, compute_type), loading on miss.
+    def _get_or_load_model(self, model: str, compute_type: str, cpu_threads: int, num_workers: int):
+        """Return a cached WhisperModel for (model, compute_type, threads, workers), loading on miss.
 
         On a cache miss, we drop the previously-cached handle *before* loading
         the new one — otherwise both would briefly be resident, which matters
         on RAM-constrained boxes when stepping from small to large-v3.
-        """
-        from faster_whisper import WhisperModel
 
-        key = (model, compute_type)
+        Cache key includes ``cpu_threads`` / ``num_workers`` because changing
+        either requires a new WhisperModel instance — CTranslate2 fixes those
+        at construction time.
+        """
+        key = (model, compute_type, cpu_threads, num_workers)
         with self._lock:
             if self._cached_model_key == key and self._cached_model is not None:
-                return self._cached_model, True  # cache hit
+                return self._cached_model, True  # cache hit (no import needed)
             # Evict before loading so peak memory is one model, not two.
             self._cached_model = None
             self._cached_model_key = None
+        # Import faster_whisper only when we actually need to load (deferred
+        # so a cache hit doesn't pay any import cost in tests/CI).
+        from faster_whisper import WhisperModel
         # Load outside the lock — model construction does disk I/O and weight
         # quantization that can take seconds.
-        instance = WhisperModel(model, device="cpu", compute_type=compute_type)
+        instance = WhisperModel(
+            model,
+            device="cpu",
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            num_workers=num_workers,
+        )
         with self._lock:
             self._cached_model = instance
             self._cached_model_key = key
@@ -234,6 +300,8 @@ class TranscriptionJobManager:
         beam_size: int,
         initial_prompt: str | None,
         hotwords: str | None,
+        batched: bool = False,
+        batch_size: int = 4,
     ) -> None:
         try:
             self._set(job, status="running", started_at=time.time())
@@ -259,12 +327,23 @@ class TranscriptionJobManager:
             # load cost only on a miss. The asr.transcribe() function accepts
             # an existing handle via model_handle=... so we don't reinstantiate.
             compute_type = "int8"  # CPU-only on the in-UI worker by design
+            # P1 speedup: explicit cpu_threads/num_workers for reproducibility.
+            # Cap at 2 — the P1 target is a 2-vCPU Codespace; on a beefier
+            # local machine a future config flag can raise this. num_workers=1
+            # keeps the worker simple — multiple workers would just thrash
+            # the same physical cores.
+            cpu_threads = min(os.cpu_count() or 2, 2)
+            num_workers = 1
             t0 = time.time()
-            whisper_model, cache_hit = self._get_or_load_model(model, compute_type)
+            whisper_model, cache_hit = self._get_or_load_model(
+                model, compute_type, cpu_threads, num_workers,
+            )
             load_ms = (time.time() - t0) * 1000
             self._append_log(
                 job,
-                f"model {'cached' if cache_hit else 'loaded'} ({model}/{compute_type}) in {load_ms:.0f}ms",
+                f"model {'cached' if cache_hit else 'loaded'} "
+                f"({model}/{compute_type}/cpu_threads={cpu_threads}/"
+                f"num_workers={num_workers}) in {load_ms:.0f}ms",
             )
 
             # Fast-mode opt-in for the in-UI worker. The CLI keeps the
@@ -278,14 +357,18 @@ class TranscriptionJobManager:
             #     The ladder is only entered for segments that fail
             #     compression-ratio/logprob thresholds, so steady-state
             #     throughput is unchanged.
-            # Tri-state prompt resolution (see start() docstring):
-            #   None  → default JA podcast prompt (cheap quality bump)
-            #   ""    → caller explicitly asked for raw decoding; honor it
-            #   "..." → caller-supplied prompt, use verbatim
-            if initial_prompt is None:
-                effective_prompt = self.DEFAULT_JA_PODCAST_PROMPT
-            else:
-                effective_prompt = initial_prompt  # may be ""
+            # Tri-state prompt resolution (see start() docstring), plus the
+            # editor-curated glossary (P0-H) when applicable. See
+            # ``resolve_prompt_and_hotwords`` for the exact rules — extracted
+            # into a pure function so it can be unit-tested without spinning
+            # up an ASR worker.
+            glossary_terms: list[str] = load_terms(self._work_dir / "glossary.txt")
+            effective_prompt, effective_hotwords, glossary_count = resolve_prompt_and_hotwords(
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                glossary_terms=glossary_terms,
+                default_prompt=self.DEFAULT_JA_PODCAST_PROMPT,
+            )
 
             cfg = ASRConfig(
                 model=model, language=language,
@@ -296,16 +379,31 @@ class TranscriptionJobManager:
                 # Use the dataclass default (full ladder) — explicit for clarity.
                 temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                 initial_prompt=effective_prompt,
-                hotwords=hotwords,
+                hotwords=effective_hotwords,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+                batched=batched,
+                batch_size=batch_size,
             )
             if initial_prompt is None:
-                prompt_tag = "default-prompt"
+                if glossary_count:
+                    prompt_tag = f"default-prompt+glossary({glossary_count})"
+                else:
+                    prompt_tag = "default-prompt"
             elif initial_prompt == "":
                 prompt_tag = "no-prompt"
             else:
                 prompt_tag = f"user-prompt ({len(initial_prompt)} chars)"
-            hw_tag = f", hw={len(hotwords)} chars" if hotwords else ""
-            self._append_log(job, f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag})")
+            hw_tag = f", hw={len(effective_hotwords)} chars" if effective_hotwords else ""
+            batch_tag = (
+                f", batched(bs={batch_size}, temp-fallback=off, cond=False)"
+                if batched
+                else ""
+            )
+            self._append_log(
+                job,
+                f"asr start (beam={beam_size}, cond=False, {prompt_tag}{hw_tag}{batch_tag})",
+            )
             tx, gen = transcribe(info, asr_wav, cfg, model_handle=whisper_model)
 
             for seg in gen:
@@ -323,7 +421,16 @@ class TranscriptionJobManager:
             # entries don't suddenly start failing mismatch checks later.
             tx.source_audio.sha256 = sha256_of_file(audio_path)
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(tx.to_dict(), ensure_ascii=False, indent=2)
+            tx_dict = tx.to_dict()
+            # P0-I: post-processing dictionary replacement. Empty / missing
+            # dictionary => no-op (transcript unchanged, no sidecar). The
+            # canonical transcript is published with corrections baked in;
+            # sidecar (<stem>.transcript.dict-ops.jsonl) is written only
+            # after a successful publish so undo history can't drift from
+            # transcript content if publish fails.
+            dictionary = load_dictionary(self._work_dir / "dictionary.json")
+            tx_dict, dict_ops = apply_dictionary(tx_dict, dictionary)
+            payload = json.dumps(tx_dict, ensure_ascii=False, indent=2)
             # Atomic, no-clobber publish: write the payload to a sibling
             # tempfile, then ``os.link`` it to the final path. ``link`` is
             # atomic on POSIX and fails with FileExistsError if the target
@@ -364,6 +471,19 @@ class TranscriptionJobManager:
                 f"({len(tx.segments)} segs, "
                 f"{sum(len(s.words) for s in tx.segments)} words)",
             )
+            # Sidecar after publish — keeps undo history aligned with what's
+            # actually on disk. If sidecar write fails the transcript still
+            # exists and editors can fall back to manual fixes.
+            if dict_ops:
+                try:
+                    write_dict_ops(dict_ops_path_for(transcript_path), dict_ops)
+                    self._append_log(
+                        job, f"dict applied: {len(dict_ops)} replacement(s)"
+                    )
+                except OSError as e:
+                    self._append_log(
+                        job, f"dict sidecar write failed (transcript ok): {e}"
+                    )
             self._set(job, status="done", finished_at=time.time())
         except Exception as e:
             tb = traceback.format_exc(limit=4)

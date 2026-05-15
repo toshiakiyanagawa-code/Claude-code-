@@ -1,0 +1,23 @@
+warning: `VIRTUAL_ENV=/usr/local` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+[eval] manuscripts=107 matched=92 todo=20
+[eval] [1/20] 『中国ぎらいのための中国史』1本目安田確認.docx (108.1s, slots=4, actual=2)
+[eval] [2/20] 『中国ぎらいのための中国史』2本目安田確認.docx (72.2s, slots=4, actual=2)
+[eval] [3/20] 【0725再修正編集部チェック】『誰が日本を降伏させたか』3本目.docx (76.3s, slots=4, actual=2)
+[eval] [4/20] 【10月3週目以降に配信】『中国ぎらいのための中国史』3本目 安田確認.docx (48.0s, slots=4, actual=2)
+[eval] [5/20] 【ご確認用】POL野尻先生インタビュー第1回背中丸まりが死亡リスク2倍の衝撃エビデンス修正・追記ジャンプをハーフスクワットに差し替え.docx (38.5s, slots=4, actual=2)
+[eval] [6/20] 【タイトル等再編集】プレジデント用　再開発0911_nozawa.docx (46.5s, slots=4, actual=2)
+[eval] [7/20] 【修正版】POL第4回【からだの「さび」はじわじわ寿命を縮める医師が警告する酸化ストレスの正体】 (1).docx (69.3s, slots=4, actual=2)
+[eval] [8/20] 【編集部チェック　著者修正版】『不登校大全』4本目 (1).docx (60.4s, slots=4, actual=2)
+[eval] [9/20] 【編集部チェック】「処刑人という職業」（p.226-234）.docx (74.3s, slots=4, actual=1)
+[eval] [10/20] 【編集部チェック】「死の直前の後悔]P43-52.docx (37.8s, slots=4, actual=2)
+[eval] [11/20] 【編集部チェック】「死の直前の後悔」P20-29〔改）.docx (33.7s, slots=4, actual=2)
+[eval] [12/20] 【編集部チェック】「死の直前の後悔」P70-79.docx (36.9s, slots=4, actual=2)
+[eval] [13/20] 【編集部チェック】『100歳まで冴える脳習慣10』抜粋.docx (25.9s, slots=4, actual=2)
+[eval] [14/20] 【編集部チェック】『40代からはじめるあなたの予防医学』抜粋.docx (41.7s, slots=4, actual=2)
+[eval] [15/20] 【編集部チェック】『60代から女は好き勝手くらいがちょうどいい』1本目.docx (31.8s, slots=4, actual=3)
+[eval] [16/20] 【編集部チェック】『60代から女は好き勝手くらいがちょうどいい』2本目.docx (34.1s, slots=4, actual=3)
+[eval] [17/20] 【編集部チェック】『60歳を過ぎたらやめるが勝ち』1本目.docx (40.9s, slots=4, actual=2)
+[eval] [18/20] 【編集部チェック】『60歳を過ぎたらやめるが勝ち』2本目.docx (25.6s, slots=4, actual=2)
+[eval] [19/20] 【編集部チェック】『90歳まで健康長寿』追加1本目.docx (33.6s, slots=4, actual=2)
+[eval] [20/20] 【編集部チェック】『90歳まで健康長寿』追加2本目 (1).docx (35.9s, slots=4, actual=2)
+[eval] wrote output/eval_v2_20articles.json

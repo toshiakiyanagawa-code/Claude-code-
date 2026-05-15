@@ -14,6 +14,8 @@ build/
 samples/
 .podedit/
 *.transcript.json
+# But the hand-curated ASR evaluation references are version-controlled.
+!eval/asr/**/reference.transcript.json
 *.16k.wav
 benchmarks.jsonl
 

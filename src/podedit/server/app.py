@@ -8,10 +8,14 @@ process, configured at startup via ``create_app``.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -44,8 +48,17 @@ class NoCacheStaticFiles(StaticFiles):
         response.headers["Expires"] = "0"
         return response
 
+from ..annotations import build_annotation_payload
+from ..asr_dictionary import (
+    DICTIONARY_VERSION,
+    DictEntry,
+    Dictionary,
+    load_dictionary,
+    save_dictionary,
+)
 from ..audio import probe as audio_probe
-from ..edit import EditSession, compile_timeline, sha256_of_file
+from ..glossary import GLOSSARY_VERSION, MAX_TERM_LEN, load_terms, save_terms
+from ..edit import EditSession, TimelineSegment, compile_timeline, sha256_of_file
 from ..library import SUPPORTED_AUDIO_SUFFIXES, list_directory, scan_library
 from ..render import RENDERER_VERSION, RenderError, render_segments
 from ..schema import AudioRef
@@ -74,6 +87,11 @@ class ServeConfig:
     kpi_log_path: Path  # JSONL; one line per UI event
     library_dir: Path | None = None  # parent dir for the library file picker; defaults to audio_path's parent
     work_dir: Path | None = None  # parent dir for transcripts/sessions; defaults to session_path's parent
+    # Shared-deployment knob: if set, every request must carry a matching
+    # HTTP Basic Authorization header. Leave None for local CLI use so the
+    # single-user flow stays one-click. Username is fixed to "podedit" since
+    # we only need a shared secret, not per-user accounts.
+    auth_password: str | None = None
 
 
 class ServeState:
@@ -102,6 +120,9 @@ class ServeState:
         self.transcript_data: dict = {}
         self.session: EditSession | None = None
         self.session_lock = Lock()
+        # Snapshot operations (create/rename/delete/restore) serialise on this.
+        # Light contention only — actions are user-initiated and one-at-a-time.
+        self.snapshots_lock = Lock()
 
     def has_active(self) -> bool:
         return (
@@ -294,10 +315,80 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _save_last_active(state: ServeState) -> None:
+    """Atomically record the currently-active (audio, transcript) pair.
+
+    Lets a subsequent ``podedit serve`` (without --audio) restore the last
+    file the user was working on, so an editor mid-task doesn't lose context
+    across server restarts or Codespace rebuilds.
+
+    Tmp name is suffixed with a random token so two concurrent saves don't
+    rename the same tempfile out from under each other (a 500 path codex
+    flagged in review).
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    tmp_path = state.work_dir / f"last_active.json.{secrets.token_hex(4)}.tmp"
+    try:
+        tmp_path.write_text(json.dumps({
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+            "ts": time.time(),
+        }))
+        os.replace(tmp_path, last_active_path)
+    finally:
+        # If write_text raised before os.replace, drop the dangling tmp.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _try_load_last_active(state: ServeState) -> bool:
+    """Try to restore the last active (audio, transcript) pair on startup.
+
+    Returns True if restoration succeeded. Any failure (missing file, missing
+    audio/transcript on disk, JSON corruption, audio/transcript mismatch) is
+    silently swallowed and the server stays in empty state.
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    try:
+        data = json.loads(last_active_path.read_text())
+        audio_path = Path(data["audio_path"])
+        transcript_path = Path(data["transcript_path"])
+        if not audio_path.exists() or not transcript_path.exists():
+            return False
+        state.load_active(audio_path, transcript_path)
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        FileNotFoundError,
+        AudioTranscriptMismatch,
+    ):
+        return False
+    print(f"restored last active audio: {state.audio_path}")
+    try:
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.restored",
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+        })
+    except OSError:
+        # KPI logging is best-effort during startup; never let a write
+        # failure here block a successful restore.
+        pass
+    return True
+
+
 def create_app(config: ServeConfig) -> FastAPI:
     state = ServeState(config)
     if config.audio_path is not None and config.transcript_path is not None:
         state.load_active(config.audio_path, config.transcript_path)
+    elif config.audio_path is None:
+        _try_load_last_active(state)
     transcription_jobs = TranscriptionJobManager(work_dir=state.work_dir)
     # Opportunistic startup cleanup of W8 transient hardlinks. BackgroundTask
     # usually deletes these on response end, but if the process died mid-
@@ -348,18 +439,64 @@ def create_app(config: ServeConfig) -> FastAPI:
     app = FastAPI(title="podedit", docs_url="/api/docs", redoc_url=None)
     no_audio_detail = "no audio loaded yet — pick a file via the Open dialog"
 
+    # Shared-deployment HTTP Basic Auth. Wired before any route runs so a
+    # bad credential can never reach a handler. Uses secrets.compare_digest
+    # for the password compare. When config.auth_password is None we skip
+    # the middleware entirely so the local CLI flow stays unchanged.
+    if config.auth_password:
+        auth_user = "podedit"
+        auth_pw = config.auth_password
+
+        @app.middleware("http")
+        async def basic_auth(request, call_next):
+            header = request.headers.get("authorization", "")
+            # Scheme is RFC-defined as case-insensitive ("Basic" / "basic" /
+            # "BASIC" all valid). Compare on the lowercased prefix so a
+            # spec-compliant client isn't rejected for cosmetic reasons.
+            if header[:6].lower() == "basic ":
+                token = header[6:].strip()
+                try:
+                    decoded = base64.b64decode(token, validate=True).decode("utf-8")
+                    user, _, pw = decoded.partition(":")
+                    if (
+                        secrets.compare_digest(user, auth_user)
+                        and secrets.compare_digest(pw, auth_pw)
+                    ):
+                        return await call_next(request)
+                except (binascii.Error, ValueError, UnicodeDecodeError):
+                    pass
+            return JSONResponse(
+                {"detail": "authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="podedit"'},
+            )
+
     def require_active() -> None:
         if not state.has_active():
             raise HTTPException(status_code=503, detail=no_audio_detail)
 
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True}
+        codespace_name = os.environ.get("CODESPACE_NAME") or None
+        return {
+            "ok": True,
+            "is_codespaces": bool(os.environ.get("CODESPACES")),
+            "codespace_name": codespace_name,
+            "chunked_upload_chunk_size": 512 * 1024,
+        }
 
     @app.get("/api/transcript")
     def transcript() -> JSONResponse:
         require_active()
         return JSONResponse(state.transcript_data)
+
+    @app.get("/api/annotations/fillers")
+    def filler_annotations() -> JSONResponse:
+        require_active()
+        return JSONResponse(
+            build_annotation_payload(state.transcript_data),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/audio/info")
     def audio_info() -> dict:
@@ -469,6 +606,179 @@ def create_app(config: ServeConfig) -> FastAPI:
         _append_jsonl(state.kpi_log_path, record)
         return {"ok": True}
 
+    # ------- snapshots (named editing drafts) -------
+    # Each snapshot is a self-contained EditSession dict written to its own
+    # file. Listing rebuilds a manifest from the directory so we never carry
+    # a stale index — losing/finding a snapshot file just changes the listing.
+    SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{16}$")
+
+    def _snapshots_dir() -> Path:
+        require_active()
+        assert state.audio_path is not None and state.work_dir is not None
+        return state.work_dir / f"{state.audio_path.stem}.snapshots"
+
+    def _snapshot_path(snapshot_id: str) -> Path:
+        # Strict id check on every entry point: the id segment is appended to
+        # a file path, so an attacker-controlled value would otherwise enable
+        # ../escape. ^[a-f0-9]{16}$ matches what we generate with token_hex(8).
+        if not SNAPSHOT_ID_RE.match(snapshot_id):
+            raise HTTPException(status_code=400, detail=f"invalid snapshot id: {snapshot_id!r}")
+        return _snapshots_dir() / f"{snapshot_id}.json"
+
+    def _load_snapshot_payload(path: Path) -> dict:
+        # Centralised reader: corrupted or unreadable snapshot files surface
+        # as 400, never as the default FastAPI 500. Caller decides whether to
+        # convert NotFound paths to 404 separately.
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=400, detail=f"snapshot file unreadable: {e}") from e
+
+    def _summarise_snapshot(payload: dict, fallback_id: str | None = None) -> dict:
+        # Tolerate older or hand-written files: surface what we can find. The
+        # id we use is the one we trust (the filename); payload.id is only
+        # advisory and may be missing/wrong on hand-edited files.
+        return {
+            "id": fallback_id or payload.get("id"),
+            "name": payload.get("name") or "(no name)",
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+            "ops_count": len((payload.get("session") or {}).get("ops") or []),
+        }
+
+    @app.get("/api/snapshots")
+    def list_snapshots() -> dict:
+        # Listing intentionally tolerates broken individual files: a single
+        # corrupted entry must not blank the whole picker, since the user
+        # may need the rest of the list precisely to recover. Single-record
+        # endpoints (GET/PATCH/restore) still return 400 on the same input.
+        snaps_dir = _snapshots_dir()
+        items: list[dict] = []
+        if snaps_dir.exists():
+            for f in sorted(snaps_dir.glob("*.json")):
+                file_id = f.stem
+                # Only honour files whose name matches our id format. Hand-
+                # dropped files with arbitrary names don't appear in the UI.
+                if not SNAPSHOT_ID_RE.match(file_id):
+                    continue
+                try:
+                    payload = json.loads(f.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                # Trust the filename, not the payload, for the id field.
+                items.append(_summarise_snapshot(payload, fallback_id=file_id))
+        # Newest first so the most recent draft is at the top of the picker.
+        items.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+        return {"snapshots": items}
+
+    @app.post("/api/snapshots")
+    def create_snapshot(body: dict) -> dict:
+        require_active()
+        name = (body or {}).get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="name is required")
+        name = name.strip()[:200]
+        snaps_dir = _snapshots_dir()
+        snapshot_id = secrets.token_hex(8)
+        now = time.time()
+        with state.snapshots_lock:
+            snaps_dir.mkdir(parents=True, exist_ok=True)
+            with state.session_lock:
+                assert state.session is not None
+                payload = {
+                    "id": snapshot_id,
+                    "name": name,
+                    "created_at": now,
+                    "updated_at": now,
+                    "session": state.session.to_dict(),
+                }
+            _atomic_write_text(
+                snaps_dir / f"{snapshot_id}.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        return {"snapshot": _summarise_snapshot(payload, fallback_id=snapshot_id)}
+
+    @app.get("/api/snapshots/{snapshot_id}")
+    def get_snapshot(snapshot_id: str) -> dict:
+        path = _snapshot_path(snapshot_id)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return _load_snapshot_payload(path)
+
+    @app.patch("/api/snapshots/{snapshot_id}")
+    def rename_snapshot(snapshot_id: str, body: dict) -> dict:
+        path = _snapshot_path(snapshot_id)
+        name = (body or {}).get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="name is required")
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            payload = _load_snapshot_payload(path)
+            payload["name"] = name.strip()[:200]
+            payload["updated_at"] = time.time()
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return {"snapshot": _summarise_snapshot(payload, fallback_id=snapshot_id)}
+
+    @app.delete("/api/snapshots/{snapshot_id}")
+    def delete_snapshot(snapshot_id: str) -> dict:
+        path = _snapshot_path(snapshot_id)
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            path.unlink()
+        return {"ok": True}
+
+    @app.post("/api/snapshots/{snapshot_id}/restore")
+    def restore_snapshot(snapshot_id: str) -> dict:
+        # Loads the snapshot's ops into the current session (the autosave
+        # file). The UI is expected to re-render after this call. We don't
+        # auto-backup the current session — the user can save a new
+        # snapshot first if they want to keep it.
+        #
+        # Lock order: snapshots_lock first (read+validate the snapshot file
+        # without an inner session_lock), then release before grabbing
+        # session_lock for the autosave write. All other code paths only
+        # take one of the two — keeping these two phases disjoint avoids
+        # any AB/BA ordering surprises later on.
+        path = _snapshot_path(snapshot_id)
+        with state.snapshots_lock:
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="snapshot not found")
+            payload = _load_snapshot_payload(path)
+        session_dict = payload.get("session")
+        if not isinstance(session_dict, dict):
+            raise HTTPException(status_code=400, detail="snapshot missing session payload")
+        try:
+            restored = EditSession.from_dict(session_dict)
+        except (KeyError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid session in snapshot: {e}") from e
+        with state.session_lock:
+            assert state.session_path is not None
+            # Source-audio sha guard: restoring a snapshot taken from a
+            # different audio file would silently align ops to the wrong
+            # timeline. Strict — if either side is missing the sha we
+            # can't prove safety, so we refuse rather than fail-open.
+            expected_src = (state.transcript_data or {}).get("source_audio") or {}
+            expected_sha = expected_src.get("sha256")
+            actual_sha = restored.source_audio.sha256
+            if not expected_sha or not actual_sha:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cannot verify snapshot source_audio sha256 (missing on either snapshot or served audio)",
+                )
+            if expected_sha != actual_sha:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"snapshot source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
+                )
+            state.session = restored
+            _atomic_write_text(
+                state.session_path,
+                json.dumps(state.session.to_dict(), ensure_ascii=False, indent=2),
+            )
+        return {"ok": True, "ops": len(restored.ops), "name": payload.get("name")}
+
     # ------- preview render (W5) -------
     # Renders the current session to a wav using the W5 PCM pipeline. Cached by
     # a hash of (ops + opts + renderer version), so re-clicking with no
@@ -483,21 +793,61 @@ def create_app(config: ServeConfig) -> FastAPI:
         if lufs_target is not None:
             lufs_target = float(lufs_target)
         true_peak = float(opts.get("true_peak_ceiling_dbtp", -1.0))
+        # Optional: render a specific saved snapshot instead of the live session.
+        # Lets the UI add a per-row "音源DL" button without forcing the user
+        # through restore→Export→re-restore. Same cache_key derivation as the
+        # live path, so two callers that pass the same ops still hit the cache.
+        snapshot_id_raw = opts.get("snapshot_id")
+        snapshot_session: EditSession | None = None
+        if snapshot_id_raw is not None:
+            if not isinstance(snapshot_id_raw, str) or not SNAPSHOT_ID_RE.match(snapshot_id_raw):
+                raise HTTPException(status_code=400, detail=f"invalid snapshot id: {snapshot_id_raw!r}")
+            snap_path = _snapshot_path(snapshot_id_raw)
+            with state.snapshots_lock:
+                if not snap_path.exists():
+                    raise HTTPException(status_code=404, detail="snapshot not found")
+                payload = _load_snapshot_payload(snap_path)
+            session_dict = payload.get("session")
+            if not isinstance(session_dict, dict):
+                raise HTTPException(status_code=400, detail="snapshot missing session payload")
+            try:
+                snapshot_session = EditSession.from_dict(session_dict)
+            except (KeyError, ValueError) as e:
+                raise HTTPException(status_code=400, detail=f"invalid session in snapshot: {e}") from e
 
         # Snapshot every piece of active state the render depends on inside one
         # lock acquisition. If library/select races in mid-render, the render
         # still writes to the snapshot's preview path, references the snapshot's
         # audio file, and logs the snapshot's KPI path — never a mix.
         with state.session_lock:
-            assert state.session is not None
             assert state.audio_path is not None
-            ops_for_render = list(state.session.ops)
-            ops_blob = state.session.to_dict().get("ops", [])
-            source_duration = state.session.source_audio.duration_sec
             snap_audio_path = state.audio_path
             snap_work_dir = state.work_dir
             snap_kpi_log = state.kpi_log_path
             snap_audio_stem = state.audio_path.stem
+            if snapshot_session is not None:
+                # Sha guard: snapshot from a different audio file would silently
+                # align ops to the wrong timeline (same as /restore).
+                expected_src = (state.transcript_data or {}).get("source_audio") or {}
+                expected_sha = expected_src.get("sha256")
+                actual_sha = snapshot_session.source_audio.sha256
+                if not expected_sha or not actual_sha:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="cannot verify snapshot source_audio sha256 (missing on either snapshot or served audio)",
+                    )
+                if expected_sha != actual_sha:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"snapshot source_audio.sha256 {actual_sha[:12]}… doesn't match served audio {expected_sha[:12]}…",
+                    )
+                source_session = snapshot_session
+            else:
+                assert state.session is not None
+                source_session = state.session
+            ops_for_render = list(source_session.ops)
+            ops_blob = source_session.to_dict().get("ops", [])
+            source_duration = source_session.source_audio.duration_sec
 
         # Cache key covers every parameter that can change the bytes on disk.
         # Including RENDERER_VERSION means a code change automatically
@@ -617,12 +967,190 @@ def create_app(config: ServeConfig) -> FastAPI:
             background=BackgroundTask(_cleanup),
         )
 
+    # ------- clip export (selection-only) -------
+    # Lets the editor cut just the highlighted range out of a 30-minute
+    # episode as a standalone file. Independent of preview/render: clips are
+    # short, the user usually only needs them once, and bypassing the long
+    # preview pipeline avoids burning the wav cache slot on a throwaway.
+    # Clip safety caps — keep a runaway / accidentally-huge clip from blowing
+    # disk + render budget. Editors normally cut 5-120 s segments, so these
+    # are generous but firm.
+    CLIP_MAX_KEEPS = 200
+    CLIP_MAX_DURATION_SEC = 1800.0  # 30 minutes
+
+    def _clip_number(v: object, field: str) -> float:
+        # Accept ints/floats (but NOT bool — isinstance(True, int) is True),
+        # reject NaN/Inf. Strings/None get rejected here instead of slipping
+        # through float() and behaving unpredictably down in the renderer.
+        import math
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise HTTPException(status_code=400, detail=f"{field} must be a number, got {type(v).__name__}")
+        f = float(v)
+        if not math.isfinite(f):
+            raise HTTPException(status_code=400, detail=f"{field} must be finite")
+        return f
+
+    @app.post("/api/export/clip")
+    def export_clip(body: dict) -> FileResponse:
+        require_active()
+        keeps_in = (body or {}).get("keeps")
+        fmt = (body or {}).get("fmt", "mp3")
+        if fmt not in ("wav", "mp3"):
+            raise HTTPException(status_code=400, detail="fmt must be 'wav' or 'mp3'")
+        if not isinstance(keeps_in, list) or not keeps_in:
+            raise HTTPException(status_code=400, detail="keeps[] required (selected source ranges)")
+        if len(keeps_in) > CLIP_MAX_KEEPS:
+            raise HTTPException(status_code=400, detail=f"too many keeps ({len(keeps_in)} > {CLIP_MAX_KEEPS})")
+        # Validate and snap keeps into TimelineSegments with edited offsets.
+        # Normalising on the server (not trusting UI-supplied edited times)
+        # means a buggy / hand-crafted client can't ask us to render
+        # overlapping or out-of-order segments.
+        with state.session_lock:
+            assert state.session is not None and state.audio_path is not None
+            source_duration = state.session.source_audio.duration_sec
+            snap_audio_path = state.audio_path
+            snap_work_dir = state.work_dir
+            snap_kpi_log = state.kpi_log_path
+            snap_audio_stem = state.audio_path.stem
+        segs: list[TimelineSegment] = []
+        cursor = 0.0
+        prev_end: float | None = None
+        for raw in keeps_in:
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail="each keep must be an object")
+            s = _clip_number(raw.get("source_start"), "source_start")
+            e = _clip_number(raw.get("source_end"), "source_end")
+            if not (0.0 <= s < e <= source_duration + 1e-3):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"keep [{s}, {e}] falls outside [0, {source_duration:.2f}] or is empty",
+                )
+            if prev_end is not None and s < prev_end - 1e-6:
+                raise HTTPException(status_code=400, detail="keeps must be ascending and non-overlapping")
+            length = e - s
+            segs.append(TimelineSegment(
+                source_start=s, source_end=e,
+                edited_start=cursor, edited_end=cursor + length,
+            ))
+            cursor += length
+            prev_end = e
+        if cursor <= 0:
+            raise HTTPException(status_code=400, detail="clip duration is zero")
+        if cursor > CLIP_MAX_DURATION_SEC:
+            raise HTTPException(
+                status_code=400,
+                detail=f"clip duration {cursor:.1f}s exceeds limit {CLIP_MAX_DURATION_SEC:.0f}s — use the full-episode Export instead",
+            )
+        # Hash keeps + fmt so two clicks on the same selection share output.
+        clip_key_blob = json.dumps(
+            {"keeps": [(s.source_start, s.source_end) for s in segs], "fmt": fmt,
+             "source": snap_audio_path.name, "renderer_version": RENDERER_VERSION},
+            sort_keys=True,
+        ).encode()
+        clip_key = hashlib.sha256(clip_key_blob).hexdigest()[:16]
+        wav_path = snap_work_dir / f"{snap_audio_stem}.clip.{clip_key}.wav"
+        out_path = wav_path if fmt == "wav" else snap_work_dir / f"{snap_audio_stem}.clip.{clip_key}.mp3"
+        with _lock_for(f"clip:{clip_key}"):
+            if not wav_path.exists():
+                t0 = time.time()
+                try:
+                    render_segments(
+                        snap_audio_path,
+                        segments=segs,
+                        output=wav_path,
+                        source_duration=source_duration,
+                        crossfade_ms=10.0,
+                        lufs_target=-16.0,
+                        true_peak_ceiling_dbtp=-1.0,
+                    )
+                except RenderError as e:
+                    raise HTTPException(status_code=500, detail=str(e)) from e
+                _append_jsonl(snap_kpi_log, {
+                    "server_ts": time.time(), "type": "server.clip.rendered",
+                    "clip_key": clip_key, "wall_sec": time.time() - t0,
+                    "keep_count": len(segs), "duration_out": cursor,
+                })
+            if fmt == "mp3" and not out_path.exists():
+                if shutil.which("ffmpeg") is None:
+                    raise HTTPException(status_code=500, detail="ffmpeg not found on PATH; cannot transcode")
+                try:
+                    wav_pinned = _pin_inode_via_hardlink(
+                        wav_path, dir=snap_work_dir,
+                        prefix=f".clipsrc-{clip_key}-", suffix=".wav",
+                    )
+                except OSError as e:
+                    raise HTTPException(status_code=500, detail=f"failed to pin clip wav: {e}") from e
+                fd, tmp_str = tempfile.mkstemp(
+                    prefix=f".{snap_audio_stem}.clip.{clip_key}.",
+                    suffix=".mp3", dir=str(snap_work_dir),
+                )
+                os.close(fd)
+                tmp = Path(tmp_str)
+                try:
+                    proc = subprocess.run(
+                        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                         "-i", str(wav_pinned), "-codec:a", "libmp3lame",
+                         "-q:a", "2", str(tmp)],
+                        check=False, timeout=300,
+                        capture_output=True, text=True,
+                    )
+                    if proc.returncode != 0:
+                        # Surface a one-line summary of ffmpeg's error log so
+                        # the UI can show something more useful than "500".
+                        err = (proc.stderr or "").strip().splitlines()[-1:][:1]
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"ffmpeg transcode failed: {err[0] if err else 'no stderr'}",
+                        )
+                    try:
+                        os.link(str(tmp), str(out_path))
+                    except FileExistsError:
+                        pass
+                except subprocess.TimeoutExpired:
+                    raise HTTPException(status_code=504, detail="ffmpeg transcode timed out") from None
+                finally:
+                    try: tmp.unlink()
+                    except OSError: pass
+                    try: wav_pinned.unlink()
+                    except OSError: pass
+        if not out_path.exists():
+            raise HTTPException(status_code=500, detail="clip output missing after render")
+        # Pin the served file via hardlink so a concurrent GC can't unlink it
+        # between this check and Starlette opening it (same as /api/export).
+        try:
+            link = _pin_inode_via_hardlink(
+                out_path, dir=snap_work_dir,
+                prefix=f".clipserve-{clip_key}-", suffix=f".{fmt}",
+            )
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"failed to pin clip output: {e}") from e
+
+        def _cleanup(path: Path = link) -> None:
+            try: path.unlink()
+            except OSError: pass
+
+        download_name = f"{snap_audio_stem}.clip.{fmt}"
+        return FileResponse(
+            link,
+            media_type="audio/mpeg" if fmt == "mp3" else "audio/wav",
+            filename=download_name,
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(_cleanup),
+        )
+
     # ------- export (W8) -------
     # Same bytes the audition player streams, but framed as a download. wav is
     # served straight from the preview cache (already 2-pass loudnorm'd, true-
     # peak-limited, sample-precise). mp3 is transcoded once via ffmpeg LAME and
     # cached as ``<stem>.preview.<key>.mp3`` so re-downloads are free.
-    @app.get("/api/export/{cache_key}")
+    #
+    # GET and HEAD share the same handler: the UI's Export button HEAD-prechecks
+    # before kicking off the browser download flow so a transcode failure
+    # surfaces as a real error instead of the browser's generic download error.
+    # FastAPI's @app.get registers GET only, which used to send HEAD into the
+    # "/" StaticFiles mount → 404, making every export look like it failed even
+    # when the GET that followed succeeded.
+    @app.api_route("/api/export/{cache_key}", methods=["GET", "HEAD"])
     def export_audio(cache_key: str, fmt: str = "wav") -> FileResponse:
         require_active()
         if not _CACHE_KEY_RE.match(cache_key):
@@ -1002,6 +1530,280 @@ def create_app(config: ServeConfig) -> FastAPI:
             "bytes": total,
         }, headers={"Cache-Control": "no-store"})
 
+    CHUNK_SIZE = 512 * 1024
+    MAX_FILE_BYTES = 500 * 1024 * 1024
+    UPLOAD_SESSION_TTL_SECONDS = 3600
+    UPLOAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{16,64}$")
+    upload_locks: dict[str, asyncio.Lock] = {}
+
+    def _chunk_upload_dir() -> Path:
+        chunks_dir = state.work_dir / "uploads" / ".chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        return chunks_dir
+
+    def _chunk_session_path(upload_id: str) -> Path:
+        return _chunk_upload_dir() / f"{upload_id}.json"
+
+    def _chunk_tmp_path(upload_id: str) -> Path:
+        return _chunk_upload_dir() / f"{upload_id}.part"
+
+    def _validate_upload_id(upload_id: str) -> str:
+        if not UPLOAD_ID_PATTERN.match(upload_id or ""):
+            raise HTTPException(status_code=400, detail="invalid upload_id")
+        return upload_id
+
+    def _chunk_upload_lock(upload_id: str) -> asyncio.Lock:
+        lock = upload_locks.get(upload_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            upload_locks[upload_id] = lock
+        return lock
+
+    def _safe_unlink_chunk_tmp(upload_id: str, tmp_path_value: str | None) -> None:
+        """Unlink tmp file only if it resolves to .chunks/<upload_id>.part."""
+        if not tmp_path_value:
+            return
+        try:
+            expected = _chunk_tmp_path(upload_id).resolve()
+            actual = Path(tmp_path_value).resolve()
+        except OSError:
+            return
+        if actual != expected:
+            return
+        try:
+            actual.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _cleanup_expired_chunk_uploads() -> None:
+        chunks_dir = _chunk_upload_dir()
+        now = time.time()
+        for session_path in chunks_dir.glob("*.json"):
+            try:
+                with session_path.open("r", encoding="utf-8") as f:
+                    session = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if now - float(session.get("created_ts", 0)) <= UPLOAD_SESSION_TTL_SECONDS:
+                continue
+            upload_id = session_path.stem
+            try:
+                session_path.unlink()
+            except FileNotFoundError:
+                pass
+            _safe_unlink_chunk_tmp(upload_id, session.get("tmp_path"))
+            upload_locks.pop(upload_id, None)
+
+    def _load_chunk_session(upload_id: str) -> dict:
+        upload_id = _validate_upload_id(upload_id)
+        session_path = _chunk_session_path(upload_id)
+        try:
+            with session_path.open("r", encoding="utf-8") as f:
+                session = json.load(f)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail="upload session not found") from e
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail="upload session is corrupt") from e
+        if time.time() - float(session.get("created_ts", 0)) > UPLOAD_SESSION_TTL_SECONDS:
+            try:
+                session_path.unlink()
+            except FileNotFoundError:
+                pass
+            _safe_unlink_chunk_tmp(upload_id, session.get("tmp_path"))
+            upload_locks.pop(upload_id, None)
+            raise HTTPException(status_code=404, detail="upload session expired")
+        return session
+
+    def _safe_chunk_tmp_path(upload_id: str, tmp_path_value: str) -> Path:
+        """Return the expected .chunks/<upload_id>.part path, rejecting anything else."""
+        expected = _chunk_tmp_path(upload_id).resolve()
+        try:
+            actual = Path(tmp_path_value).resolve()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail="upload temp path is invalid") from e
+        if actual != expected:
+            raise HTTPException(status_code=500, detail="upload temp path is invalid")
+        return actual
+
+    def _save_chunk_session(upload_id: str, session: dict) -> None:
+        session_path = _chunk_session_path(upload_id)
+        tmp_session_path = session_path.with_suffix(".json.tmp")
+        with tmp_session_path.open("w", encoding="utf-8") as f:
+            json.dump(session, f, separators=(",", ":"))
+        os.replace(tmp_session_path, session_path)
+
+    @app.post("/api/library/upload/init")
+    async def library_upload_init(request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from e
+        basename = _validate_upload_basename(str(payload.get("basename") or ""))
+        try:
+            size = int(payload.get("size"))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="size must be an integer") from e
+        if size < 0:
+            raise HTTPException(status_code=400, detail="size must be non-negative")
+        if size > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="upload exceeds 500 MB limit")
+
+        overwrite = bool(payload.get("overwrite"))
+        uploads_dir = state.work_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        final_path = uploads_dir / basename
+        # Use lstat to inspect the target without following symlinks. exists()
+        # would follow the link and let us silently delete the wrong file.
+        try:
+            entry_stat = os.lstat(final_path)
+        except FileNotFoundError:
+            entry_stat = None
+        if entry_stat is not None:
+            if not overwrite:
+                # Structured payload: client uses has_transcript to decide
+                # between zero-click "open the existing file" and the
+                # prompt-the-editor flow when the existing file has no
+                # transcript yet (re-transcribe vs. overwrite).
+                transcript_path = state.work_dir / f"{final_path.stem}.transcript.json"
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "already_exists",
+                        "basename": basename,
+                        "existing_path": str(final_path),
+                        "has_transcript": transcript_path.exists(),
+                    },
+                )
+            # Refuse anything that isn't a regular file owned by the server
+            # process. This blocks symlinks (which we never create), dirs,
+            # special files, and any leftover from another user that happens
+            # to live in the uploads dir.
+            import stat as _stat
+            if not _stat.S_ISREG(entry_stat.st_mode):
+                raise HTTPException(status_code=400, detail="cannot overwrite non-file")
+            if entry_stat.st_uid != os.getuid():
+                raise HTTPException(status_code=400, detail="cannot overwrite file owned by another user")
+            # Belt-and-braces containment check: resolve must stay inside
+            # uploads_dir (final_path is built from validated basename, so
+            # this is mostly redundant, but cheap).
+            try:
+                resolved = final_path.resolve(strict=True)
+                resolved.relative_to(uploads_dir.resolve())
+            except (OSError, ValueError) as e:
+                raise HTTPException(status_code=400, detail="cannot overwrite this path") from e
+            # Atomic-ish: unlink uses the un-resolved path so we're operating
+            # on the same dirent we just lstat'd. A concurrent rename between
+            # lstat and unlink could in principle target a different dirent;
+            # this is acceptable under the trusted-uploads-dir assumption
+            # (single server process owns this directory).
+            try:
+                final_path.unlink()
+            except FileNotFoundError:
+                pass  # someone else cleaned up; proceed to fresh upload
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"failed to remove existing file: {e}") from e
+
+        upload_id = secrets.token_urlsafe(32)
+        tmp_path = _chunk_tmp_path(upload_id)
+        tmp_path.touch(mode=0o600, exist_ok=False)
+        _save_chunk_session(upload_id, {
+            "basename": basename,
+            "size": size,
+            "received": 0,
+            "last_index": -1,
+            "tmp_path": str(tmp_path),
+            "created_ts": time.time(),
+        })
+        return JSONResponse({
+            "upload_id": upload_id,
+            "chunk_size": CHUNK_SIZE,
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/library/upload/{upload_id}/chunk")
+    async def library_upload_chunk(upload_id: str, request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        upload_id = _validate_upload_id(upload_id)
+        async with _chunk_upload_lock(upload_id):
+            session = _load_chunk_session(upload_id)
+            try:
+                chunk_index = int(request.headers.get("x-chunk-index", ""))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail="X-Chunk-Index must be an integer") from e
+            expected_index = int(session["last_index"]) + 1
+            if chunk_index != expected_index:
+                raise HTTPException(status_code=409, detail=f"expected chunk index {expected_index}")
+
+            chunk = await request.body()
+            if len(chunk) > CHUNK_SIZE:
+                raise HTTPException(status_code=413, detail="chunk exceeds 512 KB limit")
+            received = int(session["received"]) + len(chunk)
+            size = int(session["size"])
+            if received > size or received > MAX_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="upload exceeds declared size")
+
+            tmp_path = _safe_chunk_tmp_path(upload_id, str(session["tmp_path"]))
+            with tmp_path.open("ab") as f:
+                f.write(chunk)
+            session["received"] = received
+            session["last_index"] = chunk_index
+            _save_chunk_session(upload_id, session)
+            return JSONResponse({
+                "next_index": chunk_index + 1,
+                "bytes_received": received,
+            }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/library/upload/{upload_id}/finalize")
+    async def library_upload_finalize(upload_id: str, request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        upload_id = _validate_upload_id(upload_id)
+        async with _chunk_upload_lock(upload_id):
+            session = _load_chunk_session(upload_id)
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail="invalid JSON body") from e
+            try:
+                chunks = int(payload.get("chunks"))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(status_code=400, detail="chunks must be an integer") from e
+            if chunks != int(session["last_index"]) + 1:
+                raise HTTPException(status_code=409, detail="chunks does not match received chunk count")
+            total = int(session["received"])
+            if total != int(session["size"]):
+                raise HTTPException(status_code=409, detail="upload is incomplete")
+
+            basename = _validate_upload_basename(session["basename"])
+            uploads_dir = state.work_dir / "uploads"
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            final_path = uploads_dir / basename
+            if final_path.exists():
+                raise HTTPException(status_code=409, detail=f"{basename!r} already exists in uploads")
+
+            tmp_path = _safe_chunk_tmp_path(upload_id, str(session["tmp_path"]))
+            if not tmp_path.exists():
+                raise HTTPException(status_code=404, detail="upload temp file not found")
+            os.replace(tmp_path, final_path)
+            try:
+                _chunk_session_path(upload_id).unlink()
+            except FileNotFoundError:
+                pass
+
+            _append_jsonl(state.kpi_log_path, {
+                "server_ts": time.time(),
+                "type": "server.library.uploaded",
+                "basename": basename,
+                "bytes": total,
+                "via": "chunked",
+            })
+        upload_locks.pop(upload_id, None)
+        return JSONResponse({
+            "ok": True,
+            "path": str(final_path),
+            "basename": basename,
+            "bytes": total,
+        }, headers={"Cache-Control": "no-store"})
+
     def _audio_from_library_request(body: dict, *, require_string_name: bool = False) -> tuple[Path, str]:
         body = body or {}
         raw_path = body.get("path")
@@ -1046,6 +1848,7 @@ def create_app(config: ServeConfig) -> FastAPI:
             state.load_active(candidate_audio, candidate_transcript)
         except (FileNotFoundError, AudioTranscriptMismatch) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        _save_last_active(state)
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.library.selected",
             "name": candidate_audio.name, "audio_path": str(state.audio_path),
@@ -1057,6 +1860,169 @@ def create_app(config: ServeConfig) -> FastAPI:
             "transcript_path": str(state.transcript_path),
             "session_path": str(state.session_path),
         }
+
+    # ------- library delete -------
+    # Lets the editor remove an audio file and ALL its derived artifacts
+    # (transcript / session / KPI log / snapshots / dict-ops sidecar /
+    # faststart cache / 16k mono wav). Use case: cleaning up low-quality
+    # uploads that have been superseded.
+    #
+    # Safety rules (codex review of design):
+    #   * Refuse to delete the currently-loaded audio (409) — UI must
+    #     select a different file first. Auto-resetting state is more
+    #     accident-prone than asking the editor to acknowledge.
+    #   * Refuse if a transcribe job is in flight against this audio (409).
+    #   * Use the same name/path validation pattern as select (no traversal).
+    #   * Delete derivatives first, then the audio itself. No rollback —
+    #     a partial delete leaves a re-runnable state.
+    #   * Idempotent: deleting an already-missing audio returns 200.
+    @app.delete("/api/library")
+    def library_delete(body: dict) -> JSONResponse:
+        body = body or {}
+        raw_path = body.get("path")
+        if raw_path is not None:
+            if not isinstance(raw_path, str):
+                raise HTTPException(status_code=400, detail="path must be a string")
+            candidate_audio = _resolve_browse_path(raw_path)
+            if candidate_audio.name.startswith("."):
+                raise HTTPException(status_code=400, detail="hidden audio files are not supported")
+            label = str(candidate_audio)
+        else:
+            name = body.get("name")
+            if not isinstance(name, str) or not name or "/" in name or "\\" in name or name.startswith("."):
+                raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
+            candidate_audio = (state.library_dir / name).resolve()
+            label = name
+        if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
+        # Case-insensitive match — Foo.FastStart.m4a is just as much a
+        # derivative as foo.faststart.m4a on case-folding filesystems.
+        if candidate_audio.name.lower().endswith(".faststart" + candidate_audio.suffix.lower()):
+            raise HTTPException(status_code=400, detail="faststart derivatives are not deletable directly")
+
+        # Refuse: currently loaded audio.
+        if state.audio_path is not None:
+            try:
+                if state.audio_path.resolve() == candidate_audio:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"cannot delete {label!r}: it is currently loaded. "
+                            "Open a different audio first."
+                        ),
+                    )
+            except FileNotFoundError:
+                # state.audio_path was already removed externally — proceed.
+                pass
+
+        # Refuse: in-flight transcribe against this audio.
+        snap = transcription_jobs.snapshot()
+        if snap and snap.get("status") in ("queued", "running"):
+            running_path = snap.get("audio_path")
+            if running_path:
+                try:
+                    if Path(running_path).resolve() == candidate_audio:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"cannot delete {label!r}: transcription is in flight",
+                        )
+                except FileNotFoundError:
+                    pass
+
+        def _under(target: Path, root: Path) -> bool:
+            """True iff ``target`` (resolved) sits inside ``root``."""
+            try:
+                target.resolve().relative_to(root)
+                return True
+            except (ValueError, OSError):
+                return False
+
+        stem = candidate_audio.stem
+        work_dir_resolved = state.work_dir.resolve()
+        library_dir_resolved = state.library_dir.resolve()
+        # codex review (HIGH): assert library_dir membership BEFORE touching
+        # any derivative. Without this, a hand-crafted ``path`` outside
+        # library_dir could still drive deletion of stem-matched files in
+        # work_dir even though the audio itself is rejected later.
+        if not _under(candidate_audio, library_dir_resolved):
+            raise HTTPException(
+                status_code=400,
+                detail=f"audio is outside library_dir: {label}",
+            )
+        deleted: list[str] = []
+
+        # Files to remove. All anchored to <stem> under work_dir; no globs.
+        file_targets = [
+            state.work_dir / f"{stem}.transcript.json",
+            state.work_dir / f"{stem}.transcript.dict-ops.jsonl",
+            state.work_dir / f"{stem}.session.json",
+            state.work_dir / f"{stem}.kpi.jsonl",
+            state.work_dir / "_podedit_asr" / f"{stem}.16k.wav",
+            # Faststart cache for video-container audio (m4a / mp4 / mov).
+            state.work_dir / f"{stem}.faststart.m4a",
+            state.work_dir / f"{stem}.faststart.mp4",
+            state.work_dir / f"{stem}.faststart.mov",
+        ]
+        for p in file_targets:
+            if not p.exists():
+                continue
+            if not _under(p, work_dir_resolved):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"refusing to delete outside work_dir: {p}",
+                )
+            try:
+                p.unlink()
+                deleted.append(str(p))
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"failed to delete {p}: {e}") from e
+
+        # Snapshots dir (recursive remove).
+        snapshots_dir = state.work_dir / f"{stem}.snapshots"
+        if snapshots_dir.exists():
+            if not _under(snapshots_dir, work_dir_resolved):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"refusing to remove outside work_dir: {snapshots_dir}",
+                )
+            try:
+                shutil.rmtree(snapshots_dir)
+                deleted.append(str(snapshots_dir))
+            except OSError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to remove {snapshots_dir}: {e}",
+                ) from e
+
+        # Audio itself last. May have already vanished (concurrent CLI delete,
+        # OS hygiene) — that's OK, DELETE is idempotent. library_dir
+        # membership was checked above before any derivative deletion.
+        audio_existed = candidate_audio.exists()
+        if audio_existed:
+            try:
+                candidate_audio.unlink()
+                deleted.append(str(candidate_audio))
+            except OSError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to delete {candidate_audio}: {e}",
+                ) from e
+
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.deleted",
+            "name": candidate_audio.name,
+            "audio_existed": audio_existed,
+            "deleted_count": len(deleted),
+        })
+        return JSONResponse(
+            {
+                "ok": True,
+                "audio_existed": audio_existed,
+                "deleted_count": len(deleted),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     # ------- transcribe (W7.7) -------
     # Lets the UI kick off `podedit transcribe` for any library audio that
@@ -1110,6 +2076,19 @@ def create_app(config: ServeConfig) -> FastAPI:
         if len(raw_hotwords) > 2000:
             raise HTTPException(status_code=400, detail="hotwords too long (max 2000 chars)")
         hotwords = raw_hotwords or None
+        # P1 speedup: optional BatchedInferencePipeline path. ``batched`` is a
+        # bool flag; ``batch_size`` is bounded 1..8 (codex recommends 2..4 on
+        # a 2-CPU box). Default ``batched=False`` preserves prior behavior.
+        raw_batched = body.get("batched", False)
+        if not isinstance(raw_batched, bool):
+            raise HTTPException(status_code=400, detail="batched must be a bool")
+        batched = raw_batched
+        raw_batch_size = body.get("batch_size", 4)
+        if not isinstance(raw_batch_size, int) or isinstance(raw_batch_size, bool):
+            raise HTTPException(status_code=400, detail="batch_size must be an int")
+        if raw_batch_size < 1 or raw_batch_size > 8:
+            raise HTTPException(status_code=400, detail="batch_size must be in [1, 8]")
+        batch_size = raw_batch_size
         candidate_audio, label = _audio_from_library_request(body, require_string_name=("path" not in body))
         name = candidate_audio.name
         transcript_path = state.work_dir / f"{candidate_audio.stem}.transcript.json"
@@ -1127,6 +2106,8 @@ def create_app(config: ServeConfig) -> FastAPI:
                 beam_size=beam_size,
                 initial_prompt=initial_prompt,
                 hotwords=hotwords,
+                batched=batched,
+                batch_size=batch_size,
             )
         except RuntimeError as e:
             # Another job is in flight.
@@ -1134,6 +2115,7 @@ def create_app(config: ServeConfig) -> FastAPI:
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.transcribe.started",
             "name": name, "model": model, "beam_size": beam_size,
+            "batched": batched, "batch_size": batch_size,
             # Length only (not the prompt body) — we don't want big prompts
             # spilling into kpi.jsonl on every job.
             # Length only (not the prompt body) so we don't leak custom prompt
@@ -1149,6 +2131,149 @@ def create_app(config: ServeConfig) -> FastAPI:
         snap = transcription_jobs.snapshot()
         return JSONResponse(
             {"job": snap},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # ----- P0-I: post-processing dictionary management -----
+    # Single shared dictionary at <work_dir>/dictionary.json. The transcribe
+    # worker applies enabled entries to a freshly produced transcript before
+    # publish; the UI just edits the JSON via these endpoints.
+
+    def _dict_path() -> Path:
+        return state.work_dir / "dictionary.json"
+
+    def _dict_to_payload(d: Dictionary) -> dict:
+        return {
+            "version": DICTIONARY_VERSION,
+            "entries": [
+                {
+                    "id": e.id,
+                    "from": e.from_,
+                    "to": e.to,
+                    "enabled": e.enabled,
+                    "priority": e.priority,
+                    "max_words": e.max_words,
+                    "max_conf": e.max_conf,
+                }
+                for e in d.entries
+            ],
+        }
+
+    @app.get("/api/dictionary")
+    def get_dictionary() -> JSONResponse:
+        d = load_dictionary(_dict_path())
+        return JSONResponse(_dict_to_payload(d), headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/dictionary")
+    def put_dictionary(body: dict) -> JSONResponse:
+        import math
+        raw_entries = (body or {}).get("entries")
+        if not isinstance(raw_entries, list):
+            raise HTTPException(status_code=400, detail="entries must be a list")
+        if len(raw_entries) > 2000:
+            raise HTTPException(status_code=400, detail="too many entries (max 2000)")
+        entries: list[DictEntry] = []
+        seen_ids: set[str] = set()
+        for i, raw in enumerate(raw_entries):
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail=f"entry {i} must be an object")
+            from_ = raw.get("from")
+            to = raw.get("to")
+            if not isinstance(from_, str) or not isinstance(to, str):
+                raise HTTPException(status_code=400, detail=f"entry {i}: from/to must be strings")
+            if not from_.strip():
+                raise HTTPException(status_code=400, detail=f"entry {i}: from must be non-empty")
+            if len(from_) > 200 or len(to) > 200:
+                raise HTTPException(status_code=400, detail=f"entry {i}: from/to too long (max 200)")
+            entry_id = raw.get("id")
+            if entry_id is None:
+                entry_id = f"dict_{i:04d}"
+            elif not isinstance(entry_id, str) or not entry_id:
+                raise HTTPException(status_code=400, detail=f"entry {i}: id must be non-empty string")
+            elif len(entry_id) > 128:
+                raise HTTPException(status_code=400, detail=f"entry {i}: id too long (max 128)")
+            if entry_id in seen_ids:
+                raise HTTPException(status_code=400, detail=f"entry {i}: duplicate id {entry_id!r}")
+            seen_ids.add(entry_id)
+            enabled = raw.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise HTTPException(status_code=400, detail=f"entry {i}: enabled must be bool")
+            priority = raw.get("priority", 100)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                raise HTTPException(status_code=400, detail=f"entry {i}: priority must be int")
+            max_words = raw.get("max_words", 5)
+            if not isinstance(max_words, int) or isinstance(max_words, bool) or max_words < 1 or max_words > 20:
+                raise HTTPException(status_code=400, detail=f"entry {i}: max_words must be int in [1,20]")
+            max_conf = raw.get("max_conf")
+            if max_conf is not None:
+                if isinstance(max_conf, bool) or not isinstance(max_conf, (int, float)):
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be number or null")
+                if not math.isfinite(float(max_conf)):
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be finite")
+                if not 0.0 <= float(max_conf) <= 1.0:
+                    raise HTTPException(status_code=400, detail=f"entry {i}: max_conf must be in [0.0, 1.0]")
+                max_conf = float(max_conf)
+            entries.append(
+                DictEntry(
+                    id=entry_id, from_=from_, to=to,
+                    enabled=enabled, priority=priority,
+                    max_words=max_words, max_conf=max_conf,
+                )
+            )
+        d = Dictionary(entries=tuple(entries))
+        save_dictionary(_dict_path(), d)
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.dictionary.saved",
+            "entries": len(entries),
+        })
+        return JSONResponse(_dict_to_payload(d), headers={"Cache-Control": "no-store"})
+
+    # ----- P0-H: glossary management -----
+    # Plain-text glossary at <work_dir>/glossary.txt (1 term per line). The
+    # transcribe worker auto-appends these to the default JA prompt and feeds
+    # them as hotwords when the caller didn't supply its own. Editing API is
+    # JSON-shaped for UI convenience.
+
+    def _glossary_path() -> Path:
+        return state.work_dir / "glossary.txt"
+
+    @app.get("/api/glossary")
+    def get_glossary() -> JSONResponse:
+        terms = load_terms(_glossary_path())
+        return JSONResponse(
+            {"version": GLOSSARY_VERSION, "terms": terms},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.put("/api/glossary")
+    def put_glossary(body: dict) -> JSONResponse:
+        body = body or {}
+        version = body.get("version")
+        if version is not None and version != GLOSSARY_VERSION:
+            raise HTTPException(status_code=400, detail=f"unsupported version {version!r}")
+        raw_terms = body.get("terms")
+        if not isinstance(raw_terms, list):
+            raise HTTPException(status_code=400, detail="terms must be a list")
+        if len(raw_terms) > 2000:
+            raise HTTPException(status_code=400, detail="too many terms (max 2000)")
+        for i, t in enumerate(raw_terms):
+            if not isinstance(t, str):
+                raise HTTPException(status_code=400, detail=f"term {i}: must be a string")
+            if "\n" in t or "\r" in t:
+                # 1 line = 1 term on disk; embedded newlines would silently
+                # split into multiple terms on the next GET. Reject explicitly.
+                raise HTTPException(status_code=400, detail=f"term {i}: must not contain newlines")
+            if len(t) > MAX_TERM_LEN * 4:  # raw upper bound; clean step strips later
+                raise HTTPException(status_code=400, detail=f"term {i}: too long (max {MAX_TERM_LEN * 4})")
+        cleaned = save_terms(_glossary_path(), list(raw_terms))
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.glossary.saved",
+            "terms": len(cleaned),
+        })
+        return JSONResponse(
+            {"version": GLOSSARY_VERSION, "terms": cleaned},
             headers={"Cache-Control": "no-store"},
         )
 

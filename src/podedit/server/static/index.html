@@ -24,7 +24,9 @@
 
 <div class="toolbar">
   <button id="btn-open" title="別の音声ファイルに切り替え (O)">音声を開く <kbd>O</kbd></button>
-  <button id="btn-delete" disabled title="Delete selected range (D)">Delete <kbd>D</kbd></button>
+  <button id="btn-add-fillers" disabled title="推奨フィラー候補を一覧で確認してから削除する">フィラー削除レビュー <span id="filler-count">0</span></button>
+  <button id="btn-delete" disabled title="選択範囲を削除 (D)。広い範囲は Shift+クリックで指定">Delete <kbd>D</kbd></button>
+  <span class="hint-pill" title="始点をクリック → 終点を Shift+クリックすると 2分以上の範囲も選べる">Shift+クリックで広範囲選択</span>
   <button id="btn-undo" disabled title="Undo (⌘Z)">Undo <kbd>⌘Z</kbd></button>
   <button id="btn-redo" disabled title="Redo (⌘⇧Z)">Redo <kbd>⌘⇧Z</kbd></button>
   <button id="btn-clear-sel" disabled title="Clear selection (Esc)">Clear <kbd>Esc</kbd></button>
@@ -32,18 +34,28 @@
   <button id="btn-paste-before" disabled title="Paste clipboard before marked word">Paste Before</button>
   <button id="btn-paste-after" disabled title="Paste clipboard after marked word (⌘V)">Paste After <kbd>⌘V</kbd></button>
   <button id="btn-audition" title="Render preview (sample-precise + crossfade + LUFS)">Audition</button>
-  <button id="btn-export" title="Render the edit and download it (E)">Export <kbd>E</kbd></button>
+  <button id="btn-snapshots" title="編集状態を名前付きで保存 / 過去の保存に戻す">スナップショット</button>
+  <button id="btn-dictionary" title="ASRの誤認識を自動で置き換える辞書を編集">辞書</button>
+  <button id="btn-glossary" title="固有名詞リスト。次回以降の文字起こしのプロンプトに自動結合">固有名詞</button>
+  <button id="btn-export" class="btn-primary" title="編集済みの音源をレンダリングしてダウンロード (E)">編集済み音源をダウンロード <kbd>E</kbd></button>
+  <button id="btn-export-clip" disabled title="選択範囲だけを音源ファイルとしてダウンロード">選択範囲だけDL</button>
   <select id="export-format" title="Export format" aria-label="Export format">
     <option value="mp3">mp3</option>
     <option value="wav">wav</option>
   </select>
   <button id="btn-copy-transcript" title="Copy edited transcript to clipboard (T)">Copy <kbd>T</kbd></button>
+  <button id="btn-follow-playhead" class="toolbar-toggle" data-active="false" title="再生位置に画面を自動追従させる (デフォルト OFF: 別の場所を自由に編集できる)">追従 <span id="follow-state">OFF</span></button>
   <span class="mode-pill" id="mode-pill">source</span>
   <span class="spacer"></span>
+  <span class="search-box">
+    <input id="search-input" type="search" placeholder="検索 (/, スペースで複数語OR)" aria-label="文字起こしを検索 (スペース区切りで複数語をORマッチ)" autocomplete="off" />
+    <span class="search-info" id="search-info" hidden>0 / 0</span>
+    <button id="btn-search-prev" type="button" disabled title="前のマッチ (Shift+Enter)">‹</button>
+    <button id="btn-search-next" type="button" disabled title="次のマッチ (Enter)">›</button>
+  </span>
   <span class="skip-pill" id="skip-pill" title="Flashes red while playhead is inside a cut">no cut</span>
   <span class="clipboard-pill" id="clipboard-pill" hidden></span>
-  <span class="stat"><strong id="kpi-time">0.00s</strong></span>
-  <span class="stat"><strong id="kpi-ops">0</strong> ops · <strong id="kpi-cut">0.0s</strong> cut · <strong id="kpi-elapsed">0:00</strong></span>
+  <span class="stat"><strong id="kpi-ops">0</strong> ops · <strong id="kpi-cut">0.0s</strong> cut</span>
   <span id="save-status" class="save-idle">·</span>
 </div>
 
@@ -57,12 +69,14 @@
       <button id="btn-library-close" class="modal-close" title="閉じる (Esc)">×</button>
     </div>
     <div class="modal-body">
+      <div id="library-env-banner" class="library-env-banner" hidden></div>
       <div class="library-preset-row">
         <label for="transcribe-preset">文字起こしの品質:</label>
         <select id="transcribe-preset" aria-label="文字起こしプリセット">
           <option value="fast">高速 (tiny · 約3分)</option>
           <option value="balanced" selected>バランス (small · 約12〜15分)</option>
           <option value="quality">高品質 (small/beam=5 · 約25〜30分)</option>
+          <option value="quality_batched">高品質+並列 (small/beam=5/batched · 実験)</option>
         </select>
         <span class="library-preset-hint" id="transcribe-preset-hint">
           smallモデル + 貪欲デコード + 日本語ポッドキャスト用プロンプト
@@ -73,13 +87,115 @@
         <button id="btn-library-upload" type="button" title="お使いのPCから音声ファイルをアップロード">PC からファイルを選択</button>
         <span class="library-upload-hint" id="library-upload-hint">最大 500 MB · m4a/mp3/wav/flac/aac/ogg/opus/mp4</span>
       </div>
-      <input id="library-file-input" type="file" accept="audio/*,.m4a,.mp3,.wav,.flac,.aac,.ogg,.opus,.mp4" hidden />
+      <input id="library-file-input" type="file" accept="audio/*,.mp3,.MP3,.m4a,.M4A,.wav,.WAV,.flac,.FLAC,.aac,.AAC,.ogg,.OGG,.opus,.OPUS,.mp4,.MP4,.m4b,.M4B,.aiff,.AIFF,.aif,.AIF,.wma,.WMA" hidden />
       <div id="library-breadcrumbs" class="library-breadcrumbs" aria-label="現在のパス"></div>
       <ul id="library-list" class="library-list"></ul>
       <div class="library-hint">
         スキャン元: <code id="library-dir-hint">—</code> / 現在のパス:
         <code id="library-current-path">—</code>。各行の「文字起こし」ボタンは上のプリセットを使用します。
         CLI <code>podedit transcribe</code> でも文字起こしを生成でき、このピッカーに表示されます。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Filler review modal: per-candidate approve/reject before applying. -->
+<div id="fillers-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="fillers-title">
+    <div class="modal-header">
+      <h2 id="fillers-title">フィラー削除レビュー</h2>
+      <button id="btn-fillers-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="fillers-actions-row">
+        <button id="btn-fillers-select-all" type="button">全選択</button>
+        <button id="btn-fillers-clear" type="button">全解除</button>
+        <span class="fillers-selected-count" id="fillers-selected-count">0 件選択中</span>
+        <span class="spacer"></span>
+        <button id="btn-fillers-apply" class="btn-primary" type="button" disabled>選択を削除</button>
+      </div>
+      <div id="fillers-status" class="status">候補を読み込み中…</div>
+      <ul id="fillers-list" class="fillers-list"></ul>
+      <div class="library-hint">
+        チェックを入れた候補だけが削除されます。前後の文脈で本当に消していい音かを確認してください。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Snapshot modal: list/save/load/rename/delete named editing drafts. -->
+<div id="snapshots-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="snapshots-title">
+    <div class="modal-header">
+      <h2 id="snapshots-title">スナップショット</h2>
+      <button id="btn-snapshots-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="snapshots-create-row">
+        <input id="snapshot-name-input" type="text" maxlength="200" placeholder="例: ドラフト1 / 本番候補" aria-label="スナップショット名" />
+        <button id="btn-snapshot-save" type="button" title="現在の編集状態をこの名前で保存">この名前で保存</button>
+      </div>
+      <div id="snapshots-status" class="status">読み込み中…</div>
+      <ul id="snapshots-list" class="snapshots-list"></ul>
+      <div class="library-hint">
+        スナップショットは <code id="snapshots-dir-hint">work_dir/{stem}.snapshots/</code> に保存されます。
+        「読み込み」で現在の編集を上書きします(失いたくない場合は先に名前を付けて保存してください)。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Dictionary modal: edit the ASR post-processing replacement table. -->
+<div id="dictionary-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dictionary-title">
+    <div class="modal-header">
+      <h2 id="dictionary-title">ASR 辞書 (誤認識の自動置換)</h2>
+      <button id="btn-dictionary-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="dictionary-hint">
+        左に ASR が出力する誤り、右に正しい綴り。次回以降の文字起こしから自動適用されます。
+        既存の transcript には影響しません。
+      </div>
+      <div class="dictionary-actions-row">
+        <button id="btn-dict-add" type="button">+ 行を追加</button>
+        <span class="spacer"></span>
+        <span id="dictionary-status" class="save-idle">·</span>
+        <button id="btn-dict-save" class="btn-primary" type="button">保存</button>
+      </div>
+      <table class="dictionary-table">
+        <thead>
+          <tr>
+            <th>ASR の出力</th>
+            <th>正しい綴り</th>
+            <th>有効</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="dictionary-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Glossary modal: editable proper-noun list fed into ASR's initial_prompt + hotwords. -->
+<div id="glossary-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="glossary-title">
+    <div class="modal-header">
+      <h2 id="glossary-title">固有名詞リスト</h2>
+      <button id="btn-glossary-close" class="modal-close" title="閉じる (Esc)">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="glossary-hint">
+        1 行 1 語。次回以降の文字起こし時に Whisper のプロンプトと hotwords に
+        自動結合され、「クロード」「Anthropic」のような案件特有の語の誤認識を
+        予防します。先頭から約 1000 文字までが使われます。
+      </div>
+      <textarea id="glossary-textarea" rows="14" placeholder="例:&#10;クロード&#10;Anthropic&#10;認知バイアス" aria-label="固有名詞リスト"></textarea>
+      <div class="glossary-actions-row">
+        <span id="glossary-status" class="save-idle">·</span>
+        <span class="spacer"></span>
+        <button id="btn-glossary-save" class="btn-primary" type="button">保存</button>
       </div>
     </div>
   </div>

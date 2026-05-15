@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -11,6 +13,17 @@ from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
 from .asr import ASRConfig, resolve_device, transcribe
+from .asr_eval import (
+    compute_cer,
+    compute_glossary_recall,
+    find_eval_audio,
+    kpi_summary_path,
+    read_json,
+    summarize_kpi_jsonl,
+    transcript_to_dict,
+    transcript_to_text,
+    write_json,
+)
 from .audio import AudioProbeError, FFmpegMissingError, probe, to_wav_16k_mono
 from .bench import measure
 from .edit import EditSession, compile_timeline, sha256_of_file
@@ -19,9 +32,286 @@ from .render import RenderError, render_cuts, render_segments
 console = Console()
 
 
+ASR_EVAL_PRESETS = {
+    "fast": {"model": "tiny", "beam_size": 1},
+    "balanced": {"model": "small", "beam_size": 1},
+    "quality": {"model": "large-v3-turbo", "beam_size": 5},
+}
+
+
+def _browser_url(host: str, port: int) -> str:
+    codespace = os.environ.get("CODESPACE_NAME")
+    forwarding_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
+    if codespace and forwarding_domain:
+        return f"https://{codespace}-{port}.{forwarding_domain}"
+    if host in {"0.0.0.0", "::"}:
+        return f"http://127.0.0.1:{port}"
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
 @click.group()
 def cli() -> None:
     """podedit — transcript-driven podcast editor (local-first)."""
+
+
+@cli.command("asr-eval")
+@click.argument("set_name")
+@click.option("--model", default=None,
+              help="faster-whisper model id (default: ASRConfig.model)")
+@click.option("--beam-size", default=None, type=int,
+              help="Beam size (default: ASRConfig.beam_size)")
+@click.option("--preset", default=None,
+              type=click.Choice(["fast", "balanced", "quality"]),
+              help="Preset defaults for model/beam-size")
+@click.option("--out-dir", type=click.Path(path_type=Path), default=None,
+              help="Output directory for predicted transcript and run reports")
+@click.option("--initial-prompt", default=None)
+@click.option("--hotwords", default=None)
+@click.option("--no-vad", is_flag=True, default=False,
+              help="Disable VAD filter")
+def asr_eval_cmd(
+    set_name: str,
+    model: str | None,
+    beam_size: int | None,
+    preset: str | None,
+    out_dir: Path | None,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    no_vad: bool,
+) -> None:
+    """Run ASR on eval/asr/<set_name> and write accuracy/speed metrics."""
+    base_cfg = ASRConfig()
+    cfg_values = {
+        "model": base_cfg.model,
+        "beam_size": base_cfg.beam_size,
+    }
+    if preset is not None:
+        cfg_values.update(ASR_EVAL_PRESETS[preset])
+    if model is not None:
+        cfg_values["model"] = model
+    if beam_size is not None:
+        cfg_values["beam_size"] = beam_size
+
+    cfg = ASRConfig(
+        model=cfg_values["model"],
+        beam_size=cfg_values["beam_size"],
+        vad_filter=not no_vad,
+        initial_prompt=initial_prompt,
+        hotwords=hotwords,
+    )
+
+    set_dir = Path("eval/asr") / set_name
+    if not set_dir.exists():
+        _fatal(f"Evaluation set not found: {set_dir}")
+
+    try:
+        audio_path = find_eval_audio(set_dir)
+        source_info = probe(audio_path)
+    except (FileNotFoundError, ValueError, FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+
+    reference_path = set_dir / "reference.transcript.json"
+    meta_path = set_dir / "meta.json"
+    if not reference_path.exists():
+        _fatal(f"Reference transcript not found: {reference_path}")
+    if not meta_path.exists():
+        _fatal(f"Eval metadata not found: {meta_path}")
+
+    output_dir = out_dir or set_dir
+    runs_dir = output_dir / "runs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = (
+        f"{datetime.now().strftime('%Y%m%d-%H%M')}-"
+        f"{cfg.model.replace('/', '-')}-beam{cfg.beam_size}"
+    )
+    asr_wav_path = output_dir / f"{audio_path.stem}.16k.wav"
+    predicted_path = output_dir / "predicted.transcript.json"
+    report_path = runs_dir / f"{run_id}.json"
+
+    total_start = time.perf_counter()
+    ffmpeg_start = time.perf_counter()
+    try:
+        to_wav_16k_mono(audio_path, asr_wav_path)
+    except (FFmpegMissingError, AudioProbeError) as e:
+        _fatal(str(e))
+    wall_sec_ffmpeg = time.perf_counter() - ffmpeg_start
+
+    asr_start = time.perf_counter()
+    tx, segments = transcribe(source_info, asr_wav_path, cfg)
+    wall_sec_model_load = time.perf_counter() - asr_start
+    for _segment in segments:
+        pass
+    wall_sec_asr = time.perf_counter() - asr_start
+    wall_sec_total = time.perf_counter() - total_start
+
+    predicted = transcript_to_dict(tx)
+    write_json(predicted_path, predicted)
+
+    reference = read_json(reference_path)
+    meta = read_json(meta_path)
+    reference_text = transcript_to_text(reference)
+    predicted_text = transcript_to_text(predicted)
+    cer = compute_cer(reference_text, predicted_text)
+    glossary_recall, glossary_details = compute_glossary_recall(
+        predicted_text,
+        list(meta.get("glossary") or []),
+    )
+    glossary_found = sum(1 for item in glossary_details if item["found"])
+    glossary_total = len(glossary_details)
+    glossary_misses = [item["term"] for item in glossary_details if not item["found"]]
+
+    resolved = resolve_device(cfg)
+    duration_sec = float(getattr(source_info, "duration_sec", 0.0) or meta.get("duration_sec") or 0.0)
+    rtf = wall_sec_asr / duration_sec if duration_sec > 0 else None
+
+    report = {
+        "run_id": run_id,
+        "set_name": set_name,
+        "config": {
+            "model": cfg.model,
+            "beam_size": cfg.beam_size,
+            "vad_filter": cfg.vad_filter,
+            "device": resolved.device,
+            "compute_type": resolved.compute_type,
+            "initial_prompt": cfg.initial_prompt,
+            "hotwords": cfg.hotwords,
+        },
+        "timing": {
+            "audio_duration_sec": duration_sec,
+            "wall_sec_total": wall_sec_total,
+            "wall_sec_ffmpeg": wall_sec_ffmpeg,
+            "wall_sec_asr": wall_sec_asr,
+            "wall_sec_model_load": wall_sec_model_load,
+            "rtf": rtf,
+        },
+        "accuracy": {
+            "cer": cer,
+            "glossary_recall": glossary_recall,
+            "glossary_details": glossary_details,
+        },
+        "artifacts": {
+            "predicted_transcript": str(predicted_path),
+        },
+    }
+    write_json(report_path, report)
+
+    console.print(f"Source : {audio_path} ({duration_sec:.1f}s)")
+    console.print(
+        f"Model  : {cfg.model} / beam={cfg.beam_size} / "
+        f"vad={'on' if cfg.vad_filter else 'off'} / {resolved.device}/{resolved.compute_type}"
+    )
+    console.print("")
+    console.print("| Metric                 | Value       |")
+    console.print("|------------------------|-------------|")
+    console.print(f"| wall (total)           | {wall_sec_total:.1f}s      |")
+    console.print(f"| wall (ASR only)        | {wall_sec_asr:.1f}s      |")
+    console.print(f"| RTF                    | {rtf:.3f}       |" if rtf is not None else "| RTF                    | n/a         |")
+    console.print(f"| CER                    | {cer * 100:.1f}%        |")
+    console.print(
+        f"| Glossary recall        | {glossary_recall * 100:.0f}% "
+        f"({glossary_found}/{glossary_total})   |"
+    )
+    console.print("")
+    console.print("Glossary misses: " + (", ".join(glossary_misses) if glossary_misses else "-"))
+    console.print(f"Report written: {report_path}")
+
+
+@cli.command("kpi-summary")
+@click.argument("kpi_jsonl", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--audio-duration-sec", default=None, type=float,
+              help="Audio duration used for per-hour normalisation")
+def kpi_summary_cmd(kpi_jsonl: Path, audio_duration_sec: float | None) -> None:
+    """Summarise editor correction clicks from a KPI JSONL log."""
+    summary = summarize_kpi_jsonl(kpi_jsonl, audio_duration_sec=audio_duration_sec)
+    out_path = kpi_summary_path(kpi_jsonl)
+    write_json(out_path, summary)
+
+    duration = summary["audio_duration_sec"]
+    wall = summary["session_wall_sec"]
+    counts = summary["counts"]
+    per_hour = summary["correction_clicks_per_audio_hour"]
+
+    duration_label = "unknown"
+    if duration is not None:
+        duration_label = f"{duration:.1f}s ({duration / 60.0:.1f} min)"
+    wall_label = "unknown"
+    if wall is not None:
+        wall_label = f"{wall:.1f}s ({wall / 60.0:.1f} min)"
+
+    console.print(f"KPI file       : {kpi_jsonl}")
+    console.print(f"Audio duration : {duration_label}")
+    console.print(f"Session wall   : {wall_label}")
+    console.print("")
+    console.print("| Metric                          | Value           |")
+    console.print("|---------------------------------|-----------------|")
+    console.print(f"| ops.delete                      | {counts['ops.delete']}              |")
+    console.print(f"| ops.move                        | {counts['ops.move']}               |")
+    console.print(f"| ops.fillers.added (auto)        | {counts['ops.fillers.added']}              |")
+    console.print(f"| **correction clicks**           | **{summary['correction_clicks']}**          |")
+    if per_hour is None:
+        console.print("| **per hour of audio**           | **n/a**         |")
+    else:
+        console.print(f"| **per hour of audio**           | **{per_hour:.1f} / hr**  |")
+    console.print(f"| word clicks (seek)              | {counts['word_clicks']}             |")
+    console.print(f"| drag selections                 | {counts['drag_selections']}              |")
+    console.print("")
+    console.print(f"Summary written: {out_path}")
+
+
+@cli.command("dict-eval")
+@click.argument("transcript", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--dictionary", "dictionary_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              required=True, help="Path to dictionary.json to apply")
+@click.option("--show", default=10, type=click.IntRange(min=0), help="Show up to N before/after samples")
+def dict_eval_cmd(transcript: Path, dictionary_path: Path, show: int) -> None:
+    """Apply a dictionary to an existing transcript and report replacement effect.
+
+    Lets editors test how many replacements a candidate dictionary would
+    make against a real ASR output, without re-running transcription.
+    Does NOT mutate the transcript file on disk.
+    """
+    from .asr_dictionary import apply_dictionary, load_dictionary
+
+    tx = json.loads(transcript.read_text(encoding="utf-8"))
+    dictionary = load_dictionary(dictionary_path)
+    if not dictionary.entries:
+        _fatal(f"Dictionary has no entries: {dictionary_path}")
+
+    new_tx, ops = apply_dictionary(tx, dictionary)
+    orig_words = sum(len(s.get("words") or []) for s in (tx.get("segments") or []))
+    new_words = sum(len(s.get("words") or []) for s in (new_tx.get("segments") or []))
+
+    by_entry: dict[str, int] = {}
+    for op in ops:
+        by_entry[op["entry_id"]] = by_entry.get(op["entry_id"], 0) + 1
+
+    console.print(f"Transcript : {transcript}")
+    console.print(f"Dictionary : {dictionary_path} ({len(dictionary.entries)} entries)")
+    console.print("")
+    console.print(f"Replacements    : {len(ops)}")
+    console.print(f"Words before    : {orig_words}")
+    console.print(f"Words after     : {new_words}")
+    console.print(f"Words collapsed : {orig_words - new_words}")
+    console.print("")
+    if not ops:
+        console.print("No matches — every entry in the dictionary is either disabled or unmatched.")
+        return
+
+    console.print("Replacements per entry:")
+    for entry_id, count in sorted(by_entry.items(), key=lambda kv: -kv[1]):
+        console.print(f"  {entry_id}: {count}")
+    console.print("")
+    console.print(f"Samples (up to {show}):")
+    for op in ops[:show]:
+        before = "".join(w.get("text", "") for w in op["before_words"])
+        after = "".join(w.get("text", "") for w in op["after_words"])
+        start = op.get("start")
+        loc = f"{start:.2f}s" if isinstance(start, (int, float)) else "?"
+        console.print(f"  [{loc}] {before!r} → {after!r}  ({op['note']})")
 
 
 @cli.command("transcribe")
@@ -551,6 +841,12 @@ def eval_cmd(audio: Path, deletes: tuple[str, ...], out_dir: Path, click_thresho
               help="Directory holding transcripts and sessions. Defaults to the parent dir of --transcript.")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, show_default=True, type=int)
+@click.option("--auth-password", default=None, envvar="PODEDIT_AUTH_PASSWORD",
+              help="Require HTTP Basic auth (username: podedit). "
+                   "Also reads PODEDIT_AUTH_PASSWORD. Recommended when "
+                   "exposing the UI beyond 127.0.0.1 (Codespaces public port, "
+                   "shared LAN, etc.). Prefer the env-var form over a literal "
+                   "CLI arg — args end up in shell history and `ps`.")
 def serve_cmd(
     audio: Path | None,
     transcript: Path | None,
@@ -560,6 +856,7 @@ def serve_cmd(
     work_dir: Path | None,
     host: str,
     port: int,
+    auth_password: str | None,
 ) -> None:
     """Start the local web UI on http://host:port."""
     import uvicorn
@@ -585,25 +882,41 @@ def serve_cmd(
             kpi_log_path=kpi_log,
             library_dir=library_dir,
             work_dir=work_dir,
+            auth_password=auth_password,
         ))
     except AudioTranscriptMismatch as e:
         _fatal(str(e))
     except FileNotFoundError as e:
         _fatal(str(e))
+    browser_url = _browser_url(host, port)
     if audio is not None and transcript is not None:
         console.print(
             f"[green]podedit UI[/green] serving "
             f"[bold]{audio.name}[/bold] + [bold]{transcript.name}[/bold] "
-            f"at [link]http://{host}:{port}[/link]"
+            f"at [link]{browser_url}[/link]"
         )
     else:
         console.print(
             f"[green]podedit UI[/green] serving empty state "
-            f"at [link]http://{host}:{port}[/link]"
+            f"at [link]{browser_url}[/link]"
         )
         console.print("  Open the UI and use Open (O) to upload or select audio.")
     console.print(f"  Session: {session_path}  ({'exists' if session_path.exists() else 'will be created'})")
     console.print(f"  KPI log: {kpi_log}")
+    # Friendly hint when binding non-loopback without a password — it's the
+    # one combination where someone on the same network (or in the same
+    # Codespace with the port public) gets full access by default.
+    if auth_password:
+        console.print(
+            "  [green]Auth:[/green] HTTP Basic enabled (username: [bold]podedit[/bold]). "
+            "Share the URL and password with your editing team only."
+        )
+    elif host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            "  [yellow]WARNING:[/yellow] binding to non-loopback host without --auth-password. "
+            "Anyone who can reach this URL can read and edit your sessions. "
+            "Set PODEDIT_AUTH_PASSWORD (or pass --auth-password) before sharing."
+        )
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

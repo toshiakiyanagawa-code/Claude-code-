@@ -1,0 +1,379 @@
+{
+  "articles": [
+    {
+      "file": "『中国ぎらいのための中国史』1本目安田確認.docx",
+      "title": "最高倍率3000倍超…｢習近平にすべてを捧げれば一発逆転できる｣中国の就活生が殺到する “超人気職業”とは",
+      "url": "https://president.jp/articles/-/86943",
+      "elapsed_s": 42.2,
+      "suggestions": [
+        {
+          "slot_key": "hero",
+          "slot_label": "カンバン(冒頭)",
+          "type_code": "D",
+          "type_label": "行動シーン",
+          "primary_query": "勉強",
+          "candidates": [
+            {
+              "asset_id": "1130377278",
+              "alt": "学生試験は考えてハード、大学の教室、教育および世界のリテラシー日の概念で答えを書くクラスで教育入学テストを取る - 受験 手元 ノート ストックフォトと画像",
+              "photographer": "Chinnapong"
+            },
+            {
+              "asset_id": "1179260707",
+              "alt": "学生が授業中に教育入学試験を受け、一生懸命考え、大学の教室で答えを書き、教育と世界識字の日の概念を持つ学校での試験 - 受験 手元 ノート ストックフォトと画像",
+              "photographer": "Chinnapong"
+            },
+            {
+              "asset_id": "2161896318",
+              "alt": "タブレット画面で財務データを分析しているビジネスウーマン - studying back view desk hands ストックフォトと画像",
+              "photographer": "FreshSplash"
+            },
+            {
+              "asset_id": "1456222379",
+              "alt": "教室で手を挙げて質問する女子高生 - studying back view desk hands ストックフォトと画像",
+              "photographer": "Nikada"
+            },
+            {
+              "asset_id": "1397509188",
+              "alt": "教室で手を挙げる女子高生 - studying back view desk hands ストックフォトと画像",
+              "photographer": "golero"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_1",
+          "slot_label": "■「進士」になるのは博士号を取得するより難しい",
+          "type_code": "C",
+          "type_label": "抽象シンボル",
+          "primary_query": "進士 博士号 取得",
+          "candidates": [
+            {
+              "asset_id": "2254321682",
+              "alt": "中華人民共和国の国旗に置かれたミニチュア卒業帽 - 中国 科挙 進士 シンボル ストックフォトと画像",
+              "photographer": "Mohd Azrin"
+            },
+            {
+              "asset_id": "2254692644",
+              "alt": "中華人民共和国の国旗に置かれたミニチュア卒業帽 - 中国 科挙 進士 シンボル ストックフォトと画像",
+              "photographer": "Mohd Azrin"
+            },
+            {
+              "asset_id": "1020854072",
+              "alt": "卒業式 - 中国 科挙 進士 シンボル ストックフォトと画像",
+              "photographer": "Wako Megumi"
+            },
+            {
+              "asset_id": "466244816",
+              "alt": "中国の大学卒業生コンセプト、学校、大学教育 - 中国 科挙 進士 シンボル ストックフォトと画像",
+              "photographer": "Kagenmi"
+            },
+            {
+              "asset_id": "1307977084",
+              "alt": "中国の概念の教育。卒業キャップ付きの中国国旗、白い背景に隔離された3dレンダリング - 中国 科挙 進士 シンボル ストックフォトと画像",
+              "photographer": "natatravel"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_2",
+          "slot_label": "■「富も豪邸も美女も高い身分も、書物のなかにある」",
+          "type_code": "D",
+          "type_label": "行動シーン",
+          "primary_query": "勉強",
+          "candidates": [
+            {
+              "asset_id": "1338737959",
+              "alt": "小さな子供の小学生は、スクールバスへの授業のために学校の建物に急いで走っている生徒を生徒にしています。学校へようこそ。新学期の始まり - 勉強 後ろ姿 書籍 ストックフォトと画像",
+              "photographer": "Inside Creative House"
+            },
+            {
+              "asset_id": "1987737367",
+              "alt": "ソファで本を読んでいる若い日本人女性の肩越しの眺め。 - 勉強 後ろ姿 書籍 ストックフォトと画像",
+              "photographer": "South_agency"
+            },
+            {
+              "asset_id": "1176676447",
+              "alt": "ライトボックスでx線を研究する日本人医師の背面図 - desk studying back view japanese ストックフォトと画像",
+              "photographer": "AzmanL"
+            },
+            {
+              "asset_id": "1176676458",
+              "alt": "患者とx線の詳細を調べる日本人医師 - desk studying back view japanese ストックフォトと画像",
+              "photographer": "AzmanL"
+            },
+            {
+              "asset_id": "1167945018",
+              "alt": "患者とx線を研究する日本人医師 - desk studying back view japanese ストックフォトと画像",
+              "photographer": "AzmanL"
+            }
+          ]
+        }
+      ],
+      "actual": [
+        {
+          "role": "hero",
+          "alt": "最高倍率3000倍超…｢習近平にすべてを捧げれば一発逆転できる｣中国の就活生が殺到する\"超人気職業\"とは 習近平の｢廃塾令｣で路頭に迷う高学歴エリートの本音",
+          "source": "報道(通信社)",
+          "photographer": ""
+        },
+        {
+          "role": "body",
+          "alt": "安徽省阜陽市で試験勉強に励む2024年度の「高考」受験生",
+          "source": "報道(通信社)",
+          "photographer": ""
+        }
+      ]
+    },
+    {
+      "file": "『中国ぎらいのための中国史』2本目安田確認.docx",
+      "title": "若者の｢体制離れ｣が止まらない…中国全土に広がる｢毛沢東ブーム｣に習近平政権が頭を抱える理由",
+      "url": "https://president.jp/articles/-/86944",
+      "elapsed_s": 42.8,
+      "suggestions": [
+        {
+          "slot_key": "hero",
+          "slot_label": "カンバン(冒頭)",
+          "type_code": "C",
+          "type_label": "抽象シンボル",
+          "primary_query": "経済",
+          "candidates": [
+            {
+              "asset_id": "2157198324",
+              "alt": "中国の経済。投資家のシルエットが描かれた中華人民共和国の旗。危機の財務チャート。投資相場。中国とのビジネスコンセプト。中国経済の衰退のチャート。中国の危機。3d画像 - china economy graph silhouette ストックフォトと画像",
+              "photographer": "Gri-spb"
+            },
+            {
+              "asset_id": "1372522333",
+              "alt": "ビジネス背景の3dレンダリングに関する中国のチェスとチャート - china economy graph silhouette ストックフォトと画像",
+              "photographer": "niphon"
+            },
+            {
+              "asset_id": "514462456",
+              "alt": "素早い開発に都会の経済および財務部門 - china economy graph silhouette ストックフォトと画像",
+              "photographer": "liulolo"
+            },
+            {
+              "asset_id": "642683890",
+              "alt": "財務上の成功矢印記号 - china economy graph silhouette ストックフォトと画像",
+              "photographer": "liulolo"
+            },
+            {
+              "asset_id": "642683934",
+              "alt": "財務上の成功矢印記号 - china economy graph silhouette ストックフォトと画像",
+              "photographer": "liulolo"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_1",
+          "slot_label": "■中国庶民が望む“帝王像”に合致していた毛沢東",
+          "type_code": "E",
+          "type_label": "産業",
+          "primary_query": "建設",
+          "candidates": [
+            {
+              "asset_id": "1329503530",
+              "alt": "道路上の人々の影と中国の旗の概念図 - china flag silhouette ストックフォトと画像",
+              "photographer": "AlxeyPnferov"
+            },
+            {
+              "asset_id": "694205062",
+              "alt": "グランジの金属の質感を持つ中国と日本の旗 - 中国 国旗 シルエット ストックフォトと画像",
+              "photographer": "btgbtg"
+            },
+            {
+              "asset_id": "1130930234",
+              "alt": "オフィスビルの壁にある白紙の看板 - 中国 建築 象徴 ストックフォトと画像",
+              "photographer": "baona"
+            },
+            {
+              "asset_id": "1206220770",
+              "alt": "冬の街並み - 中国 建築 象徴 ストックフォトと画像",
+              "photographer": "chinaphotographer"
+            },
+            {
+              "asset_id": "620974266",
+              "alt": "都市スケープとネットワーク接続コンセプトの上に平らにマップピン - 中国 建築 象徴 ストックフォトと画像",
+              "photographer": "ASKA"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_2",
+          "slot_label": "■改革開放路線のなかで“毛思想”が復権",
+          "type_code": "E",
+          "type_label": "産業",
+          "primary_query": "建設",
+          "candidates": [
+            {
+              "asset_id": "1296514379",
+              "alt": "ビジネスの超高層ビルを備えたモダンなスカイライン - 中国 建設 都市景観 ストックフォトと画像",
+              "photographer": "CHUNYIP WONG"
+            },
+            {
+              "asset_id": "891501876",
+              "alt": "北京のスカイラインの都市ネットワークの航空写真 - china infrastructure development ストックフォトと画像",
+              "photographer": "AerialPerspective Works"
+            },
+            {
+              "asset_id": "576900878",
+              "alt": "北京の夕暮れの街並み - 中国 建設 都市景観 ストックフォトと画像",
+              "photographer": "bjdlzx"
+            },
+            {
+              "asset_id": "1357458696",
+              "alt": "夜間の陸橋と都市交通のドローンポイントビュー - china infrastructure development ストックフォトと画像",
+              "photographer": "AerialPerspective Works"
+            },
+            {
+              "asset_id": "615881342",
+              "alt": "空から見た上海の夜景 - 中国 建設 都市景観 ストックフォトと画像",
+              "photographer": "ASKA"
+            }
+          ]
+        }
+      ],
+      "actual": [
+        {
+          "role": "hero",
+          "alt": "若者の｢体制離れ｣が止まらない…中国全土に広がる｢毛沢東ブーム｣に習近平政権が頭を抱える理由 老若男女が｢建国の父｣に救いを求めている",
+          "source": "iStock",
+          "photographer": "The-Tor"
+        },
+        {
+          "role": "body",
+          "alt": "北京の天安門に掲げられた毛沢東の肖像",
+          "source": "iStock",
+          "photographer": "The-Tor"
+        }
+      ]
+    },
+    {
+      "file": "【0725再修正編集部チェック】『誰が日本を降伏させたか』3本目.docx",
+      "title": "広島に原爆が落とされても戦争をやめる気はなかった…日本の戦争指導者が‷敗戦”を受け入れた決定的瞬間",
+      "url": "https://president.jp/articles/-/98856",
+      "elapsed_s": 42.6,
+      "suggestions": [
+        {
+          "slot_key": "hero",
+          "slot_label": "カンバン(冒頭)",
+          "type_code": "B",
+          "type_label": "国旗",
+          "primary_query": "日本 アメリカ 国旗",
+          "candidates": [
+            {
+              "asset_id": "1358521287",
+              "alt": "ひび割れたコンクリートの壁、中国と日本の紛争またはパートナーシップの概念に描かれた中国と日本の旗 - 日本 アメリカ 国旗 外交 ストックフォトと画像",
+              "photographer": "masterSergeant"
+            },
+            {
+              "asset_id": "1166455234",
+              "alt": "テクスチャファブリック上のニュージーランドのフラグ。愛国的シンボル - flag symbol history abstract ストックフォトと画像",
+              "photographer": "SomeMeans"
+            },
+            {
+              "asset_id": "1181619967",
+              "alt": "共和国リベリア国立ファブリックフラグテキスタイルの背景。世界アフリカの国のシンボル。 - flag symbol history abstract ストックフォトと画像",
+              "photographer": "Anastasiia_Guseva"
+            },
+            {
+              "asset_id": "1231388570",
+              "alt": "アメリカ国旗の背景に祝祭花火。シンボルホリデーアメリカ独立記念日。7月4日アメリカ独立記念日。 - flag symbol history abstract ストックフォトと画像",
+              "photographer": "Trifonov_Evgeniy"
+            },
+            {
+              "asset_id": "1135473520",
+              "alt": "独立した風に吹くメキシコ国旗。公式愛国抽象デザイン。図 3 3d レンダリング記号を振る。 - flag symbol history abstract ストックフォトと画像",
+              "photographer": "tampatra"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_1",
+          "slot_label": "■日本を降伏させたのは「原爆」か「ソ連侵攻」か",
+          "type_code": "B",
+          "type_label": "国旗",
+          "primary_query": "日本 米国 国旗",
+          "candidates": [
+            {
+              "asset_id": "1334498013",
+              "alt": "その上に手を振るアメリカの旗とussアリゾナ記念碑の遠いショット - japanese flag american flag ストックフォトと画像",
+              "photographer": "SeregaSibTravel"
+            },
+            {
+              "asset_id": "1334498031",
+              "alt": "その上に手を振るアメリカの旗を持つussアリゾナ記念碑 - japanese flag american flag ストックフォトと画像",
+              "photographer": "SeregaSibTravel"
+            },
+            {
+              "asset_id": "1125607789",
+              "alt": "すべての州の旗と世界地図 - 国旗 外交 シンボル ストックフォトと画像",
+              "photographer": "CarlosAndreSantos"
+            },
+            {
+              "asset_id": "919701318",
+              "alt": "アメリカと中国の国旗ペア多重の背景の上の机の上 - 国旗 外交 シンボル ストックフォトと画像",
+              "photographer": "MicroStockHub"
+            },
+            {
+              "asset_id": "179243711",
+              "alt": "アルゼンチンとブラジルの世界の旗 - 国旗 外交 シンボル ストックフォトと画像",
+              "photographer": "123ArtistImages"
+            }
+          ]
+        },
+        {
+          "slot_key": "h4_2",
+          "slot_label": "■「“新型爆弾”の投下を理由に戦争を終わらせるべき」",
+          "type_code": "C",
+          "type_label": "抽象シンボル",
+          "primary_query": "天皇",
+          "candidates": [
+            {
+              "asset_id": "682858898",
+              "alt": "日本のお寺で祈る若い日本女性 - 皇室 後ろ姿 日本 ストックフォトと画像",
+              "photographer": "joka2000"
+            },
+            {
+              "asset_id": "636847792",
+              "alt": "東北の山門で歩く日本人カップル - 皇室 後ろ姿 日本 ストックフォトと画像",
+              "photographer": "joka2000"
+            },
+            {
+              "asset_id": "1178292817",
+              "alt": "帝国日本の旗アイコンの3dレンダリング。 - 昭和 国家指導 象徴 ストックフォトと画像",
+              "photographer": "Enrique Ramos Lopez"
+            },
+            {
+              "asset_id": "635771724",
+              "alt": "京都・戸府寺で秋の紅葉を楽しむ日本人家族 - 皇室 後ろ姿 日本 ストックフォトと画像",
+              "photographer": "magicflute002"
+            },
+            {
+              "asset_id": "1002017134",
+              "alt": "東福寺、京都で日本の秋の紅葉を鑑賞する日本の家族 - 皇室 後ろ姿 日本 ストックフォトと画像",
+              "photographer": "magicflute002"
+            }
+          ]
+        }
+      ],
+      "actual": [
+        {
+          "role": "hero",
+          "alt": "広島に原爆が落とされても戦争をやめる気はなかった…日本の戦争指導者が\"敗戦\"を受け入れた決定的瞬間 昭和天皇の\"聖断\"に影響を与えた｢運命の5日間｣",
+          "source": "報道(通信社)",
+          "photographer": ""
+        },
+        {
+          "role": "body",
+          "alt": "終戦直後の焼トタン住宅で暮らす人々。後方は国会議事堂",
+          "source": "報道(通信社)",
+          "photographer": ""
+        }
+      ]
+    }
+  ],
+  "config": {
+    "search_mode": "llm_rerank"
+  }
+}

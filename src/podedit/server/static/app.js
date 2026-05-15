@@ -7,6 +7,8 @@
   const $meta = $('audio-meta');
   const $tx = $('transcript');
   const $btnDelete = $('btn-delete');
+  const $btnFollowPlayhead = $('btn-follow-playhead');
+  const $followState = $('follow-state');
   const $btnUndo = $('btn-undo');
   const $btnRedo = $('btn-redo');
   const $btnClear = $('btn-clear-sel');
@@ -26,6 +28,7 @@
   const $scrubber = $('scrubber');
   const $btnAudition = $('btn-audition');
   const $btnExport = $('btn-export');
+  const $btnExportClip = $('btn-export-clip');
   const $exportFormat = $('export-format');
   const $btnCopyTranscript = $('btn-copy-transcript');
   const $btnOpen = $('btn-open');
@@ -38,9 +41,12 @@
   const $libraryFileInput = $('library-file-input');
   const $libraryUploadHint = $('library-upload-hint');
   const $libraryBreadcrumbs = $('library-breadcrumbs');
+  const $libraryEnvBanner = $('library-env-banner');
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
+  const $btnAddFillers = $('btn-add-fillers');
+  const $fillerCount = $('filler-count');
 
   // ------- utilities -------
   const fmt = (s) => {
@@ -276,6 +282,7 @@
     saveTimer: null,
     saveDirty: false,
     saveSeq: 0,        // monotonic; only the latest save can claim 'saved'
+    annotations: [],   // computed transcript annotations, currently filler/aizuchi candidates
   };
 
   function recomputeMergedDeletes() {
@@ -419,6 +426,24 @@
     state.editedDuration = state.timeline.reduce((sum, r) => sum + (r.sourceEnd - r.sourceStart), 0);
   }
 
+  // Selection boundary guards exist to stop the user from picking up
+  // "arbitrary source content" when the DOM order has diverged from the
+  // source-time order — that only happens once a Move/Reorder reshuffles
+  // segments. Delete just removes spans, so segments stay in source order
+  // and the guard is purely an obstacle (the famous "30 sec wall" was
+  // exactly this: 13 cumulative Delete ops created a segment boundary at
+  // ~30 s and the guard refused to let Shift+Down cross it). Treat the
+  // timeline as "safe to cross" whenever the source ranges are still in
+  // ascending order — that captures Delete-only sessions and pre-Move
+  // states, and excludes only post-Move arrangements.
+  function isTimelineMonotonic() {
+    if (!state.timeline || state.timeline.length < 2) return true;
+    for (let i = 1; i < state.timeline.length; i++) {
+      if (state.timeline[i].sourceStart < state.timeline[i - 1].sourceEnd) return false;
+    }
+    return true;
+  }
+
   function editedToSource(t) {
     if (!state.timeline.length) return 0;
     t = Math.max(0, Math.min(t, state.editedDuration));
@@ -439,51 +464,44 @@
     if (next) return next.editedStart;
     return state.editedDuration;
   }
-  const words = [];    // [{el, start, end, idx, segIdx}]
+  const words = [];    // [{el, start, end, idx, segIdx, wordId}]
+  const wordById = new Map();
   const kpi = { sessionStartedAt: Date.now() / 1000, firstOpAt: null, opsCount: 0 };
+  let activeIdx = -1;  // current word highlight; must exist before initial load/rerender
+  // Search index state (lazily built on first query, invalidated when the
+  // transcript changes). Declared up here next to `words` so the
+  // loadActiveAndRender path can reset it without tripping the temporal
+  // dead zone — the search wiring further down only adds the build/query
+  // logic, not these flag variables.
+  let searchFullText = '';
+  let searchWordStart = null;   // Int32Array, length = words.length
+  let searchWordEnd = null;     // Int32Array, length = words.length
+  let searchIndexBuiltFor = -1; // words.length at index-build time
 
-  // ------- load -------
-  const t0 = performance.now();
-  let info, tx, session;
-  try {
-    tx = await fetchJSONDetailed('/api/transcript');
-    [info, session] = await Promise.all([
-      fetchJSON('/api/audio/info'),
-      fetchJSON('/api/session'),
-    ]);
-  } catch (e) {
-    if (e && e.status === 503) {
-      state.hasActive = false;
-      info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
-      tx = { segments: [] };
-      session = { ops: [] };
-      $tx.innerHTML = '<div class="status empty">音声が読み込まれていません。<br>上の「音声を開く」(O) をクリックして、Codespace 内のファイルを選ぶか、アップロードしてください。</div>';
-    } else {
-      $tx.innerHTML = `<div class="status error">読み込みに失敗しました: ${e.message}</div>`;
-      return;
-    }
+  // Auto-follow the playhead with the transcript scroll position. Default OFF
+  // so the editor can scroll to a distant part of the audio (e.g. 5:00) while
+  // the player keeps playing somewhere else (e.g. 0:30) without the screen
+  // snapping back. Persisted across page loads so the user only sets it once.
+  const FOLLOW_PLAYHEAD_LS_KEY = 'podedit.followPlayhead';
+  let followPlayhead = false;
+  try { followPlayhead = localStorage.getItem(FOLLOW_PLAYHEAD_LS_KEY) === 'true'; } catch (_) {}
+  function setFollowPlayhead(next, opts) {
+    followPlayhead = !!next;
+    try { localStorage.setItem(FOLLOW_PLAYHEAD_LS_KEY, followPlayhead ? 'true' : 'false'); } catch (_) {}
+    if ($btnFollowPlayhead) $btnFollowPlayhead.dataset.active = followPlayhead ? 'true' : 'false';
+    if ($followState) $followState.textContent = followPlayhead ? 'ON' : 'OFF';
+    // Suppress the KPI event during boot-time restore — otherwise every
+    // page load would synthesise a spurious "user toggled" event.
+    if (!opts || !opts.silent) logKPI('ui.follow_playhead.toggle', { enabled: followPlayhead });
   }
-  state.sessionTemplate = session;
-  state.ops = session.ops || [];
-  state.sourceDuration = info.duration_sec;
-  logKPI('ui.loaded', {
-    latency_ms: performance.now() - t0,
-    has_existing_session: state.ops.length > 0,
-    has_active: state.hasActive,
-  });
-
-  $name.textContent = info.name;
-  $meta.textContent = [
-    fmt(info.duration_sec),
-    info.sample_rate && `${info.sample_rate}Hz`,
-    info.channels && `${info.channels}ch`,
-    info.codec,
-    tx.model_config && `· model: ${tx.model_config.model}`,
-  ].filter(Boolean).join(' · ');
-  if (state.hasActive) $player.src = info.url;
+  setFollowPlayhead(followPlayhead, { silent: true });
+  if ($btnFollowPlayhead) {
+    $btnFollowPlayhead.addEventListener('click', () => setFollowPlayhead(!followPlayhead));
+  }
 
   // Diagnostic logging: if seeks are silently ignored, we still see seeking/
-  // seeked/error events in the KPI log.
+  // seeked/error events in the KPI log. Wired once at boot so a SPA-style
+  // library switch doesn't stack duplicate listeners.
   $player.addEventListener('seeking', () => logKPI('ui.audio.seeking', { t: $player.currentTime }));
   $player.addEventListener('seeked', () => logKPI('ui.audio.seeked', { t: $player.currentTime }));
   $player.addEventListener('error', () => logKPI('ui.audio.error', {
@@ -491,31 +509,195 @@
   }));
   $player.addEventListener('stalled', () => logKPI('ui.audio.stalled', { t: $player.currentTime }));
 
-  // ------- render -------
-  if (state.hasActive) $tx.innerHTML = '';
-  let idx = 0;
-  tx.segments.forEach((seg, segIdx) => {
-    const div = document.createElement('div');
-    div.className = 'segment';
-    const time = document.createElement('span');
-    time.className = 'seg-time';
-    time.textContent = fmt(seg.start);
-    div.appendChild(time);
-    (seg.words || []).forEach((w) => {
-      const span = document.createElement('span');
-      span.className = 'word';
-      const wordIdx = idx;  // capture per-iteration value
-      span.dataset.idx = String(wordIdx);
-      span.textContent = w.text;
-      const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx };
-      words.push(word);
-      span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
-      span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
-      div.appendChild(span);
-      idx += 1;
+  // Fetches /api/transcript /audio/info /session, resets edit state to a
+  // clean slate, and rebuilds the transcript DOM. Called once at boot and
+  // again every time the user switches files via the Open dialog — no full
+  // page reload, so the in-page UI stays mounted (keyboard focus, scroll,
+  // env banner state, etc.).
+  //
+  // Returns true on success (active or empty state), false on hard fetch
+  // failure so callers (e.g. selectLibraryEntry) can keep their UI honest.
+  // Concurrent calls cancel each other via loadSeq: only the most recent
+  // call gets to commit DOM/state changes — a slow earlier call that
+  // returns after a newer call started is silently dropped.
+  let loadSeq = 0;
+  async function loadActiveAndRender() {
+    const mySeq = ++loadSeq;
+    const stale = () => mySeq !== loadSeq;
+    const t0 = performance.now();
+    let info, tx, session, annotations;
+    let nextHasActive = true;
+    let loadError = null;
+    try {
+      tx = await fetchJSONDetailed('/api/transcript');
+      if (stale()) return false;
+      [info, session, annotations] = await Promise.all([
+        fetchJSON('/api/audio/info'),
+        fetchJSON('/api/session'),
+        fetchJSON('/api/annotations/fillers').catch((e) => {
+          logKPI('ui.annotations.error', { error: e.message });
+          return { annotations: [] };
+        }),
+      ]);
+      if (stale()) return false;
+    } catch (e) {
+      if (stale()) return false;
+      if (e && e.status === 503) {
+        nextHasActive = false;
+        info = { name: '音声未読み込み', duration_sec: 0, sample_rate: null, channels: null, codec: null, url: '' };
+        tx = { segments: [] };
+        session = { ops: [] };
+        annotations = { annotations: [] };
+      } else {
+        loadError = e;
+      }
+    }
+
+    // Stop any current playback / revoke a previous preview blob URL before
+    // we tear the DOM down. Switching files mid-audition would otherwise
+    // leak the rendered wav for the previous file.
+    try { $player.pause(); } catch (_) { /* element may not be ready */ }
+    if (state.previewURL) {
+      try { URL.revokeObjectURL(state.previewURL); } catch (_) { /* non-fatal */ }
+    }
+
+    // Reset every piece of per-file edit state. Anything that survives here
+    // becomes a ghost from the previous file (e.g. selection indexes that
+    // point past the new transcript, an undo stack referring to deleted
+    // ops, a stale paste anchor).
+    if (stale()) return false;
+    state.hasActive = nextHasActive;
+    state.ops = [];
+    state.mergedDeletes = [];
+    state.timeline = [];
+    state.editedDuration = 0;
+    state.sourceDuration = 0;
+    state.isScrubbing = false;
+    state.previewMode = false;
+    state.previewURL = null;
+    state.previewCacheKey = null;
+    state.previewDuration = null;
+    state.renderSeq = (state.renderSeq || 0) + 1;  // invalidate in-flight renders
+    state.undoStack = [];
+    state.redoStack = [];
+    state.selection = null;
+    state.selectionPainted = null;  // old indices point to torn-down DOM
+    state.clipboard = null;
+    state.pasteAnchor = null;
+    state.pasteAnchorPainted = null;
+    state.sessionTemplate = null;
+    state.saveStatus = 'idle';
+    if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
+    state.saveDirty = false;
+    state.saveSeq = (state.saveSeq || 0) + 1;  // any in-flight autosave is no longer ours
+    state.annotations = [];
+    // KPI counters are per-file too: a fresh switch starts a fresh editing
+    // session so downstream metrics (time-to-first-op, ops-per-session) are
+    // not contaminated by the previous file's history.
+    kpi.sessionStartedAt = Date.now() / 1000;
+    kpi.firstOpAt = null;
+    kpi.opsCount = 0;
+    words.length = 0;
+    wordById.clear();
+    // Invalidate the search index so the new transcript doesn't see hits
+    // against the previous file's full-text buffer. Cheap (just a flag).
+    searchIndexBuiltFor = -1;
+    searchFullText = '';
+    searchWordStart = null;
+    searchWordEnd = null;
+    $tx.innerHTML = '';
+    $skipPill.textContent = 'no cut';
+    if ($clipboardPill) $clipboardPill.hidden = true;
+
+    if (loadError) {
+      $tx.innerHTML = `<div class="status error">読み込みに失敗しました: ${loadError.message}</div>`;
+      // Leave the rest of the UI consistent with the empty state so the
+      // error doesn't leave stale chips/pills/pasteAnchor markers from
+      // the previous file.
+      $name.textContent = '読み込み失敗';
+      $meta.textContent = '';
+      $player.removeAttribute('src');
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+      syncTimelineUI();
+      updateStats();
+      renderPasteAnchor();
+      refreshButtons();
+      setModePill('source', 'source');
+      setSaveStatus('idle');
+      return false;
+    }
+
+    state.sessionTemplate = session;
+    state.ops = session.ops || [];
+    state.annotations = Array.isArray(annotations && annotations.annotations)
+      ? annotations.annotations
+      : [];
+    state.sourceDuration = info.duration_sec;
+    logKPI('ui.loaded', {
+      latency_ms: performance.now() - t0,
+      has_existing_session: state.ops.length > 0,
+      has_active: state.hasActive,
     });
-    $tx.appendChild(div);
-  });
+
+    $name.textContent = info.name;
+    $meta.textContent = [
+      fmt(info.duration_sec),
+      info.sample_rate && `${info.sample_rate}Hz`,
+      info.channels && `${info.channels}ch`,
+      info.codec,
+      tx.model_config && `· model: ${tx.model_config.model}`,
+    ].filter(Boolean).join(' · ');
+
+    if (state.hasActive) {
+      $player.src = info.url;
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+    } else {
+      $player.removeAttribute('src');
+      try { $player.load(); } catch (_) { /* non-fatal */ }
+      $tx.innerHTML = '<div class="status empty">音声が読み込まれていません。<br>上の「音声を開く」(O) をクリックして、Codespace 内のファイルを選ぶか、アップロードしてください。</div>';
+    }
+
+    if (state.hasActive) {
+      let idx = 0;
+      tx.segments.forEach((seg, segIdx) => {
+        const div = document.createElement('div');
+        div.className = 'segment';
+        const time = document.createElement('span');
+        time.className = 'seg-time';
+        time.textContent = fmt(seg.start);
+        div.appendChild(time);
+        const segmentId = seg.id || `s${segIdx}`;
+        (seg.words || []).forEach((w, wordIdxInSeg) => {
+          const span = document.createElement('span');
+          span.className = 'word';
+          const wordIdx = idx;
+          const wordId = String(w.id != null ? w.id : `${segmentId}-w${wordIdxInSeg}`);
+          span.dataset.idx = String(wordIdx);
+          span.dataset.wordId = wordId;
+          span.textContent = w.text;
+          const word = { el: span, start: w.start, end: w.end, idx: wordIdx, segIdx, wordId };
+          words.push(word);
+          wordById.set(wordId, word);
+          span.addEventListener('pointerdown', (ev) => onWordPointerDown(wordIdx, ev));
+          span.addEventListener('mouseenter', () => onWordMouseEnter(wordIdx));
+          div.appendChild(span);
+          idx += 1;
+        });
+        $tx.appendChild(div);
+      });
+    }
+    renderAnnotations();
+
+    if (state.hasActive) rerenderOps();
+    else { syncTimelineUI(); updateStats(); }
+    renderPasteAnchor();
+    refreshButtons();
+    setModePill('source', 'source');
+    setSaveStatus('idle');
+    return true;
+  }
+
+  await loadActiveAndRender();
 
   // ------- selection + move-drag clicks -------
   // Pointerdown on an unselected word keeps the W4 drag-to-select behavior.
@@ -538,9 +720,50 @@
   function onWordPointerDown(i, ev) {
     if (ev.button !== undefined && ev.button !== 0) return;  // left button only
     if (ev.isComposing || isIMEComposing) return;
-    if (ev.shiftKey && state.selection) {
-      state.selection = { anchor: state.selection.anchor, extent: i };
+    if (ev.shiftKey) {
+      // Shift+Click range select. Bypasses the drag-to-select path entirely
+      // so the user can pick a 2-minute range without fighting auto-scroll.
+      // Anchor priority: existing selection anchor > last plain click > self.
+      let anchor = i;
+      if (state.selection) anchor = state.selection.anchor;
+      else if (lastPlainClickIdx >= 0) anchor = lastPlainClickIdx;
+      // Only clamp when the DOM order has diverged from source order
+      // (post-Move/Reorder). Delete-only sessions stay monotonic, so the
+      // user can Shift+Click across a deleted gap without picking up
+      // arbitrary content — the cut words have pointer-events:none.
+      let extent = i;
+      if (!isTimelineMonotonic()) {
+        const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+        const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
+        if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+          const step = i > anchor ? -1 : 1;
+          let j = i;
+          while (j !== anchor && wordTimelineSegmentIndex(words[j]) !== anchorTLSeg) {
+            j += step;
+          }
+          extent = j;
+          logKPI('ui.shift_click.clamped', {
+            requested_extent: i, clamped_to: extent, anchor,
+            anchor_seg: anchorTLSeg, click_seg: candidateTLSeg,
+          });
+        }
+      }
+      state.selection = { anchor, extent };
       renderSelection();
+      const ws = Math.min(anchor, extent);
+      const we = Math.max(anchor, extent);
+      const wStart = words[ws];
+      const wEnd = words[we];
+      if (wStart) $player.currentTime = wStart.start;
+      // Reset double-click tracking — a Shift+Click is a deliberate range
+      // gesture, not a candidate for the "next click plays" rule.
+      lastPlainClickIdx = -1;
+      lastPlainClickAt = 0;
+      refreshButtons();
+      logKPI('ui.shift_click.range', {
+        anchor, extent, ws, we,
+        duration: wStart && wEnd ? wEnd.end - wStart.start : null,
+      });
       ev.preventDefault();
       return;
     }
@@ -624,14 +847,15 @@
 
   function extendSelectionDrag(i) {
     if (dragAnchor === null) return;
-    // Selection in the UI maps to a *single* contiguous source range
-    // (the anchor's timeline segment). After a Move op the DOM is in edited
-    // order, so a user dragging across timeline-segment boundaries would
-    // pick up arbitrary source content. Refuse to extend across boundaries:
-    // the selection stops at whichever side of the boundary the anchor lives.
-    const anchorTLSeg = wordTimelineSegmentIndex(words[dragAnchor]);
-    const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
-    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) return;
+    // Boundary guard only matters once a Move/Reorder put the DOM out of
+    // source order. While timeline is still monotonic (Delete-only or no
+    // edits yet) the user can safely drag across deleted gaps — the cut
+    // words have pointer-events:none so they aren't actually picked up.
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[dragAnchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[i]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) return;
+    }
     if (i !== dragAnchor) dragMoved = true;
     if (!state.selection || state.selection.extent !== i) {
       state.selection = { anchor: dragAnchor, extent: i };
@@ -639,28 +863,60 @@
     }
   }
 
+  // Track the previous plain click so a second click on the same word
+  // within DOUBLE_CLICK_MS becomes a "double-click = play" gesture.
+  // Single click only seeks + selects; the user explicitly asked for
+  // playback to require a deliberate double-click.
+  let lastPlainClickIdx = -1;
+  let lastPlainClickAt = 0;
+  const DOUBLE_CLICK_MS = 400;
+
   function handlePlainWordClick(startIdx) {
     if (state.clipboard) {
       setPasteAnchor(startIdx);
       clearSelection();
+      // Reset double-click tracking so a later normal click on the same
+      // word doesn't see the paste-anchor click as the first half of a
+      // double-click and unexpectedly start playback.
+      lastPlainClickIdx = -1;
+      lastPlainClickAt = 0;
       logKPI('ui.paste.anchor', { word_idx: startIdx, t: words[startIdx].start });
       return;
     }
-    // Plain click: seek + play. Selection collapses to this one word so D
-    // can still delete a single word if the user wants.
+    const now = performance.now();
+    const isDouble = lastPlainClickIdx === startIdx && (now - lastPlainClickAt) < DOUBLE_CLICK_MS;
+    lastPlainClickIdx = startIdx;
+    lastPlainClickAt = now;
+    // Selection collapses to this one word so <kbd>D</kbd> can still
+    // delete a single word if the user wants.
     state.selection = { anchor: startIdx, extent: startIdx };
     renderSelection();
     const w = words[startIdx];
     $player.currentTime = w.start;
-    const p = $player.play();
-    if (p && typeof p.catch === 'function') p.catch(() => {});
-    logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+    if (isDouble) {
+      const p = $player.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      logKPI('ui.dblclick.word', { word_idx: startIdx, t: w.start });
+    } else {
+      // Single click: seek (so the player UI shows where the user is)
+      // but do NOT start playback. Double-click within 400ms plays.
+      logKPI('ui.click.word', { word_idx: startIdx, t: w.start });
+    }
   }
 
-  function finishSelectionDrag() {
+  function finishSelectionDrag(reason) {
     if (dragAnchor === null) return;
     const wasDrag = dragMoved;
     const startIdx = dragAnchor;
+    const r0 = selectionRange();
+    logKPI('ui.drag.finish_debug', {
+      reason: reason || 'pointerup',
+      start_idx: startIdx,
+      had_drag: wasDrag,
+      extent: r0 ? r0.we : null,
+      anchor: r0 ? r0.ws : null,
+      duration_sec: r0 ? r0.end - r0.start : null,
+    });
     dragAnchor = null;
     dragMoved = false;
     releaseActivePointerCapture();
@@ -726,8 +982,28 @@
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   }
 
+  function scrollViewportBy(dy) {
+    // Most layouts have <main id="transcript"> as the scrolling container
+    // (overflow-y: auto). On narrow viewports / large fonts the document
+    // itself becomes the scroller instead, leaving $tx.scrollTop pinned at
+    // 0. Try the pane first and fall back to window — this is what the
+    // user hit when they said drag-to-select stopped around 30 seconds.
+    if (dy === 0) return;
+    const before = $tx.scrollTop;
+    $tx.scrollTop += dy;
+    if ($tx.scrollTop === before) window.scrollBy(0, dy);
+  }
+
   function wordFromPoint(x, y) {
-    let el = document.elementFromPoint(x, y);
+    // Clamp to viewport interior so a pointer dragged just past the bottom
+    // (or top) edge still hit-tests the boundary-most visible word.
+    // Without this, document.elementFromPoint returns null whenever y
+    // exceeds window.innerHeight, freezing the selection at whatever was
+    // on screen when the cursor crossed the edge — the codex review
+    // flagged this as the next likely cause after the mouseleave fix.
+    const cx = Math.max(1, Math.min(window.innerWidth - 1, x));
+    const cy = Math.max(1, Math.min(window.innerHeight - 1, y));
+    let el = document.elementFromPoint(cx, cy);
     while (el && !el.classList?.contains('word')) el = el.parentElement;
     if (el && el.classList.contains('word')) {
       const i = parseInt(el.dataset.idx, 10);
@@ -872,6 +1148,9 @@
     }
     if (dragAnchor === null) return;
     pendingDragMove = { x: e.clientX, y: e.clientY };
+    // Stamp the last actual pointer motion so the auto-scroll tick can
+    // tell "moving" from "held still" — Word/Docs style.
+    _lastSelectionPointerMoveAt = performance.now();
   });
 
   document.addEventListener('pointerup', (e) => {
@@ -880,30 +1159,127 @@
       finishMoveDrag(e.clientX, e.clientY);
       return;
     }
-    finishSelectionDrag();
+    finishSelectionDrag('pointerup');
   });
 
   document.addEventListener('pointercancel', (e) => {
     if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    logKPI('ui.drag.pointercancel', { pointerId: e.pointerId, dragAnchor });
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
+    if (dragAnchor !== null) finishSelectionDrag('pointercancel');
   });
 
-  // Drag can be aborted by leaving the window mid-drag; treat it as cancel for
-  // move-drag and as release for selection-drag so dragAnchor never sticks.
+  // Selection drag intentionally does NOT end on mouseleave: the user
+  // routinely drags their pointer past the viewport edge to keep
+  // extending the selection while the transcript auto-scrolls. Pointer
+  // capture + pointerup/pointercancel handle legitimate drag-end.
+  // Killing the drag here was the REAL "30 sec wall" — the moment
+  // pointer y crossed the document edge, dragAnchor went null and the
+  // rAF tick stopped doing anything. Move-drag still cancels because
+  // dropping into another window can't pick a meaningful target.
   document.addEventListener('mouseleave', () => {
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
+  });
+  // setPointerCapture can be released implicitly (DOM mutation, OS
+  // gesture, focus-stealing extension). We log it for diagnostics but
+  // DO NOT end the selection drag — document-level pointermove keeps
+  // firing without capture, so the rAF tick can continue extending the
+  // selection. Only move-drag (which renders a ghost element pinned
+  // to the cursor) actually needs capture; cancel that one explicitly.
+  // Early return when nothing is active to avoid logging unrelated
+  // pointer releases from elsewhere in the page.
+  document.addEventListener('lostpointercapture', (e) => {
+    if (dragAnchor === null && !moveDrag) return;
+    if (activePointerId !== null && e.pointerId !== activePointerId) return;
+    logKPI('ui.drag.pointer_capture_lost', {
+      pointerId: e.pointerId,
+      dragAnchor,
+      hasMoveDrag: !!moveDrag,
+    });
+    if (moveDrag) cancelMoveDrag();
+    // Intentionally do NOT call finishSelectionDrag here — see header.
   });
 
   // Backstop for sensitivity: track pointer position during selection drag and
   // resolve the word directly under the cursor each rAF. mouseenter alone
   // misses words when dragging fast across line breaks or inter-word gaps.
+  // Keep the last pointer position (no per-frame null-ing) so edge auto-scroll
+  // continues even if the user holds the pointer still at the viewport edge.
+  // Without this, drag-to-select can't pull the transcript past whatever's
+  // visible — the user reported being capped around 30 seconds because
+  // wordFromPoint can only see what's already painted on screen.
+  // Selection drag uses a centre-based auto-scroll (Word / Google Docs
+  // style) rather than the move-drag's 80px edge zone. Real-user KPI
+  // (2026-05-14) showed users keep their pointer near the vertical
+  // middle (y ~= innerHeight * 0.6) while dragging — they never get
+  // within 80px of the bottom edge, so the transcript never scrolled
+  // and selection stalled at ~30 sec of already-painted words. Dead
+  // zone ±60px in the centre, then velocity ramps from a BASE the
+  // instant the pointer leaves the dead zone up to MAX at the viewport
+  // edge. Auto-scroll only fires within ACTIVITY_MS of the last
+  // pointermove so a held-still pointer can't drift the page silently.
+  const SELECTION_AUTOSCROLL_DEAD_ZONE_PX = 60;
+  const SELECTION_AUTOSCROLL_MAX_VELOCITY = 24;
+  const SELECTION_AUTOSCROLL_BASE_VELOCITY = 3;
+  const SELECTION_AUTOSCROLL_ACTIVITY_MS = 500;
+  let _lastSelectionPointerMoveAt = 0;
+  let _dragDebugLastEmitAt = 0;
   function dragMoveTick() {
-    if (pendingDragMove && dragAnchor !== null) {
-      const w = wordFromPoint(pendingDragMove.x, pendingDragMove.y);
+    if (pendingDragMove && dragAnchor !== null && !moveDrag) {
+      const x = pendingDragMove.x;
+      const y = pendingDragMove.y;
+      const now = performance.now();
+      const recentlyMoved = (now - _lastSelectionPointerMoveAt) < SELECTION_AUTOSCROLL_ACTIVITY_MS;
+      const centerY = window.innerHeight / 2;
+      const distFromCenter = Math.abs(y - centerY);
+      let velocity = 0;
+      if (recentlyMoved && distFromCenter > SELECTION_AUTOSCROLL_DEAD_ZONE_PX) {
+        const effectiveDist = distFromCenter - SELECTION_AUTOSCROLL_DEAD_ZONE_PX;
+        const maxDist = Math.max(1, centerY - SELECTION_AUTOSCROLL_DEAD_ZONE_PX);
+        const sign = y < centerY ? -1 : 1;
+        const fraction = Math.min(1, effectiveDist / maxDist);
+        // Start at BASE the instant we leave the dead zone, ramp up to
+        // MAX at the viewport edge. Never drops to zero again until the
+        // pointer comes back into the centre band.
+        velocity = sign * (SELECTION_AUTOSCROLL_BASE_VELOCITY
+          + fraction * (SELECTION_AUTOSCROLL_MAX_VELOCITY - SELECTION_AUTOSCROLL_BASE_VELOCITY));
+      }
+      const beforeTxTop = $tx.scrollTop;
+      const beforeWinY = window.scrollY;
+      if (velocity !== 0) scrollViewportBy(velocity);
+      const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
-      pendingDragMove = null;
+      // Throttled diagnostic KPI: lets us see from server-side KPI alone
+      // whether auto-scroll is firing and the extent is advancing.
+      if (now - _dragDebugLastEmitAt > 250) {
+        _dragDebugLastEmitAt = now;
+        logKPI('ui.drag.tick_debug', {
+          x, y,
+          innerH: window.innerHeight,
+          innerW: window.innerWidth,
+          recentlyMoved,
+          dist: distFromCenter,
+          dead_zone: SELECTION_AUTOSCROLL_DEAD_ZONE_PX,
+          edge_zone: MOVE_DRAG_AUTOSCROLL_EDGE_PX,
+          velocity,
+          tx_top_before: beforeTxTop,
+          tx_top_after: $tx.scrollTop,
+          tx_scroll_height: $tx.scrollHeight,
+          tx_client_height: $tx.clientHeight,
+          win_y_before: beforeWinY,
+          win_y_after: window.scrollY,
+          doc_height: document.documentElement.scrollHeight,
+          hit_word_idx: w ? w.idx : null,
+          extent: state.selection ? state.selection.extent : null,
+          anchor: state.selection ? state.selection.anchor : null,
+          drag_anchor: dragAnchor,
+          paint_we: state.selectionPainted ? state.selectionPainted.we : null,
+        });
+      }
+      // Intentionally NOT nulling pendingDragMove: a stationary pointer
+      // must keep the rAF tick running so when the user resumes moving
+      // (within ACTIVITY_MS) scroll picks back up. The "no-op for same
+      // extent" guard in extendSelectionDrag keeps per-frame work tiny.
     }
     requestAnimationFrame(dragMoveTick);
   }
@@ -917,21 +1293,60 @@
   }
 
   function renderSelection() {
+    // Differential paint: only flip classes on the symmetric difference
+    // between the previously-painted range and the new range. Drag
+    // selection on a 30-min podcast hits this at ~60Hz, so the old
+    // "iterate every word" loop was the dominant cost (1000+ classList
+    // ops per frame). The diff path touches at most ~2 words per frame.
     const r = selectionRange();
-    for (const w of words) w.el.classList.remove('selected');
-    if (r) for (let i = r.ws; i <= r.we; i++) words[i].el.classList.add('selected');
+    const prev = state.selectionPainted || null;
+    if (prev && r && prev.ws === r.ws && prev.we === r.we) {
+      // identical range — no DOM work
+    } else {
+      if (prev) {
+        for (let i = prev.ws; i <= prev.we; i++) {
+          if (!r || i < r.ws || i > r.we) {
+            const w = words[i];
+            if (w) w.el.classList.remove('selected');
+          }
+        }
+      }
+      if (r) {
+        for (let i = r.ws; i <= r.we; i++) {
+          if (!prev || i < prev.ws || i > prev.we) {
+            const w = words[i];
+            if (w) w.el.classList.add('selected');
+          }
+        }
+      }
+      state.selectionPainted = r ? { ws: r.ws, we: r.we } : null;
+    }
     $btnDelete.disabled = !state.hasActive || !r;
     $btnCut.disabled = !state.hasActive || !r;
     $btnClear.disabled = !state.hasActive || !r;
   }
 
   function setSelection(anchor, extent) {
+    // No-op when the selection didn't actually change — keeps mouseenter
+    // + rAF backstop from doing redundant work on the same word.
+    if (state.selection && state.selection.anchor === anchor && state.selection.extent === extent) return;
     state.selection = { anchor, extent };
     renderSelection();
   }
 
   function renderPasteAnchor() {
-    for (const w of words) w.el.classList.toggle('paste-anchor', state.pasteAnchor === w.idx);
+    // Differential paint: flip the class only on the word whose paste
+    // anchor membership changed. The previous version iterated every
+    // word — cheap for short clips, but unnecessary churn elsewhere.
+    if (state.pasteAnchorPainted !== state.pasteAnchor) {
+      if (state.pasteAnchorPainted != null && words[state.pasteAnchorPainted]) {
+        words[state.pasteAnchorPainted].el.classList.remove('paste-anchor');
+      }
+      if (state.pasteAnchor != null && words[state.pasteAnchor]) {
+        words[state.pasteAnchor].el.classList.add('paste-anchor');
+      }
+      state.pasteAnchorPainted = state.pasteAnchor;
+    }
     const canPaste = state.hasActive && !!state.clipboard && state.pasteAnchor != null;
     $btnPasteBefore.disabled = !canPaste;
     $btnPasteAfter.disabled = !canPaste;
@@ -969,34 +1384,136 @@
     }
 
     const next = Math.max(0, Math.min(words.length - 1, extent + dir));
-    const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
-    const candidateTLSeg = wordTimelineSegmentIndex(words[next]);
-    if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
-      if (!hadSelection) setSelection(anchor, anchor);
-      return;
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[next]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+        if (!hadSelection) setSelection(anchor, anchor);
+        return;
+      }
     }
     setSelection(anchor, next);
     logKPI('ui.keyboard.select', { anchor, extent: next, direction: dir });
   }
 
+  function extendSelectionByLine(dir) {
+    // Shift+ArrowDown / Shift+ArrowUp: jump the extent one *visual line*
+    // instead of one word. Walk neighbouring words by index until rect.top
+    // changes (= we crossed a line break), then keep scanning that new
+    // line for the word whose horizontal centre is closest to the current
+    // extent's x. Linear in line length, not in word count.
+    if (dir !== -1 && dir !== 1 || words.length === 0) return;
+    let anchor, extent;
+    const hadSelection = !!state.selection;
+    if (hadSelection) {
+      anchor = state.selection.anchor;
+      extent = state.selection.extent;
+    } else {
+      if (activeIdx < 0) return;
+      anchor = activeIdx;
+      extent = activeIdx;
+    }
+    const cur = words[extent];
+    if (!cur) return;
+    const curRect = cur.el.getBoundingClientRect();
+    const targetX = curRect.left + curRect.width / 2;
+    const startLineTop = curRect.top;
+    const LINE_EPS = 2;  // tolerate sub-pixel rounding
+
+    // Phase 1: scan to the first word on a different line in `dir`.
+    let i = extent + dir;
+    let nextLineTop = null;
+    while (i >= 0 && i < words.length) {
+      const r = words[i].el.getBoundingClientRect();
+      if (Math.abs(r.top - startLineTop) > LINE_EPS) { nextLineTop = r.top; break; }
+      i += dir;
+    }
+    if (nextLineTop === null) {
+      // Already on the first/last visual line — collapse caret to whichever
+      // edge the user asked for, matching native textarea behaviour.
+      const edge = dir > 0 ? words.length - 1 : 0;
+      setSelection(anchor, edge);
+      logKPI('ui.keyboard.select.line', { anchor, extent: edge, direction: dir, edge: true });
+      return;
+    }
+
+    // Phase 2: scan that entire line, pick the word whose centre is
+    // closest to targetX. `i` is the first word on the new line.
+    let bestIdx = i;
+    let bestDist = Math.abs((() => {
+      const r = words[i].el.getBoundingClientRect();
+      return r.left + r.width / 2 - targetX;
+    })());
+    let j = i + dir;
+    while (j >= 0 && j < words.length) {
+      const r = words[j].el.getBoundingClientRect();
+      if (Math.abs(r.top - nextLineTop) > LINE_EPS) break;
+      const dx = Math.abs(r.left + r.width / 2 - targetX);
+      if (dx < bestDist) { bestDist = dx; bestIdx = j; }
+      j += dir;
+    }
+
+    if (!isTimelineMonotonic()) {
+      const anchorTLSeg = wordTimelineSegmentIndex(words[anchor]);
+      const candidateTLSeg = wordTimelineSegmentIndex(words[bestIdx]);
+      if (anchorTLSeg >= 0 && candidateTLSeg !== anchorTLSeg) {
+        // Don't cross a move-op timeline boundary; clamp at the last word
+        // that's still inside the anchor's segment.
+        let clamped = bestIdx;
+        while (clamped !== extent) {
+          const seg = wordTimelineSegmentIndex(words[clamped]);
+          if (seg === anchorTLSeg) break;
+          clamped += dir > 0 ? -1 : 1;
+        }
+        if (clamped !== extent) {
+          setSelection(anchor, clamped);
+          const clampedWord = words[clamped];
+          if (clampedWord) clampedWord.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+          logKPI('ui.keyboard.select.line', { anchor, extent: clamped, direction: dir, clamped: true });
+        }
+        return;
+      }
+    }
+    setSelection(anchor, bestIdx);
+    // Scroll the new extent into view so the user can see where they are.
+    const newExt = words[bestIdx];
+    if (newExt) newExt.el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+    logKPI('ui.keyboard.select.line', { anchor, extent: bestIdx, direction: dir });
+  }
+
   // ------- ops -------
   function applyDeleteRange(start, end) {
-    if (end <= start) return;
+    return applyDeleteRanges([{ start, end, note: null }], 'manual');
+  }
+
+  function applyDeleteRanges(ranges, source) {
+    const valid = ranges.filter((r) => r && r.end > r.start);
+    if (valid.length === 0) return 0;
     // Any edit invalidates the rendered preview — jump back to the source so
     // the user isn't auditioning a stale render. revertToSource bumps
     // renderSeq, so any in-flight Audition response is also discarded.
     if (state.previewMode) revertToSource('apply-delete');
     else state.renderSeq += 1;  // still bump so a stale response can't land on us
-    const op = { op_id: newOpId(), op: 'delete', start, end, note: null };
-    state.ops.push(op);
-    state.undoStack.push({ type: 'add', op });
+    for (const r of valid) {
+      const op = { op_id: newOpId(), op: 'delete', start: r.start, end: r.end, note: r.note || null };
+      state.ops.push(op);
+      state.undoStack.push({ type: 'add', op });
+      logKPI('ui.op.delete', {
+        op_id: op.op_id,
+        start: r.start,
+        end: r.end,
+        duration: r.end - r.start,
+        source,
+        note: op.note,
+      });
+    }
     state.redoStack = [];
-    kpi.opsCount += 1;
+    kpi.opsCount += valid.length;
     if (!kpi.firstOpAt) kpi.firstOpAt = Date.now() / 1000;
-    logKPI('ui.op.delete', { op_id: op.op_id, start, end, duration: end - start });
     rerenderOps();
     refreshButtons();
     scheduleSave();
+    return valid.length;
   }
 
   function deleteSelected() {
@@ -1018,6 +1535,19 @@
 
   function applyMoveRange(srcStart, srcEnd, targetEditedT) {
     if (srcEnd <= srcStart || targetEditedT < 0) return;
+    // No-op guard: dropping a range back onto its own current edited
+    // position would add a Move op that produces zero observable change
+    // but still occupies an Undo slot and a render-cache invalidation.
+    // Skip it so the editor's history stays clean.
+    const currentEditedStart = sourceToEdited(srcStart);
+    if (Math.abs(targetEditedT - currentEditedStart) < 1e-3) {
+      logKPI('ui.op.move.no_op', {
+        src_start: srcStart, src_end: srcEnd,
+        target_edited_t: targetEditedT,
+        current_edited_start: currentEditedStart,
+      });
+      return;
+    }
     if (state.previewMode) revertToSource('apply-move');
     else state.renderSeq += 1;
     const op = {
@@ -1044,8 +1574,33 @@
     state.pasteAnchor = null;
     rerenderOps();
     renderPasteAnchor();
+    // Keep the moved range selected so the editor can immediately keep
+    // working with it (delete, re-move, audition). After rerenderOps()
+    // the words are in their new edited-order positions; we find them
+    // by their source-time range since that's invariant across the move.
+    const movedRange = wordRangeFromSourceSpan(srcStart, srcEnd);
+    if (movedRange) {
+      state.selection = { anchor: movedRange.ws, extent: movedRange.we };
+      renderSelection();
+    }
     refreshButtons();
     scheduleSave();
+  }
+
+  function wordRangeFromSourceSpan(srcStart, srcEnd) {
+    // Find the contiguous index range of words whose source-time span
+    // overlaps [srcStart, srcEnd]. The set is contiguous because the
+    // moved span is a single source range and rerenderOps re-emits each
+    // word once. Use word.idx (not loop index) so the result is stable
+    // even if the words[] array is re-sorted by the renderer later.
+    let ws = -1, we = -1;
+    for (const w of words) {
+      if (w.start >= srcEnd - 1e-6 || w.end <= srcStart + 1e-6) continue;
+      if (ws < 0 || w.idx < ws) ws = w.idx;
+      if (we < 0 || w.idx > we) we = w.idx;
+    }
+    if (ws < 0 || we < 0) return null;
+    return { ws, we };
   }
 
   function findPlayheadWord() {
@@ -1132,6 +1687,7 @@
       const inCut = !inCompiledTimeline || state.mergedDeletes.some(([s, e]) => w.start >= s && w.end <= e);
       w.el.classList.toggle('deleted', inCut);
     }
+    renderAnnotations();
     renderPasteAnchor();
     updateStats();
   }
@@ -1207,6 +1763,286 @@
     }
   }
 
+  function recommendedFillerAnnotations() {
+    return state.annotations.filter((ann) =>
+      ann
+      && ann.type === 'filler'
+      && ann.delete_recommended
+      && Number.isFinite(ann.start)
+      && Number.isFinite(ann.end)
+      && ann.end > ann.start
+    );
+  }
+
+  function rangeCoveredByDelete(start, end) {
+    const eps = 1e-3;
+    return state.mergedDeletes.some(([s, e]) => s <= start + eps && e >= end - eps);
+  }
+
+  function rangeOverlapsAnyDelete(start, end) {
+    // Codex review: partial overlap between a recommended filler and an
+    // existing delete would otherwise stay "addable" and produce a second
+    // overlapping delete op. Filter them out — the user can still delete
+    // any leftover word manually.
+    const eps = 1e-3;
+    return state.mergedDeletes.some(([s, e]) => e > start + eps && s < end - eps);
+  }
+
+  function addableFillerAnnotations() {
+    return recommendedFillerAnnotations().filter((ann) =>
+      !rangeCoveredByDelete(ann.start, ann.end)
+      && !rangeOverlapsAnyDelete(ann.start, ann.end)
+    );
+  }
+
+  function renderAnnotations() {
+    for (const w of words) {
+      w.el.classList.remove('annotation-filler', 'annotation-aizuchi', 'annotation-recommended');
+      w.el.removeAttribute('data-annotation');
+      w.el.title = '';
+    }
+    for (const ann of state.annotations) {
+      const ids = Array.isArray(ann.word_ids) ? ann.word_ids : [];
+      const cls = ann.type === 'filler' ? 'annotation-filler'
+        : ann.type === 'aizuchi' ? 'annotation-aizuchi'
+        : null;
+      if (!cls) continue;
+      const title = ann.type === 'filler'
+        ? `フィラー候補 (${Math.round((ann.confidence || 0) * 100)}%)`
+        : `相槌候補 (${Math.round((ann.confidence || 0) * 100)}%)`;
+      for (const rawId of ids) {
+        const word = wordById.get(String(rawId));
+        if (!word) continue;
+        word.el.classList.add(cls);
+        if (ann.delete_recommended) word.el.classList.add('annotation-recommended');
+        word.el.dataset.annotation = ann.type;
+        word.el.title = title;
+      }
+    }
+    updateFillerControls();
+  }
+
+  function updateFillerControls() {
+    if (!$btnAddFillers || !$fillerCount) return;
+    const count = state.hasActive ? addableFillerAnnotations().length : 0;
+    $fillerCount.textContent = String(count);
+    $btnAddFillers.disabled = !state.hasActive || count === 0;
+    $btnAddFillers.title = count > 0
+      ? `${count} 件の推奨フィラー候補を削除候補に追加`
+      : '推奨フィラー候補はありません';
+  }
+
+  function addRecommendedFillers() {
+    // Replaces the old "apply all at once" behaviour with a per-candidate
+    // review modal. Editors specifically asked to see what would be cut
+    // before committing — auto-deleting 30+ ranges blind is too scary.
+    showFillersReviewModal();
+  }
+  function applySelectedFillerAnnotations(annIds) {
+    // Re-derive addableFillerAnnotations() so ops applied while the modal
+    // was open are naturally excluded; intersect with the user's checked set.
+    const want = new Set(annIds);
+    const candidates = addableFillerAnnotations().filter((a) => want.has(a.id));
+    if (!candidates.length) return 0;
+    const ranges = candidates.map((ann) => ({
+      start: ann.start,
+      end: ann.end,
+      note: `filler:${ann.id}`,
+    }));
+    const added = applyDeleteRanges(ranges, 'annotation.filler.reviewed');
+    if (added > 0) {
+      clearSelection();
+      logKPI('ui.annotation.fillers.added', { count: added, source: 'review' });
+    }
+    return added;
+  }
+
+  // ------- filler review modal -------
+  const $fillersModal = $('fillers-modal');
+  const $btnFillersClose = $('btn-fillers-close');
+  const $fillersList = $('fillers-list');
+  const $fillersStatus = $('fillers-status');
+  const $fillersSelectedCount = $('fillers-selected-count');
+  const $btnFillersApply = $('btn-fillers-apply');
+  const $btnFillersSelectAll = $('btn-fillers-select-all');
+  const $btnFillersClear = $('btn-fillers-clear');
+  let fillersReturnFocus = null;
+  let fillersApplyInFlight = false;
+
+  function fillerContextText(ann, before = 4, after = 4) {
+    // Build the "…前 [対象] 後…" snippet by walking the word list around
+    // the annotation's first/last word. Full bounds check on word.idx
+    // (integer in [0, words.length)) so we never index out of range.
+    const ids = Array.isArray(ann.word_ids) ? ann.word_ids : [];
+    let firstIdx = -1, lastIdx = -1;
+    for (const rawId of ids) {
+      const w = wordById.get(String(rawId));
+      if (w && Number.isInteger(w.idx) && w.idx >= 0 && w.idx < words.length) {
+        if (firstIdx < 0 || w.idx < firstIdx) firstIdx = w.idx;
+        if (lastIdx < 0 || w.idx > lastIdx) lastIdx = w.idx;
+      }
+    }
+    if (firstIdx < 0) {
+      // time-based fallback: strict overlap (not touching) so we don't pick
+      // up the neighbour word just because its boundary happens to align.
+      for (let i = 0; i < words.length; i++) {
+        if (words[i].end > ann.start + 1e-6 && words[i].start < ann.end - 1e-6) {
+          if (firstIdx < 0) firstIdx = i;
+          lastIdx = i;
+        }
+      }
+    }
+    if (firstIdx < 0) return { before: '', target: '(該当語が見つかりません)', after: '' };
+    const lo = Math.max(0, firstIdx - before);
+    const hi = Math.min(words.length - 1, lastIdx + after);
+    let beforeStr = '';
+    for (let i = lo; i < firstIdx; i++) beforeStr += (words[i].el?.textContent || '');
+    let targetStr = '';
+    for (let i = firstIdx; i <= lastIdx; i++) targetStr += (words[i].el?.textContent || '');
+    let afterStr = '';
+    for (let i = lastIdx + 1; i <= hi; i++) afterStr += (words[i].el?.textContent || '');
+    return { before: beforeStr.trim(), target: targetStr.trim(), after: afterStr.trim() };
+  }
+
+  function refreshFillersSelectedCount() {
+    const checked = $fillersList.querySelectorAll('input[type="checkbox"]:checked').length;
+    $fillersSelectedCount.textContent = `${checked} 件選択中`;
+    $btnFillersApply.disabled = fillersApplyInFlight || checked === 0;
+  }
+
+  function renderFillersList() {
+    // DocumentFragment so 30+ rows don't trigger 30+ layout passes.
+    $fillersList.innerHTML = '';
+    const candidates = addableFillerAnnotations();
+    if (candidates.length === 0) {
+      $fillersStatus.textContent = '推奨フィラー候補はありません。';
+      $btnFillersApply.disabled = true;
+      $fillersSelectedCount.textContent = '0 件選択中';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    const seenIds = new Set();
+    let renderedCount = 0;
+    for (const ann of candidates) {
+      // Defence in depth: if two annotations share an id, skip the duplicate
+      // so a single checkbox toggle can never apply two ranges.
+      if (!ann.id || seenIds.has(ann.id)) continue;
+      seenIds.add(ann.id);
+      renderedCount += 1;
+      const li = document.createElement('li');
+      const label = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;  // default-on: matches the old "apply all" behaviour
+      cb.dataset.annId = ann.id;
+      cb.addEventListener('change', refreshFillersSelectedCount);
+      const time = document.createElement('span');
+      time.className = 'filler-time';
+      time.textContent = fmt(ann.start);
+      const ctx = fillerContextText(ann);
+      const text = document.createElement('span');
+      text.className = 'filler-text';
+      const beforeSpan = document.createElement('span');
+      beforeSpan.className = 'filler-context';
+      beforeSpan.textContent = ctx.before ? `…${ctx.before} ` : '';
+      const targetSpan = document.createElement('span');
+      targetSpan.className = 'filler-target';
+      targetSpan.textContent = ctx.target;
+      const afterSpan = document.createElement('span');
+      afterSpan.className = 'filler-context';
+      afterSpan.textContent = ctx.after ? ` ${ctx.after}…` : '';
+      text.append(beforeSpan, targetSpan, afterSpan);
+      const conf = document.createElement('span');
+      conf.className = 'filler-conf';
+      conf.textContent = `${Math.round((ann.confidence || 0) * 100)}%`;
+      label.append(cb, time, text, conf);
+      const btnPreview = document.createElement('button');
+      btnPreview.type = 'button';
+      btnPreview.className = 'preview';
+      btnPreview.textContent = '聞く';
+      btnPreview.title = 'この候補の開始位置を再生';
+      btnPreview.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        $player.currentTime = ann.start;
+        const p = $player.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+        logKPI('ui.annotation.fillers.preview', { id: ann.id, t: ann.start });
+      });
+      li.append(label, btnPreview);
+      frag.appendChild(li);
+    }
+    $fillersList.appendChild(frag);
+    // Report what we actually rendered (post-dedup), not raw candidates.
+    if (renderedCount === 0) {
+      $fillersStatus.textContent = '推奨フィラー候補はありません。';
+      $btnFillersApply.disabled = true;
+      $fillersSelectedCount.textContent = '0 件選択中';
+      return;
+    }
+    $fillersStatus.textContent = `${renderedCount} 件の候補`;
+    refreshFillersSelectedCount();
+  }
+
+  function showFillersReviewModal() {
+    if (!$fillersModal) return;
+    fillersReturnFocus = document.activeElement;
+    $fillersModal.hidden = false;
+    fillersApplyInFlight = false;
+    renderFillersList();
+    setTimeout(() => $btnFillersClose && $btnFillersClose.focus(), 50);
+    logKPI('ui.annotation.fillers.review_open');
+  }
+  function hideFillersReviewModal() {
+    if ($fillersModal) $fillersModal.hidden = true;
+    if (fillersReturnFocus && typeof fillersReturnFocus.focus === 'function') {
+      try { fillersReturnFocus.focus(); } catch (_) {}
+    }
+    fillersReturnFocus = null;
+  }
+  if ($btnFillersClose) $btnFillersClose.addEventListener('click', hideFillersReviewModal);
+  if ($fillersModal) {
+    $fillersModal.addEventListener('click', (ev) => {
+      if (ev.target === $fillersModal) hideFillersReviewModal();
+    });
+  }
+  if ($btnFillersSelectAll) {
+    $btnFillersSelectAll.addEventListener('click', () => {
+      $fillersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
+      refreshFillersSelectedCount();
+    });
+  }
+  if ($btnFillersClear) {
+    $btnFillersClear.addEventListener('click', () => {
+      $fillersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+      refreshFillersSelectedCount();
+    });
+  }
+  if ($btnFillersApply) {
+    $btnFillersApply.addEventListener('click', () => {
+      if (fillersApplyInFlight) return;
+      const ids = Array.from($fillersList.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((cb) => cb.dataset.annId)
+        .filter(Boolean);
+      if (ids.length === 0) return;
+      fillersApplyInFlight = true;
+      $btnFillersApply.disabled = true;
+      try {
+        const added = applySelectedFillerAnnotations(ids);
+        hideFillersReviewModal();
+        if (added === 0) {
+          setModePill('error', 'no fillers applied');
+          setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+            state.previewMode ? 'preview' : 'source'), 1500);
+        }
+      } finally {
+        fillersApplyInFlight = false;
+      }
+    });
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $fillersModal && !$fillersModal.hidden) hideFillersReviewModal();
+  });
+
   function refreshButtons() {
     $btnUndo.disabled = !state.hasActive || state.undoStack.length === 0;
     $btnRedo.disabled = !state.hasActive || state.redoStack.length === 0;
@@ -1216,6 +2052,12 @@
     $btnPlay.disabled = !state.hasActive;
     $scrubber.disabled = !state.hasActive;
     $exportFormat.disabled = !state.hasActive;
+    if ($btnExportClip) {
+      // Honour an in-progress clip export so refreshButtons() from a parallel
+      // path (autosave / op apply) can't re-enable the button mid-render.
+      $btnExportClip.disabled = state.exportingClip || !state.hasActive || !state.selection;
+    }
+    updateFillerControls();
   }
 
   function updateStats() {
@@ -1225,14 +2067,22 @@
     $kpiCut.textContent = fmtMs(cut);
   }
 
+  // Session elapsed counter is intentionally only updated when the DOM
+  // element exists. The toolbar used to show it next to ops/cut, but the
+  // ticker pushed the toolbar width around every minute and the editor
+  // wanted it gone. KPI events still carry sessionStartedAt so a downstream
+  // analysis can recover the same number off-screen.
   function tickElapsed() {
+    if (!$kpiElapsed) return;
     const elapsed = Math.floor(Date.now() / 1000 - kpi.sessionStartedAt);
     const m = Math.floor(elapsed / 60);
     const s = elapsed % 60;
     $kpiElapsed.textContent = `${m}:${String(s).padStart(2, '0')}`;
   }
-  setInterval(tickElapsed, 1000);
-  tickElapsed();
+  if ($kpiElapsed) {
+    setInterval(tickElapsed, 1000);
+    tickElapsed();
+  }
 
   // ------- autosave -------
   function setSaveStatus(s) {
@@ -1295,7 +2145,6 @@
   }
 
   // ------- preview-skip + highlight -------
-  let activeIdx = -1;
   function findActive(t) {
     let lo = 0, hi = words.length - 1, ans = -1;
     while (lo <= hi) {
@@ -1350,7 +2199,11 @@
     // In preview mode the audio source IS the rendered file, so currentTime
     // is already in edited space; sourceToEdited would double-map.
     const edt = state.previewMode ? t : sourceToEdited(t);
-    $kpiTime.textContent = `${t.toFixed(2)}s`;
+    // Toolbar source-time readout used to shake the layout every frame (the
+    // 0.00s → 1278.72s digit-count change re-flowed neighbouring spans).
+    // The element no longer exists in the default layout, but the
+    // per-frame write stays null-safe for users who add it back via CSS.
+    if ($kpiTime) $kpiTime.textContent = `${t.toFixed(2)}s`;
 
     // Mirror the playhead into the edited timeline displays — unless the user
     // is actively dragging the scrubber, in which case they own those values.
@@ -1416,7 +2269,10 @@
       if (activeIdx >= 0) words[activeIdx].el.classList.remove('active');
       if (idx >= 0) {
         words[idx].el.classList.add('active');
-        scrollIfOffscreen(words[idx].el);
+        // Only follow the playhead when the user explicitly opted in. Default
+        // OFF lets them edit a distant part of the audio without the screen
+        // snapping back every time the active word changes.
+        if (followPlayhead) scrollIfOffscreen(words[idx].el);
       }
       activeIdx = idx;
     }
@@ -1433,6 +2289,220 @@
   $btnCut.addEventListener('click', cutSelected);
   $btnPasteBefore.addEventListener('click', () => pasteClipboard('before'));
   $btnPasteAfter.addEventListener('click', () => pasteClipboard('after'));
+
+  // ------- transcript search -------
+  // Free-text search across the rendered words. Editors specifically asked
+  // for "type a phrase, jump to that moment" — much faster than scrubbing a
+  // 30-min episode when they remember the wording but not the time. Match
+  // is a case-insensitive, NFKC-normalised substring against the full
+  // concatenated transcript text (see buildSearchIndex below). Word-by-
+  // word matching was tried first but missed every phrase that crossed
+  // even one ASR word boundary, which is most ja phrases in practice.
+  // Kana folding is NOT applied — query and transcript both go through
+  // the same NFKC + lowercase pipeline, so ASCII case and width
+  // differences are absorbed but hiragana ↔ katakana still distinguish.
+  const $searchInput = $('search-input');
+  const $searchInfo = $('search-info');
+  const $btnSearchNext = $('btn-search-next');
+  const $btnSearchPrev = $('btn-search-prev');
+  let searchMatches = [];       // ascending word indices
+  let searchActiveIdx = -1;     // index INTO searchMatches
+  let searchPaintedActive = -1; // word idx currently wearing .search-active
+  // searchFullText / searchWordStart / searchWordEnd / searchIndexBuiltFor
+  // are declared up next to `words` so loadActiveAndRender() can reset
+  // them before this wiring runs (otherwise TDZ would crash boot).
+  function buildSearchIndex() {
+    const N = words.length;
+    if (searchIndexBuiltFor === N) return;
+    let buf = '';
+    const starts = new Int32Array(N);
+    const ends = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      starts[i] = buf.length;
+      // Normalise on the way in (NFKC) so full-width / half-width / kana-
+      // width differences between the editor's query and the ASR output
+      // don't cause silent misses. Lowercase for case-insensitive ASCII.
+      const t = (words[i].el?.textContent || '').normalize('NFKC').toLowerCase();
+      buf += t;
+      ends[i] = buf.length;
+    }
+    searchFullText = buf;
+    searchWordStart = starts;
+    searchWordEnd = ends;
+    searchIndexBuiltFor = N;
+  }
+  function wordIndexAtChar(c) {
+    // Binary search: find the word whose [start, end) contains char c.
+    // Used to map match boundaries back to word ranges.
+    if (!searchWordStart) return -1;
+    const N = searchWordStart.length;
+    if (N === 0 || c < 0) return -1;
+    let lo = 0, hi = N - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (c < searchWordStart[mid]) hi = mid - 1;
+      else if (c >= searchWordEnd[mid]) lo = mid + 1;
+      else return mid;
+    }
+    // Past the last word's end — clamp to last (callers use this for end-1).
+    return c >= searchWordEnd[N - 1] ? N - 1 : -1;
+  }
+
+  function clearSearchHighlights() {
+    for (const i of searchMatches) {
+      const w = words[i];
+      if (w && w.el) w.el.classList.remove('search-hit', 'search-active');
+    }
+    if (searchPaintedActive >= 0 && words[searchPaintedActive]) {
+      words[searchPaintedActive].el.classList.remove('search-active');
+    }
+    searchPaintedActive = -1;
+  }
+  function updateSearchInfo() {
+    if (!$searchInfo) return;
+    if (searchMatches.length === 0) {
+      $searchInfo.hidden = !$searchInput.value;
+      $searchInfo.textContent = $searchInput.value ? '0 件' : '0 / 0';
+      $searchInfo.classList.toggle('no-hits', !!$searchInput.value);
+    } else {
+      $searchInfo.hidden = false;
+      $searchInfo.classList.remove('no-hits');
+      $searchInfo.textContent = `${searchActiveIdx + 1} / ${searchMatches.length}`;
+    }
+    if ($btnSearchNext) $btnSearchNext.disabled = searchMatches.length === 0;
+    if ($btnSearchPrev) $btnSearchPrev.disabled = searchMatches.length === 0;
+  }
+  function paintSearchActive() {
+    // Move .search-active off the previous match onto the current one.
+    // .search-hit stays on every match across navigation.
+    if (searchPaintedActive >= 0 && words[searchPaintedActive]) {
+      words[searchPaintedActive].el.classList.remove('search-active');
+    }
+    searchPaintedActive = -1;
+    if (searchActiveIdx < 0 || searchActiveIdx >= searchMatches.length) return;
+    const wIdx = searchMatches[searchActiveIdx];
+    const w = words[wIdx];
+    if (!w || !w.el) return;
+    w.el.classList.add('search-active');
+    searchPaintedActive = wIdx;
+    try { w.el.scrollIntoView({ block: 'center', behavior: 'auto' }); } catch (_) {}
+    if ($player && Number.isFinite(w.start)) $player.currentTime = w.start;
+    logKPI('ui.search.jump', { word_idx: wIdx, t: w.start, match_index: searchActiveIdx });
+  }
+  function runSearch(query) {
+    clearSearchHighlights();
+    searchMatches = [];
+    searchActiveIdx = -1;
+    const q = (query || '').trim();
+    if (!q) { updateSearchInfo(); return; }
+    buildSearchIndex();
+    // Split on whitespace so the editor can paste several candidate
+    // spellings at once. NFKC + lowercase to align with the index. Tokens
+    // shorter than 2 chars are dropped — single ja chars ("と", "の") would
+    // false-positive on most of the transcript. ASCII "AI" etc. is allowed
+    // when the user types it explicitly via a longer phrase context.
+    const needles = q.normalize('NFKC').toLowerCase().split(/\s+/)
+      .filter(Boolean)
+      .filter((n) => n.length >= 2);
+    if (needles.length === 0) {
+      // The user typed only single-char tokens; still log so we can tell
+      // "no hits because filtered" apart from "no hits because no match".
+      updateSearchInfo();
+      logKPI('ui.search.query', { q, tokens: 0, hits: 0, dropped_short: true });
+      return;
+    }
+    // Full-text scan: find every (overlapping-safe) occurrence of every
+    // needle in the concatenated transcript, then walk the affected char
+    // span back to the word indices it covers. Words are de-duped via Set
+    // so two needles hitting the same word don't double-count.
+    const hitSet = new Set();
+    for (const n of needles) {
+      let from = 0;
+      while (true) {
+        const idx = searchFullText.indexOf(n, from);
+        if (idx < 0) break;
+        const startWord = wordIndexAtChar(idx);
+        const endWord = wordIndexAtChar(idx + n.length - 1);
+        if (startWord >= 0 && endWord >= 0) {
+          for (let i = startWord; i <= endWord; i++) hitSet.add(i);
+        }
+        // Advance by 1 so overlapping matches ("ABA" in "ABABA") aren't
+        // skipped. Word-level dedup above keeps the cost bounded.
+        from = idx + 1;
+      }
+    }
+    searchMatches = Array.from(hitSet).sort((a, b) => a - b);
+    for (const i of searchMatches) {
+      const w = words[i];
+      if (w && w.el) w.el.classList.add('search-hit');
+    }
+    if (searchMatches.length > 0) {
+      // Default to the first match at/after the current playhead so a
+      // mid-listening search jumps forward rather than back to t=0.
+      const t = $player ? $player.currentTime : 0;
+      let pick = 0;
+      for (let k = 0; k < searchMatches.length; k++) {
+        if (words[searchMatches[k]].start >= t - 0.05) { pick = k; break; }
+      }
+      searchActiveIdx = pick;
+      paintSearchActive();
+    }
+    updateSearchInfo();
+    logKPI('ui.search.query', { q, tokens: needles.length, hits: searchMatches.length });
+  }
+  function searchNext() {
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx + 1) % searchMatches.length;
+    paintSearchActive(); updateSearchInfo();
+  }
+  function searchPrev() {
+    if (searchMatches.length === 0) return;
+    searchActiveIdx = (searchActiveIdx - 1 + searchMatches.length) % searchMatches.length;
+    paintSearchActive(); updateSearchInfo();
+  }
+  if ($searchInput) {
+    let searchDebounce = null;
+    $searchInput.addEventListener('input', () => {
+      clearTimeout(searchDebounce);
+      const val = $searchInput.value;
+      searchDebounce = setTimeout(() => {
+        runSearch(val);
+        $searchInput.dataset.lastQuery = val;
+      }, 120);
+    });
+    $searchInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        clearTimeout(searchDebounce);
+        if (searchMatches.length === 0 || $searchInput.value !== ($searchInput.dataset.lastQuery || '')) {
+          runSearch($searchInput.value);
+          $searchInput.dataset.lastQuery = $searchInput.value;
+          return;
+        }
+        if (ev.shiftKey) searchPrev(); else searchNext();
+        return;
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        $searchInput.value = '';
+        runSearch('');
+        $searchInput.dataset.lastQuery = '';
+        $searchInput.blur();
+      }
+    });
+  }
+  if ($btnSearchNext) $btnSearchNext.addEventListener('click', searchNext);
+  if ($btnSearchPrev) $btnSearchPrev.addEventListener('click', searchPrev);
+  // Focus the search box on "/" (Slack/GitHub/Twitter convention).
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== '/' || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const tag = (ev.target && ev.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (ev.target && ev.target.isContentEditable)) return;
+    if (!$searchInput) return;
+    ev.preventDefault();
+    $searchInput.focus();
+    $searchInput.select();
+  });
 
   // ------- custom player controls -------
   $btnPlay.addEventListener('click', () => {
@@ -1643,6 +2713,78 @@
   }
   $btnExport.addEventListener('click', exportEditedAudio);
 
+  async function exportSelectedClip() {
+    if (!state.hasActive || !state.selection) return;
+    const sel = selectionRange();
+    if (!sel) return;
+    // Build keeps from the intersection of the selected source range and the
+    // current timeline. This way deletes inside the selection are honoured
+    // (the user gets the edited version of those 10 seconds, not the raw
+    // source-time slice with the cut audio re-introduced).
+    const keeps = [];
+    for (const seg of state.timeline) {
+      const s = Math.max(sel.start, seg.sourceStart);
+      const e = Math.min(sel.end, seg.sourceEnd);
+      if (e > s + 1e-6) keeps.push({ source_start: s, source_end: e });
+    }
+    if (keeps.length === 0) {
+      setModePill('error', 'empty clip');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 1500);
+      logKPI('ui.export.clip.empty', { sel_start: sel.start, sel_end: sel.end });
+      return;
+    }
+    const fmt = $exportFormat.value === 'wav' ? 'wav' : 'mp3';
+    const prevLabel = $btnExportClip.textContent;
+    state.exportingClip = true;
+    $btnExportClip.disabled = true;
+    $btnExportClip.textContent = fmt === 'mp3' ? 'render+mp3…' : 'render…';
+    const t0 = performance.now();
+    try {
+      // Flush autosave first so the timeline we just sampled keeps[] from
+      // matches what the server has on disk.
+      await flushSave();
+      const r = await fetch('/api/export/clip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keeps, fmt }),
+      });
+      if (!r.ok) {
+        let detail = `HTTP ${r.status}`;
+        try { const j = await r.json(); if (j.detail) detail = j.detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      // The clip route returns the bytes directly (no separate /export GET
+      // step). We stream into a blob URL so the browser save dialog fires.
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `clip.${fmt}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke after a short delay so the browser has time to actually
+      // download. Premature revoke can abort the save on some browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      logKPI('ui.export.clip', {
+        fmt, sel_start: sel.start, sel_end: sel.end,
+        keep_count: keeps.length, latency_ms: performance.now() - t0,
+        bytes: blob.size,
+      });
+    } catch (e) {
+      setModePill('error', 'clip error');
+      setTimeout(() => setModePill(state.previewMode ? 'preview' : 'source',
+        state.previewMode ? 'preview' : 'source'), 2500);
+      logKPI('ui.export.clip.error', { error: e.message });
+    } finally {
+      state.exportingClip = false;
+      $btnExportClip.textContent = prevLabel || '選択範囲だけDL';
+      refreshButtons();
+    }
+  }
+  if ($btnExportClip) $btnExportClip.addEventListener('click', exportSelectedClip);
+
   async function writeClipboardText(text) {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       await navigator.clipboard.writeText(text);
@@ -1829,8 +2971,19 @@
     if (e.shiftKey && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
       const t = document.activeElement;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      // Don't grab the arrow keys while the IME conversion window is up —
+      // otherwise the IME loses focus on its candidate list.
+      if (e.isComposing || isIMEComposing) return;
       e.preventDefault();
       extendSelectionByKeyboard(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
+    if (e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      const t = document.activeElement;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (e.isComposing || isIMEComposing) return;
+      e.preventDefault();
+      extendSelectionByLine(e.key === 'ArrowDown' ? 1 : -1);
       return;
     }
     if (mod && (e.key === 'z' || e.key === 'Z')) {
@@ -1994,6 +3147,25 @@
     }
   }
 
+  let cachedHealth = null;
+  async function ensureEnvBanner() {
+    if (!$libraryEnvBanner) return;
+    if (!cachedHealth) {
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store' });
+        if (r.ok) cachedHealth = await r.json();
+      } catch (_) { /* non-fatal */ }
+    }
+    if (cachedHealth && cachedHealth.is_codespaces) {
+      const kb = Math.round((cachedHealth.chunked_upload_chunk_size || 524288) / 1024);
+      $libraryEnvBanner.innerHTML =
+        `<strong>Codespaces で動作中</strong> · ` +
+        `アップロードは ${kb}KB ずつの分割転送で、最大 500MB まで対応します。` +
+        `転送中はボタンに進捗 % が表示されます。`;
+      $libraryEnvBanner.hidden = false;
+    }
+  }
+
   function showLibraryModal() {
     try {
       if (libraryOpen) return;
@@ -2002,6 +3174,7 @@
       const startedAt = performance.now();
       libraryReturnFocus = document.activeElement;
       $libraryModal.hidden = false;
+      ensureEnvBanner();
       $libraryList.innerHTML = '';
       $libraryDirHint.textContent = '確認中…';
       if ($libraryCurrentPath) $libraryCurrentPath.textContent = '確認中…';
@@ -2228,10 +3401,80 @@
         }
         li.append(btn);
       }
+      // Delete button: remove the audio and ALL its derivatives. Hidden
+      // for the currently-active audio (the server would 409 anyway, but
+      // hiding the button avoids tempting the editor). Reuse the
+      // ``isActive`` declared at the top of this loop iteration.
+      const isTranscribingThis =
+        transcribeJob && transcribeJob.status &&
+        (transcribeJob.status === 'running' || transcribeJob.status === 'queued') &&
+        (transcribeJob.name === e.name || transcribeJob.audio_path === e.path);
+      if (!isActive) {
+        const delBtn = document.createElement('button');
+        delBtn.className = 'library-action library-delete-btn';
+        delBtn.type = 'button';
+        delBtn.title = e.has_transcript
+          ? 'この音源と文字起こし・編集セッションなどをすべて削除します'
+          : 'この音源を削除します';
+        delBtn.textContent = '削除';
+        if (isTranscribingThis) {
+          delBtn.disabled = true;
+          delBtn.title = '文字起こし中は削除できません';
+        }
+        delBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          deleteLibraryEntry(e);
+        });
+        li.append(delBtn);
+      }
       if (selectable) {
         li.addEventListener('click', () => selectLibraryEntry(e));
       }
       $libraryList.appendChild(li);
+    }
+  }
+
+  async function deleteLibraryEntry(e) {
+    const label = e.name || (e.path ? e.path.split('/').pop() : '?');
+    const msg = e.has_transcript
+      ? `「${label}」と、その文字起こし・編集セッション・スナップショットをすべて削除しますか? この操作は取り消せません。`
+      : `「${label}」を削除しますか? この操作は取り消せません。`;
+    if (!confirm(msg)) return;
+    setLibraryStatus(`「${label}」を削除しています…`);
+    try {
+      const body = e.path ? { path: e.path } : { name: e.name };
+      const r = await fetch('/api/library', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const result = await r.json();
+      logKPI('ui.library.deleted', {
+        name: e.name, path: e.path,
+        audio_existed: result.audio_existed,
+        deleted_count: result.deleted_count,
+      });
+      // Refresh the library list — branch on whether the user was browsing
+      // a subdirectory or viewing the default scan.
+      if (libraryBrowseMode && libraryBrowsePath) {
+        await navigateLibraryTo(libraryBrowsePath);
+      } else {
+        const seq = ++libraryLoadSeq;
+        try {
+          const refreshed = await fetchLibraryWithDiagnostics(seq);
+          if (libraryOpen && seq === libraryLoadSeq) {
+            lastTranscribedLibrary = refreshed;
+            populateLibrary(refreshed);
+          }
+        } catch (_) { /* swallow — refresh failure is non-fatal */ }
+      }
+      setLibraryStatus(`「${label}」を削除しました (${result.deleted_count} 件のファイルを除去)。`);
+    } catch (err) {
+      setLibraryStatus(`「${label}」の削除に失敗: ${err.message}`, true);
     }
   }
 
@@ -2285,9 +3528,18 @@
   // win over tiny while still finishing a 30-min file in well under
   // 30 min on a 2-vCPU Codespace.
   const TRANSCRIBE_PRESETS = {
-    fast:     { model: 'tiny',  beam_size: 1, label: 'tiny · greedy' },
-    balanced: { model: 'small', beam_size: 1, label: 'small · greedy' },
-    quality:  { model: 'small', beam_size: 5, label: 'small · beam=5' },
+    fast:     { model: 'tiny',  beam_size: 1, batched: false,
+                label: 'tiny · greedy' },
+    balanced: { model: 'small', beam_size: 1, batched: false,
+                label: 'small · greedy' },
+    quality:  { model: 'small', beam_size: 5, batched: false,
+                label: 'small · beam=5' },
+    // P1 speedup (experimental): route through faster-whisper's
+    // BatchedInferencePipeline. VAD slices the audio and decodes in parallel
+    // inside CT2, so beam=5 quality is kept while wall time drops on long
+    // podcasts with natural silences. Cross-segment conditioning is lost.
+    quality_batched: { model: 'small', beam_size: 5, batched: true, batch_size: 4,
+                       label: 'small · beam=5 · batched' },
   };
   const TRANSCRIBE_PRESET_KEY = 'podedit.transcribePreset';
   const $transcribePreset = $('transcribe-preset');
@@ -2327,6 +3579,10 @@
         // default for this MVP's target content. Custom prompts can be
         // added via a future settings UI.
       };
+      if (preset.batched) {
+        payload.batched = true;
+        payload.batch_size = preset.batch_size || 4;
+      }
       if (path) payload.path = path;
       else payload.name = name;
       const r = await fetch('/api/library/transcribe', {
@@ -2433,6 +3689,17 @@
     if (librarySwitching) return;
     const name = entry && entry.name ? entry.name : String(entry || '');
     const path = entry && (entry.path || entry.audio_path) ? (entry.path || entry.audio_path) : null;
+    // SPA swap means we no longer trigger window.beforeunload, so the
+    // browser's native "unsaved changes" prompt won't fire on file switch.
+    // Re-create that safety net with an explicit confirm against the
+    // autosave dirty flag.
+    if (state.saveDirty || (state.saveStatus || '').startsWith('saving') || (state.saveStatus || '').startsWith('error')) {
+      const ok = window.confirm('未保存の編集があります。破棄して切り替えますか?');
+      if (!ok) {
+        logKPI('ui.library.switch_cancelled_unsaved', { name, path });
+        return;
+      }
+    }
     librarySwitching = true;
     $libraryStatus.textContent = `${name} に切り替え中…`;
     $libraryStatus.hidden = false;
@@ -2448,49 +3715,699 @@
         throw new Error(`HTTP ${r.status} ${text.slice(0, 200)}`);
       }
       logKPI('ui.library.selected', { name, path });
-      // The page reload picks up the new transcript / waveform / audio.
-      // beforeunload above will warn if there's unsaved work.
-      window.location.reload();
+      // SPA-style swap: re-fetch transcript/audio/session + rebuild DOM
+      // in place. No full page reload — keyboard focus, the Open dialog's
+      // scroll, the env banner, and the toolbar all survive the switch.
+      const ok = await loadActiveAndRender();
+      if (!ok) {
+        // Surface the failure without closing the modal so the user can
+        // pick a different entry. loadActiveAndRender already printed an
+        // error into the transcript area; mirror it in the dialog status.
+        logKPI('ui.library.switch_failed', { name, path, reason: 'load_failed' });
+        $libraryStatus.textContent = `${name} の読み込みに失敗しました`;
+        $libraryStatus.hidden = false;
+        librarySwitching = false;
+        return;
+      }
+      hideLibraryModal();
+      $libraryStatus.textContent = `${name} を読み込みました`;
+      $libraryStatus.hidden = false;
+      logKPI('ui.library.switched', { name, path });
+      librarySwitching = false;
     } catch (e) {
+      logKPI('ui.library.switch_failed', { name, message: e && e.message ? e.message : String(e) });
       $libraryStatus.textContent = `切り替えに失敗しました: ${e.message}`;
       librarySwitching = false;
     }
   }
-  async function uploadFileToLibrary(file) {
+  async function startTranscribeOnExisting(existing) {
+    // Re-use the existing file on disk and kick off ASR; no re-upload.
+    try {
+      const r = await fetch('/api/library/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: existing.existing_path }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      }
+      transcribeJob = await r.json();
+      logKPI('ui.library.upload.existing_transcribe', {
+        name: existing.basename,
+        path: existing.existing_path,
+      });
+      setLibraryStatus('文字起こしを開始しました。完了したら自動で選択できます。');
+      if (lastTranscribedLibrary) populateLibrary(lastTranscribedLibrary);
+      schedulePoll();
+    } catch (e) {
+      setLibraryStatus(`文字起こしを開始できませんでした: ${e.message}`);
+    }
+  }
+
+  function showExistingNoTranscriptPrompt(file, existing) {
+    $libraryStatus.hidden = false;
+    $libraryStatus.textContent = `${file.name} は既にアップロード済みですが文字起こしがありません。　`;
+    const transcribeBtn = document.createElement('button');
+    transcribeBtn.type = 'button';
+    transcribeBtn.textContent = '再アップロードせず文字起こしを開始';
+    transcribeBtn.className = 'library-action';
+    transcribeBtn.style.marginRight = '6px';
+    transcribeBtn.addEventListener('click', () => {
+      transcribeBtn.disabled = true;
+      startTranscribeOnExisting(existing);
+    });
+    const overwriteBtn = document.createElement('button');
+    overwriteBtn.type = 'button';
+    overwriteBtn.textContent = '上書きしてアップロード';
+    overwriteBtn.className = 'library-action';
+    overwriteBtn.addEventListener('click', () => {
+      overwriteBtn.disabled = true;
+      uploadFileToLibrary(file, { overwrite: true });
+    });
+    $libraryStatus.appendChild(transcribeBtn);
+    $libraryStatus.appendChild(overwriteBtn);
+  }
+
+  async function uploadFileToLibrary(file, opts) {
+    opts = opts || {};
+    const overwrite = !!opts.overwrite;
     const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
       setLibraryStatus(`ファイルが大きすぎます: ${(file.size / 1024 / 1024).toFixed(1)} MB (上限 500 MB)`);
       return;
     }
+
+    async function readUploadError(r) {
+      const text = await r.text();
+      try {
+        const reply = JSON.parse(text);
+        // Preserve detail as-is so callers can branch on a structured
+        // object (e.g. {code, basename, existing_path, has_transcript}
+        // for 409 already_exists). Older string-detail responses still
+        // pass through unchanged.
+        if (reply && Object.prototype.hasOwnProperty.call(reply, 'detail')) {
+          return { detail: reply.detail, status: r.status };
+        }
+        return { detail: text.slice(0, 200), status: r.status };
+      } catch (_) {
+        return { detail: text.slice(0, 200), status: r.status };
+      }
+    }
+
     $btnLibraryUpload.disabled = true;
     const prev = $btnLibraryUpload.textContent;
     $btnLibraryUpload.textContent = `${file.name} をアップロード中…`;
     try {
-      const form = new FormData();
-      form.append('file', file, file.name);
-      const r = await fetch('/api/library/upload', { method: 'POST', body: form });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      logKPI('ui.library.upload.fetch_started', { name: file.name, bytes: file.size, overwrite });
+
+      const init = await fetch('/api/library/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ basename: file.name, size: file.size, overwrite }),
+      });
+      if (!init.ok) {
+        const err = await readUploadError(init);
+        // Structured already_exists detail: server tells us the canonical
+        // path and whether a transcript already lives next to it.
+        // - has_transcript=true → silent SPA jump into the editor (no
+        //   re-upload prompt at all; that's the "上書きアップデートしなくても
+        //   すぐに編集に入れる" UX the user asked for).
+        // - has_transcript=false → offer "transcribe existing" vs "overwrite".
+        if (
+          init.status === 409
+          && err.detail
+          && typeof err.detail === 'object'
+          && err.detail.code === 'already_exists'
+        ) {
+          const existing = err.detail;
+          if (existing.has_transcript) {
+            logKPI('ui.library.upload.existing_reused', {
+              name: existing.basename, path: existing.existing_path,
+            });
+            // selectLibraryEntry runs its own unsaved-edits confirm and
+            // emits its own status messages on success/cancel. Await it
+            // so we don't show a stale "opens…" line if the user aborts.
+            await selectLibraryEntry({ name: existing.basename, path: existing.existing_path });
+          } else {
+            showExistingNoTranscriptPrompt(file, existing);
+            logKPI('ui.library.upload.existing_no_transcript', {
+              name: existing.basename, path: existing.existing_path,
+            });
+          }
+          return;
+        }
+        throw new Error(typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail));
       }
-      const reply = await r.json();
+      const started = await init.json();
+      logKPI('ui.library.upload.init_ok', {
+        upload_id: started.upload_id,
+        chunk_size: started.chunk_size,
+        name: file.name,
+        bytes: file.size,
+      });
+
+      const uploadId = encodeURIComponent(started.upload_id);
+      const chunkSize = started.chunk_size;
+      if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+        throw new Error('invalid chunk_size from server');
+      }
+      const chunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkSize);
+      let bytesReceived = 0;
+
+      for (let index = 0; index < chunks; index += 1) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const chunk = await fetch(`/api/library/upload/${uploadId}/chunk`, {
+          method: 'PUT',
+          headers: { 'X-Chunk-Index': String(index) },
+          body: file.slice(start, end),
+        });
+        if (!chunk.ok) {
+          const chunkErr = await readUploadError(chunk);
+          throw new Error(typeof chunkErr.detail === 'string' ? chunkErr.detail : JSON.stringify(chunkErr.detail));
+        }
+        const progress = await chunk.json();
+        bytesReceived = progress.bytes_received;
+        const pct = file.size ? Math.floor((bytesReceived / file.size) * 100) : 100;
+        $btnLibraryUpload.textContent = `${file.name} を ${pct}%...`;
+        logKPI('ui.library.upload.chunk_progress', {
+          chunk_index: index,
+          bytes_received: bytesReceived,
+          total_bytes: file.size,
+        });
+      }
+
+      const finalize = await fetch(`/api/library/upload/${uploadId}/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunks }),
+      });
+      if (!finalize.ok) {
+        const finalizeErr = await readUploadError(finalize);
+        throw new Error(typeof finalizeErr.detail === 'string' ? finalizeErr.detail : JSON.stringify(finalizeErr.detail));
+      }
+      const reply = await finalize.json();
+      logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
+      logKPI('ui.library.upload.auto_transcribe_started', { basename: reply.basename, path: reply.path });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
-      setLibraryStatus(`${reply.basename} をアップロードしました。「文字起こし」をクリックして処理してください。`);
+      startTranscribe({ name: reply.basename, path: reply.path }).catch((err) => {
+        logKPI('ui.library.upload.auto_transcribe_failed', { message: String(err && err.message ? err.message : err) });
+        console.log('auto_transcribe_failed', err);
+      });
+      setLibraryStatus(`${reply.basename} をアップロードしました。文字起こしを開始しています…`);
     } catch (e) {
-      setLibraryStatus(`アップロードに失敗しました: ${e.message}`);
+      logKPI('ui.library.upload.fetch_failed', { message: e.message, name: e.name });
+      console.log('ui.library.upload.fetch_failed', { message: e.message, name: e.name, stack: e.stack }, e);
+      setLibraryStatus(`アップロードに失敗しました: ${String(e && e.message ? e.message : e)}`);
     } finally {
       $btnLibraryUpload.disabled = false;
       $btnLibraryUpload.textContent = prev;
     }
   }
+  if ($btnAddFillers) $btnAddFillers.addEventListener('click', addRecommendedFillers);
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
+
+  // ------- snapshots (named editing drafts) -------
+  const $btnSnapshots = $('btn-snapshots');
+  const $snapshotsModal = $('snapshots-modal');
+  const $btnSnapshotsClose = $('btn-snapshots-close');
+  const $snapshotsList = $('snapshots-list');
+  const $snapshotsStatus = $('snapshots-status');
+  const $snapshotNameInput = $('snapshot-name-input');
+  const $btnSnapshotSave = $('btn-snapshot-save');
+
+  function setSnapshotsStatus(msg, isError) {
+    if (!$snapshotsStatus) return;
+    $snapshotsStatus.textContent = msg || '';
+    $snapshotsStatus.classList.toggle('error', !!isError);
+  }
+  function fmtSnapshotTs(ts) {
+    if (!ts) return '—';
+    try {
+      const d = new Date(ts * 1000);
+      return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    } catch (_) { return '—'; }
+  }
+  async function refreshSnapshotsList() {
+    setSnapshotsStatus('読み込み中…');
+    $snapshotsList.innerHTML = '';
+    try {
+      const r = await fetch('/api/snapshots');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const items = data.snapshots || [];
+      if (items.length === 0) {
+        setSnapshotsStatus('まだ保存されたスナップショットはありません。上の入力欄で名前を付けて保存してください。');
+        return;
+      }
+      setSnapshotsStatus(`${items.length} 件`);
+      for (const s of items) {
+        const li = document.createElement('li');
+        const name = document.createElement('span');
+        name.className = 'snapshot-name';
+        name.textContent = s.name || '(no name)';
+        name.title = `${s.ops_count} ops · ${fmtSnapshotTs(s.updated_at)}`;
+        const meta = document.createElement('span');
+        meta.className = 'snapshot-meta';
+        meta.textContent = `${s.ops_count} ops · ${fmtSnapshotTs(s.updated_at)}`;
+        const btnLoad = document.createElement('button');
+        btnLoad.type = 'button';
+        btnLoad.textContent = '読み込み';
+        btnLoad.title = 'この編集状態を現在の編集に上書きする';
+        btnLoad.addEventListener('click', () => restoreSnapshot(s.id, s.name));
+        const btnDownload = document.createElement('button');
+        btnDownload.type = 'button';
+        btnDownload.textContent = '音源DL';
+        btnDownload.title = 'このスナップショットの編集を音源ファイルとしてダウンロード';
+        btnDownload.addEventListener('click', () => downloadSnapshotAudio(s.id, s.name, btnDownload));
+        const btnRename = document.createElement('button');
+        btnRename.type = 'button';
+        btnRename.textContent = '名前変更';
+        btnRename.addEventListener('click', () => renameSnapshot(s.id, s.name));
+        const btnDelete = document.createElement('button');
+        btnDelete.type = 'button';
+        btnDelete.className = 'danger';
+        btnDelete.textContent = '削除';
+        btnDelete.addEventListener('click', () => deleteSnapshot(s.id, s.name));
+        li.append(name, meta, btnLoad, btnDownload, btnRename, btnDelete);
+        $snapshotsList.appendChild(li);
+      }
+    } catch (e) {
+      setSnapshotsStatus(`一覧の取得に失敗: ${e.message}`, true);
+    }
+  }
+  async function saveCurrentAsSnapshot() {
+    const name = ($snapshotNameInput.value || '').trim();
+    if (!name) {
+      $snapshotNameInput.focus();
+      setSnapshotsStatus('名前を入力してください。', true);
+      return;
+    }
+    // Flush any pending autosave first so the snapshot really matches what
+    // the user sees on screen. flushSave() catches errors internally and
+    // routes them through setSaveStatus, so we detect failure via the
+    // saveDirty flag instead — if it's still dirty after the flush, the
+    // autosave POST is broken and we must not snapshot stale on-disk state.
+    await flushSave();
+    if (state.saveDirty) {
+      setSnapshotsStatus('自動保存がエラー中のためスナップショットを作れません。右上の save-status を確認してください。', true);
+      return;
+    }
+    $btnSnapshotSave.disabled = true;
+    try {
+      const r = await fetch('/api/snapshots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      $snapshotNameInput.value = '';
+      logKPI('ui.snapshot.save', { name });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnSnapshotSave.disabled = false;
+    }
+  }
+  async function restoreSnapshot(id, name) {
+    if (!confirm(`「${name}」を読み込みますか?\n現在の編集は上書きされます (失いたくない場合は先に保存してください)。`)) return;
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.restore', { id, name });
+      hideSnapshotsModal();
+      await loadActiveAndRender();
+    } catch (e) {
+      setSnapshotsStatus(`読み込みに失敗: ${e.message}`, true);
+    }
+  }
+  async function renameSnapshot(id, oldName) {
+    const next = prompt('新しい名前を入力してください:', oldName || '');
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (!trimmed) {
+      setSnapshotsStatus('名前は空にできません。', true);
+      return;
+    }
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.rename', { id, name: trimmed });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`名前変更に失敗: ${e.message}`, true);
+    }
+  }
+  async function downloadSnapshotAudio(id, name, btnEl) {
+    // Same flow as the live Export button, but with snapshot_id in the
+    // preview/render body — the server hashes the snapshot's ops into the
+    // cache_key so two callers asking for the same draft share the cache.
+    // We pick fmt from the toolbar's existing export-format select so the
+    // editor doesn't have to choose twice.
+    const fmt = $exportFormat.value === 'wav' ? 'wav' : 'mp3';
+    const prevLabel = btnEl ? btnEl.textContent : null;
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = fmt === 'mp3' ? 'render+mp3…' : 'render…'; }
+    try {
+      const r = await fetch('/api/preview/render', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshot_id: id }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const reply = await r.json();
+      const cacheKey = reply.cache_key;
+      if (btnEl) btnEl.textContent = fmt === 'mp3' ? 'transcoding…' : 'downloading…';
+      const url = `/api/export/${encodeURIComponent(cacheKey)}?fmt=${encodeURIComponent(fmt)}`;
+      const head = await fetch(url, { method: 'HEAD' });
+      if (!head.ok) {
+        let detail = `HTTP ${head.status}`;
+        try {
+          const probe = await fetch(url);
+          const txt = await probe.text();
+          detail = `${head.status}: ${txt.slice(0, 200)}`;
+        } catch (_) { /* ignore */ }
+        throw new Error(`export ${detail}`);
+      }
+      const a = document.createElement('a');
+      a.href = url;
+      a.rel = 'noopener';
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      logKPI('ui.snapshot.download', { id, name, fmt, cache_key: cacheKey, render_cached: reply.cached });
+      // Clear any stale error from a prior attempt so the user gets feedback
+      // that this run succeeded. Status falls back to the row count.
+      setSnapshotsStatus('ダウンロードを開始しました。');
+    } catch (e) {
+      setSnapshotsStatus(`「${name}」のダウンロードに失敗: ${e.message}`, true);
+      logKPI('ui.snapshot.download_error', { id, error: e.message });
+    } finally {
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = prevLabel || '音源DL'; }
+    }
+  }
+  async function deleteSnapshot(id, name) {
+    if (!confirm(`「${name}」を削除しますか? この操作は取り消せません。`)) return;
+    try {
+      const r = await fetch(`/api/snapshots/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.snapshot.delete', { id });
+      await refreshSnapshotsList();
+    } catch (e) {
+      setSnapshotsStatus(`削除に失敗: ${e.message}`, true);
+    }
+  }
+  function showSnapshotsModal() {
+    if (!$snapshotsModal) return;
+    $snapshotsModal.hidden = false;
+    $snapshotNameInput.value = '';
+    refreshSnapshotsList();
+    setTimeout(() => $snapshotNameInput.focus(), 50);
+    logKPI('ui.snapshot.modal_open');
+  }
+  function hideSnapshotsModal() {
+    if (!$snapshotsModal) return;
+    $snapshotsModal.hidden = true;
+  }
+  if ($btnSnapshots) $btnSnapshots.addEventListener('click', showSnapshotsModal);
+  if ($btnSnapshotsClose) $btnSnapshotsClose.addEventListener('click', hideSnapshotsModal);
+  if ($snapshotsModal) {
+    $snapshotsModal.addEventListener('click', (ev) => {
+      if (ev.target === $snapshotsModal) hideSnapshotsModal();
+    });
+  }
+  if ($btnSnapshotSave) $btnSnapshotSave.addEventListener('click', saveCurrentAsSnapshot);
+  if ($snapshotNameInput) {
+    $snapshotNameInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); saveCurrentAsSnapshot(); }
+    });
+  }
+  // Esc to close the snapshots modal alongside the library one.
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $snapshotsModal && !$snapshotsModal.hidden) hideSnapshotsModal();
+  });
+
+  // ------- dictionary modal (P0-I: ASR post-processing replacements) -------
+  const $btnDictionary = $('btn-dictionary');
+  const $dictionaryModal = $('dictionary-modal');
+  const $btnDictionaryClose = $('btn-dictionary-close');
+  const $dictTbody = $('dictionary-tbody');
+  const $dictStatus = $('dictionary-status');
+  const $btnDictAdd = $('btn-dict-add');
+  const $btnDictSave = $('btn-dict-save');
+
+  function setDictStatus(msg, isError) {
+    if (!$dictStatus) return;
+    $dictStatus.textContent = msg || '·';
+    $dictStatus.classList.toggle('error', !!isError);
+  }
+  function buildDictRow(entry) {
+    const tr = document.createElement('tr');
+    const tdFrom = document.createElement('td');
+    tdFrom.className = 'col-from';
+    const inputFrom = document.createElement('input');
+    inputFrom.type = 'text';
+    inputFrom.value = entry.from || '';
+    inputFrom.placeholder = '例: 黒だ';
+    inputFrom.maxLength = 200;
+    inputFrom.dataset.field = 'from';
+    tdFrom.appendChild(inputFrom);
+
+    const tdTo = document.createElement('td');
+    tdTo.className = 'col-to';
+    const inputTo = document.createElement('input');
+    inputTo.type = 'text';
+    inputTo.value = entry.to || '';
+    inputTo.placeholder = '例: クロード';
+    inputTo.maxLength = 200;
+    inputTo.dataset.field = 'to';
+    tdTo.appendChild(inputTo);
+
+    const tdEnabled = document.createElement('td');
+    tdEnabled.className = 'col-enabled';
+    const inputEnabled = document.createElement('input');
+    inputEnabled.type = 'checkbox';
+    inputEnabled.checked = entry.enabled !== false;
+    inputEnabled.dataset.field = 'enabled';
+    tdEnabled.appendChild(inputEnabled);
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'col-actions';
+    const btnDel = document.createElement('button');
+    btnDel.type = 'button';
+    btnDel.textContent = '削除';
+    btnDel.addEventListener('click', () => { tr.remove(); renderEmptyHint(); });
+    tdActions.appendChild(btnDel);
+
+    tr.append(tdFrom, tdTo, tdEnabled, tdActions);
+    return tr;
+  }
+  function renderEmptyHint() {
+    if (!$dictTbody) return;
+    const existing = $dictTbody.querySelector('tr.row-empty-wrapper');
+    if (existing) existing.remove();
+    const rows = $dictTbody.querySelectorAll('tr:not(.row-empty-wrapper)');
+    if (rows.length === 0) {
+      const tr = document.createElement('tr');
+      tr.className = 'row-empty-wrapper';
+      const td = document.createElement('td');
+      td.colSpan = 4;
+      td.className = 'row-empty';
+      td.textContent = 'まだ辞書エントリがありません。「+ 行を追加」から登録してください。';
+      tr.appendChild(td);
+      $dictTbody.appendChild(tr);
+    }
+  }
+  function collectDictRows() {
+    const entries = [];
+    if (!$dictTbody) return entries;
+    const rows = $dictTbody.querySelectorAll('tr:not(.row-empty-wrapper)');
+    for (const tr of rows) {
+      const from = tr.querySelector('input[data-field="from"]').value;
+      const to = tr.querySelector('input[data-field="to"]').value;
+      const enabled = tr.querySelector('input[data-field="enabled"]').checked;
+      if (!from.trim()) continue;  // skip empty rows silently
+      entries.push({ from, to, enabled });
+    }
+    return entries;
+  }
+  async function loadDictionary() {
+    setDictStatus('読み込み中…');
+    if ($dictTbody) $dictTbody.innerHTML = '';
+    try {
+      const r = await fetch('/api/dictionary');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const entries = data.entries || [];
+      for (const e of entries) $dictTbody.appendChild(buildDictRow(e));
+      renderEmptyHint();
+      setDictStatus(`${entries.length} 件`);
+    } catch (e) {
+      setDictStatus(`一覧取得に失敗: ${e.message}`, true);
+    }
+  }
+  async function saveDictionary() {
+    const entries = collectDictRows();
+    setDictStatus('保存中…');
+    $btnDictSave.disabled = true;
+    try {
+      const r = await fetch('/api/dictionary', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entries }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      logKPI('ui.dictionary.save', { entries: entries.length });
+      setDictStatus(`保存しました (${entries.length} 件)`);
+    } catch (e) {
+      setDictStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnDictSave.disabled = false;
+    }
+  }
+  function showDictionaryModal() {
+    if (!$dictionaryModal) return;
+    $dictionaryModal.hidden = false;
+    loadDictionary();
+    logKPI('ui.dictionary.modal_open');
+  }
+  function hideDictionaryModal() {
+    if ($dictionaryModal) $dictionaryModal.hidden = true;
+  }
+  if ($btnDictionary) $btnDictionary.addEventListener('click', showDictionaryModal);
+  if ($btnDictionaryClose) $btnDictionaryClose.addEventListener('click', hideDictionaryModal);
+  if ($dictionaryModal) {
+    $dictionaryModal.addEventListener('click', (ev) => {
+      if (ev.target === $dictionaryModal) hideDictionaryModal();
+    });
+  }
+  if ($btnDictAdd) {
+    $btnDictAdd.addEventListener('click', () => {
+      const empty = $dictTbody.querySelector('tr.row-empty-wrapper');
+      if (empty) empty.remove();
+      const tr = buildDictRow({ from: '', to: '', enabled: true });
+      $dictTbody.appendChild(tr);
+      const firstInput = tr.querySelector('input[type="text"]');
+      if (firstInput) firstInput.focus();
+    });
+  }
+  if ($btnDictSave) $btnDictSave.addEventListener('click', saveDictionary);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $dictionaryModal && !$dictionaryModal.hidden) hideDictionaryModal();
+  });
+
+  // ------- glossary modal (P0-H: proper-noun list for ASR prompt + hotwords) -------
+  const $btnGlossary = $('btn-glossary');
+  const $glossaryModal = $('glossary-modal');
+  const $btnGlossaryClose = $('btn-glossary-close');
+  const $glossaryTextarea = $('glossary-textarea');
+  const $glossaryStatus = $('glossary-status');
+  const $btnGlossarySave = $('btn-glossary-save');
+
+  function setGlossaryStatus(msg, isError) {
+    if (!$glossaryStatus) return;
+    $glossaryStatus.textContent = msg || '·';
+    $glossaryStatus.classList.toggle('error', !!isError);
+  }
+  async function loadGlossary() {
+    setGlossaryStatus('読み込み中…');
+    try {
+      const r = await fetch('/api/glossary');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const terms = data.terms || [];
+      $glossaryTextarea.value = terms.join('\n');
+      setGlossaryStatus(`${terms.length} 語`);
+    } catch (e) {
+      setGlossaryStatus(`読み込みに失敗: ${e.message}`, true);
+    }
+  }
+  async function saveGlossary() {
+    const lines = ($glossaryTextarea.value || '').split(/\r?\n/);
+    setGlossaryStatus('保存中…');
+    $btnGlossarySave.disabled = true;
+    try {
+      const r = await fetch('/api/glossary', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ terms: lines }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const data = await r.json();
+      const cleaned = data.terms || [];
+      $glossaryTextarea.value = cleaned.join('\n');
+      logKPI('ui.glossary.save', { terms: cleaned.length });
+      const dropped = lines.filter((l) => l.trim()).length - cleaned.length;
+      if (dropped > 0) {
+        setGlossaryStatus(`保存しました (${cleaned.length} 語、重複・長すぎなど ${dropped} 件は除外)`);
+      } else {
+        setGlossaryStatus(`保存しました (${cleaned.length} 語)`);
+      }
+    } catch (e) {
+      setGlossaryStatus(`保存に失敗: ${e.message}`, true);
+    } finally {
+      $btnGlossarySave.disabled = false;
+    }
+  }
+  function showGlossaryModal() {
+    if (!$glossaryModal) return;
+    $glossaryModal.hidden = false;
+    loadGlossary();
+    setTimeout(() => $glossaryTextarea && $glossaryTextarea.focus(), 50);
+    logKPI('ui.glossary.modal_open');
+  }
+  function hideGlossaryModal() {
+    if ($glossaryModal) $glossaryModal.hidden = true;
+  }
+  if ($btnGlossary) $btnGlossary.addEventListener('click', showGlossaryModal);
+  if ($btnGlossaryClose) $btnGlossaryClose.addEventListener('click', hideGlossaryModal);
+  if ($glossaryModal) {
+    $glossaryModal.addEventListener('click', (ev) => {
+      if (ev.target === $glossaryModal) hideGlossaryModal();
+    });
+  }
+  if ($btnGlossarySave) $btnGlossarySave.addEventListener('click', saveGlossary);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $glossaryModal && !$glossaryModal.hidden) hideGlossaryModal();
+  });
   if ($btnLibraryUpload && $libraryFileInput) {
-    $btnLibraryUpload.addEventListener('click', () => $libraryFileInput.click());
+    $btnLibraryUpload.addEventListener('click', () => {
+      logKPI('ui.library.upload.button_clicked');
+      $libraryFileInput.click();
+    });
     $libraryFileInput.addEventListener('change', async () => {
       const f = $libraryFileInput.files && $libraryFileInput.files[0];
+      logKPI('ui.library.upload.change_fired', { has_file: !!f, name: f ? f.name : null, bytes: f ? f.size : null });
       if (!f) return;
       await uploadFileToLibrary(f);
       $libraryFileInput.value = '';
@@ -2501,12 +4418,5 @@
     if (ev.target === $libraryModal) hideLibraryModal();
   });
 
-  // ------- initial paint -------
-  if (state.hasActive) rerenderOps();
-  else {
-    syncTimelineUI();
-    updateStats();
-  }
-  renderPasteAnchor();
-  refreshButtons();
+  // Initial paint is owned by loadActiveAndRender(), called above.
 })();
