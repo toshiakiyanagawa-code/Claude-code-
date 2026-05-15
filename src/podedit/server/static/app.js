@@ -3401,10 +3401,81 @@
         }
         li.append(btn);
       }
+      // Delete button: remove the audio and ALL its derivatives. Hidden
+      // for the currently-active audio (the server would 409 anyway, but
+      // hiding the button avoids tempting the editor). ``active`` /
+      // ``activePath`` are in the closure from populateLibrary.
+      const isActive = (active && e.name === active) || (activePath && e.path === activePath);
+      const isTranscribingThis =
+        transcribeJob && transcribeJob.status &&
+        (transcribeJob.status === 'running' || transcribeJob.status === 'queued') &&
+        (transcribeJob.name === e.name || transcribeJob.audio_path === e.path);
+      if (!isActive) {
+        const delBtn = document.createElement('button');
+        delBtn.className = 'library-action library-delete-btn';
+        delBtn.type = 'button';
+        delBtn.title = e.has_transcript
+          ? 'この音源と文字起こし・編集セッションなどをすべて削除します'
+          : 'この音源を削除します';
+        delBtn.textContent = '削除';
+        if (isTranscribingThis) {
+          delBtn.disabled = true;
+          delBtn.title = '文字起こし中は削除できません';
+        }
+        delBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          deleteLibraryEntry(e);
+        });
+        li.append(delBtn);
+      }
       if (selectable) {
         li.addEventListener('click', () => selectLibraryEntry(e));
       }
       $libraryList.appendChild(li);
+    }
+  }
+
+  async function deleteLibraryEntry(e) {
+    const label = e.name || (e.path ? e.path.split('/').pop() : '?');
+    const msg = e.has_transcript
+      ? `「${label}」と、その文字起こし・編集セッション・スナップショットをすべて削除しますか? この操作は取り消せません。`
+      : `「${label}」を削除しますか? この操作は取り消せません。`;
+    if (!confirm(msg)) return;
+    setLibraryStatus(`「${label}」を削除しています…`);
+    try {
+      const body = e.path ? { path: e.path } : { name: e.name };
+      const r = await fetch('/api/library', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || `HTTP ${r.status}`);
+      }
+      const result = await r.json();
+      logKPI('ui.library.deleted', {
+        name: e.name, path: e.path,
+        audio_existed: result.audio_existed,
+        deleted_count: result.deleted_count,
+      });
+      // Refresh the library list — branch on whether the user was browsing
+      // a subdirectory or viewing the default scan.
+      if (libraryBrowseMode && libraryBrowsePath) {
+        await navigateLibraryTo(libraryBrowsePath);
+      } else {
+        const seq = ++libraryLoadSeq;
+        try {
+          const refreshed = await fetchLibraryWithDiagnostics(seq);
+          if (libraryOpen && seq === libraryLoadSeq) {
+            lastTranscribedLibrary = refreshed;
+            populateLibrary(refreshed);
+          }
+        } catch (_) { /* swallow — refresh failure is non-fatal */ }
+      }
+      setLibraryStatus(`「${label}」を削除しました (${result.deleted_count} 件のファイルを除去)。`);
+    } catch (err) {
+      setLibraryStatus(`「${label}」の削除に失敗: ${err.message}`, true);
     }
   }
 

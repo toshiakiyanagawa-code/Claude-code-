@@ -1861,6 +1861,169 @@ def create_app(config: ServeConfig) -> FastAPI:
             "session_path": str(state.session_path),
         }
 
+    # ------- library delete -------
+    # Lets the editor remove an audio file and ALL its derived artifacts
+    # (transcript / session / KPI log / snapshots / dict-ops sidecar /
+    # faststart cache / 16k mono wav). Use case: cleaning up low-quality
+    # uploads that have been superseded.
+    #
+    # Safety rules (codex review of design):
+    #   * Refuse to delete the currently-loaded audio (409) — UI must
+    #     select a different file first. Auto-resetting state is more
+    #     accident-prone than asking the editor to acknowledge.
+    #   * Refuse if a transcribe job is in flight against this audio (409).
+    #   * Use the same name/path validation pattern as select (no traversal).
+    #   * Delete derivatives first, then the audio itself. No rollback —
+    #     a partial delete leaves a re-runnable state.
+    #   * Idempotent: deleting an already-missing audio returns 200.
+    @app.delete("/api/library")
+    def library_delete(body: dict) -> JSONResponse:
+        body = body or {}
+        raw_path = body.get("path")
+        if raw_path is not None:
+            if not isinstance(raw_path, str):
+                raise HTTPException(status_code=400, detail="path must be a string")
+            candidate_audio = _resolve_browse_path(raw_path)
+            if candidate_audio.name.startswith("."):
+                raise HTTPException(status_code=400, detail="hidden audio files are not supported")
+            label = str(candidate_audio)
+        else:
+            name = body.get("name")
+            if not isinstance(name, str) or not name or "/" in name or "\\" in name or name.startswith("."):
+                raise HTTPException(status_code=400, detail="name must be a plain filename in the library dir")
+            candidate_audio = (state.library_dir / name).resolve()
+            label = name
+        if candidate_audio.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"unsupported audio suffix {candidate_audio.suffix!r}")
+        # Case-insensitive match — Foo.FastStart.m4a is just as much a
+        # derivative as foo.faststart.m4a on case-folding filesystems.
+        if candidate_audio.name.lower().endswith(".faststart" + candidate_audio.suffix.lower()):
+            raise HTTPException(status_code=400, detail="faststart derivatives are not deletable directly")
+
+        # Refuse: currently loaded audio.
+        if state.audio_path is not None:
+            try:
+                if state.audio_path.resolve() == candidate_audio:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"cannot delete {label!r}: it is currently loaded. "
+                            "Open a different audio first."
+                        ),
+                    )
+            except FileNotFoundError:
+                # state.audio_path was already removed externally — proceed.
+                pass
+
+        # Refuse: in-flight transcribe against this audio.
+        snap = transcription_jobs.snapshot()
+        if snap and snap.get("status") in ("queued", "running"):
+            running_path = snap.get("audio_path")
+            if running_path:
+                try:
+                    if Path(running_path).resolve() == candidate_audio:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"cannot delete {label!r}: transcription is in flight",
+                        )
+                except FileNotFoundError:
+                    pass
+
+        def _under(target: Path, root: Path) -> bool:
+            """True iff ``target`` (resolved) sits inside ``root``."""
+            try:
+                target.resolve().relative_to(root)
+                return True
+            except (ValueError, OSError):
+                return False
+
+        stem = candidate_audio.stem
+        work_dir_resolved = state.work_dir.resolve()
+        library_dir_resolved = state.library_dir.resolve()
+        # codex review (HIGH): assert library_dir membership BEFORE touching
+        # any derivative. Without this, a hand-crafted ``path`` outside
+        # library_dir could still drive deletion of stem-matched files in
+        # work_dir even though the audio itself is rejected later.
+        if not _under(candidate_audio, library_dir_resolved):
+            raise HTTPException(
+                status_code=400,
+                detail=f"audio is outside library_dir: {label}",
+            )
+        deleted: list[str] = []
+
+        # Files to remove. All anchored to <stem> under work_dir; no globs.
+        file_targets = [
+            state.work_dir / f"{stem}.transcript.json",
+            state.work_dir / f"{stem}.transcript.dict-ops.jsonl",
+            state.work_dir / f"{stem}.session.json",
+            state.work_dir / f"{stem}.kpi.jsonl",
+            state.work_dir / "_podedit_asr" / f"{stem}.16k.wav",
+            # Faststart cache for video-container audio (m4a / mp4 / mov).
+            state.work_dir / f"{stem}.faststart.m4a",
+            state.work_dir / f"{stem}.faststart.mp4",
+            state.work_dir / f"{stem}.faststart.mov",
+        ]
+        for p in file_targets:
+            if not p.exists():
+                continue
+            if not _under(p, work_dir_resolved):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"refusing to delete outside work_dir: {p}",
+                )
+            try:
+                p.unlink()
+                deleted.append(str(p))
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"failed to delete {p}: {e}") from e
+
+        # Snapshots dir (recursive remove).
+        snapshots_dir = state.work_dir / f"{stem}.snapshots"
+        if snapshots_dir.exists():
+            if not _under(snapshots_dir, work_dir_resolved):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"refusing to remove outside work_dir: {snapshots_dir}",
+                )
+            try:
+                shutil.rmtree(snapshots_dir)
+                deleted.append(str(snapshots_dir))
+            except OSError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to remove {snapshots_dir}: {e}",
+                ) from e
+
+        # Audio itself last. May have already vanished (concurrent CLI delete,
+        # OS hygiene) — that's OK, DELETE is idempotent. library_dir
+        # membership was checked above before any derivative deletion.
+        audio_existed = candidate_audio.exists()
+        if audio_existed:
+            try:
+                candidate_audio.unlink()
+                deleted.append(str(candidate_audio))
+            except OSError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to delete {candidate_audio}: {e}",
+                ) from e
+
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.deleted",
+            "name": candidate_audio.name,
+            "audio_existed": audio_existed,
+            "deleted_count": len(deleted),
+        })
+        return JSONResponse(
+            {
+                "ok": True,
+                "audio_existed": audio_existed,
+                "deleted_count": len(deleted),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     # ------- transcribe (W7.7) -------
     # Lets the UI kick off `podedit transcribe` for any library audio that
     # doesn't have a transcript yet. The actual ASR runs in a worker thread
