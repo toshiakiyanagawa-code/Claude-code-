@@ -286,6 +286,83 @@ def _maybe_generate_llm_plan(
     return plan
 
 
+# codex retrieval review: literal/concrete query lane.
+# Editors search iStock with concrete nouns ("天安門", "腰", "膝") that the
+# Policy-2 LLM rewrites into abstract themes ("中国 経済 シルエット",
+# "シニア 後ろ姿"). Result: actual photos never appear in our top-5 (v4: 0/44).
+# Fix: extract slot-label literal keywords and crawl them at deeper depth (24)
+# without Policy-2 abstraction. Policy-3 hard-block / soft-demote still applies
+# at rerank time so this lane is safe.
+
+# 日本語の助詞・記号・連体形末尾を区切り文字として扱い、漢字 + カタカナ +
+# 数字混じり token を抜き出す。
+# ひらがな run はほぼ助詞/活用語尾なので「区切り」扱い (例: "毛沢東の建国" の
+# "の" を境界として ["毛沢東", "建国"] が取れる)。
+_JP_LITERAL_SPLIT_RE = re.compile(
+    r"[ぁ-ん]+|[、。・「」『』 　【】〔〕…：:?？！!()（）\"'\s]+"
+)
+_LITERAL_STOPWORDS = frozenset(
+    {
+        "カンバン",
+        "冒頭",
+        "参考",
+        "報道人物",
+        "固有名",
+        "検出",
+        "通信社",
+        "確認",
+        "検討",
+        "番目",
+    }
+)
+
+
+def _literal_queries_for_slot(
+    s: IstockSearchSuggestion, *, article_title: str
+) -> list[str]:
+    """Build literal/concrete queries from slot_label (and article_title for hero).
+
+    codex retrieval review: Policy-2 LLM が抽象化する前の素のキーワードで
+    iStock を深く掘ることで、編集者が選びそうな具体物・固有名詞写真を
+    候補プールに引き上げる。
+    """
+    sources: list[str] = []
+    label = (s.slot_label or "").lstrip("■「『")
+    if label:
+        sources.append(label)
+    # hero は slot_label が "カンバン(冒頭)" で意味なしなので article_title を使う
+    if s.slot_key == "hero" and article_title:
+        sources.append(article_title)
+    # note 内に検出済の固有名詞 (PRESS_FIGURES) があれば抽出
+    if s.note:
+        sources.append(s.note)
+
+    tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for src in sources:
+        # ひらがな run + 句読点 を区切りに split。残った chunk は漢字/カタカナ/
+        # 数字混じりの「具体名詞候補」になりやすい。
+        for chunk in _JP_LITERAL_SPLIT_RE.split(src):
+            chunk = chunk.strip()
+            if not chunk or len(chunk) < 2:
+                continue
+            if chunk in _LITERAL_STOPWORDS or chunk in seen_tokens:
+                continue
+            seen_tokens.add(chunk)
+            tokens.append(chunk)
+
+    if not tokens:
+        return []
+    # 上位 2 トークンを 1 query に。残り 1-2 token は次クエリ (slot 固有具体名 +
+    # トピック広い)。
+    queries: list[str] = []
+    queries.append(" ".join(tokens[:2]))
+    if len(tokens) >= 3:
+        # トピック広い query: 3 件まで
+        queries.append(" ".join(tokens[:3]))
+    return queries
+
+
 def _process_slot(
     s: IstockSearchSuggestion,
     *,
@@ -301,6 +378,7 @@ def _process_slot(
         llm_plan = _maybe_generate_llm_plan(s, article_title=article_title)
 
     seen_queries: set[str] = set()
+    literal_queries: list[str] = []
     guaranteed: list[str] = []
     fallback_queries: list[str] = []
 
@@ -313,6 +391,12 @@ def _process_slot(
             return
         seen_queries.add(normalized)
         bucket.append(normalized)
+
+    # Literal/concrete lane (codex retrieval review).
+    # Policy-2 を通さない素の slot_label / article_title キーワード。
+    # この lane は限定数 (1-2 件) で limit=24 の深掘りクロール。
+    for q in _literal_queries_for_slot(s, article_title=article_title):
+        _add(q, bucket=literal_queries)
 
     # LLM の search_queries は上から優先度順なので、上位 N 件だけを guaranteed
     # に積む。fresh iStock 取得 1 件あたり 2.5s 以上の rate limit が利くので、
@@ -327,7 +411,7 @@ def _process_slot(
     for q in (getattr(s, "query_plan", []) or []):
         _add(q, bucket=fallback_queries)
 
-    if not guaranteed and not fallback_queries:
+    if not literal_queries and not guaranteed and not fallback_queries:
         return []
 
     collected: list[IstockSearchHit] = []
@@ -338,13 +422,15 @@ def _process_slot(
     # 十分残り、初回アップロードでも Codespaces のプロキシタイムアウト内に
     # 収まりやすくなる。CMS_ENTRY_ASSISTANT_RERANK_POOL_SIZE で上書き可能。
     if mode == "llm_rerank":
-        collect_until = int(os.getenv("CMS_ENTRY_ASSISTANT_RERANK_POOL_SIZE") or "15")
+        collect_until = int(os.getenv("CMS_ENTRY_ASSISTANT_RERANK_POOL_SIZE") or "20")
     else:
         collect_until = hits_per_slot + 2
 
-    def _ingest(query: str) -> None:
+    _LITERAL_LIMIT = int(os.getenv("CMS_ENTRY_ASSISTANT_LITERAL_LIMIT") or "24")
+
+    def _ingest(query: str, *, limit: int = 8) -> None:
         try:
-            hits = _crawl_search_safe(query, limit=8)
+            hits = _crawl_search_safe(query, limit=limit)
         except Exception:
             return
         for hit in hits:
@@ -354,8 +440,13 @@ def _process_slot(
             seen.update(identity_keys)
             collected.append(hit)
 
+    # 1. literal lane: 深く (limit=24) 全 query 実行
+    for query in literal_queries:
+        _ingest(query, limit=_LITERAL_LIMIT)
+    # 2. guaranteed (LLM + primary)
     for query in guaranteed:
         _ingest(query)
+    # 3. fallback: collect_until に達したら止める
     for query in fallback_queries:
         if len(collected) >= collect_until:
             break

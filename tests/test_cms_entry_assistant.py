@@ -1238,7 +1238,81 @@ def test_fetch_candidates_isolates_per_slot_failure(monkeypatch):
     out = app_module._fetch_candidates(suggestions)
     assert out["hero"] == []           # 失敗スロットは空
     assert len(out["h4_1"]) == 1       # 別スロットは通常通り取得
-    assert calls == ["FAIL me", "working query"]
+    # query_ja の "FAIL me" / "working query" は確実に呼ばれている (literal lane が
+    # slot_label から query を作っても、guaranteed lane で query_ja も追加で呼ばれる)
+    assert "FAIL me" in calls
+    assert "working query" in calls
+
+
+def test_literal_queries_for_slot_extracts_concrete_keywords():
+    """codex retrieval review: literal lane の query 生成。slot_label の
+    ひらがな部分を区切りにして、漢字・カタカナの具体名詞を 2-3 個まで抽出する。"""
+    from cms_entry_assistant.web.app import _literal_queries_for_slot
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    # 中国の歴史 slot
+    s = IstockSearchSuggestion(slot_key="h4_1", slot_label="■毛沢東の建国を全否定する次世代")
+    q = _literal_queries_for_slot(s, article_title="")
+    assert q
+    assert "毛沢東" in q[0]
+    assert "建国" in q[0]
+
+    # 健康 slot — シンプルな名詞のみ
+    s2 = IstockSearchSuggestion(slot_key="h4_3", slot_label="■腰痛で動けなくなる")
+    q2 = _literal_queries_for_slot(s2, article_title="")
+    assert q2
+    assert "腰痛" in q2[0]
+
+    # hero は slot_label が無意味 ("カンバン(冒頭)") なので article_title を使う
+    s3 = IstockSearchSuggestion(slot_key="hero", slot_label="カンバン(冒頭)")
+    q3 = _literal_queries_for_slot(
+        s3, article_title="広島に原爆が落とされても戦争をやめる気はなかった"
+    )
+    assert q3
+    assert "広島" in q3[0]
+    assert "原爆" in q3[0]
+
+
+def test_fetch_candidates_literal_lane_runs_with_deeper_limit(monkeypatch):
+    """literal lane は guaranteed/fallback とは別 lane で先頭実行され、
+    limit=24 で深掘りクロールする (codex retrieval review)。"""
+    from cms_entry_assistant.web import app as app_module
+    from cms_entry_assistant.istock_crawler import IstockSearchHit
+    from cms_entry_assistant.models import IstockSearchSuggestion
+
+    monkeypatch.setattr(app_module, "is_available", lambda: True)
+    # LLM をスキップ
+    monkeypatch.setattr(
+        app_module,
+        "_maybe_generate_llm_plan",
+        lambda suggestion, article_title="": None,
+    )
+
+    calls: list[tuple[str, int]] = []
+    def fake_crawl(query, limit=8):
+        calls.append((query, limit))
+        return [IstockSearchHit(asset_id=query, thumbnail_url="", alt=query, photographer_username="", detail_url=f"https://x/{query}")]
+
+    monkeypatch.setattr(app_module, "crawl_search", fake_crawl)
+
+    suggestions = [
+        IstockSearchSuggestion(
+            slot_key="h4_1",
+            slot_label="■腰痛で動けなくなる",
+            query_ja="legacy-primary",
+        ),
+    ]
+    app_module._fetch_candidates(suggestions, search_mode="legacy")
+
+    # literal lane で "腰痛" が limit=24 で呼ばれている
+    literal_calls = [(q, l) for q, l in calls if "腰痛" in q]
+    assert literal_calls, f"literal query 腰痛 was not invoked: calls={calls}"
+    assert literal_calls[0][1] == 24, f"literal lane should use limit=24, got {literal_calls[0][1]}"
+
+    # legacy primary も guaranteed lane で呼ばれている (limit=8)
+    primary_calls = [(q, l) for q, l in calls if q == "legacy-primary"]
+    assert primary_calls
+    assert primary_calls[0][1] == 8
 
 
 def test_fetch_candidates_llm_mode_prepends_llm_queries(monkeypatch):
@@ -1278,10 +1352,11 @@ def test_fetch_candidates_llm_mode_prepends_llm_queries(monkeypatch):
     ]
     out = app_module._fetch_candidates(suggestions, search_mode="llm")
 
-    # 先頭は LLM の query。1 件で十分集まったらそこで止まる。
-    assert queries_seen[0] == "llm-fresh"
+    # LLM の query "llm-fresh" は必ず実行されている。literal lane が先頭に
+    # 来る場合があるので、順序ではなく存在確認。
+    assert "llm-fresh" in queries_seen
+    assert "legacy-primary" in queries_seen
     assert out["hero"]
-    assert out["hero"][0].asset_id == "llm-fresh"
 
 
 def test_fetch_candidates_llm_rerank_uses_rerank_order(monkeypatch):
