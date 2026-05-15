@@ -8,10 +8,12 @@ process, configured at startup via ``create_app``.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -294,10 +296,80 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def _save_last_active(state: ServeState) -> None:
+    """Atomically record the currently-active (audio, transcript) pair.
+
+    Lets a subsequent ``podedit serve`` (without --audio) restore the last
+    file the user was working on, so an editor mid-task doesn't lose context
+    across server restarts or Codespace rebuilds.
+
+    Tmp name is suffixed with a random token so two concurrent saves don't
+    rename the same tempfile out from under each other (a 500 path codex
+    flagged in review).
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    tmp_path = state.work_dir / f"last_active.json.{secrets.token_hex(4)}.tmp"
+    try:
+        tmp_path.write_text(json.dumps({
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+            "ts": time.time(),
+        }))
+        os.replace(tmp_path, last_active_path)
+    finally:
+        # If write_text raised before os.replace, drop the dangling tmp.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _try_load_last_active(state: ServeState) -> bool:
+    """Try to restore the last active (audio, transcript) pair on startup.
+
+    Returns True if restoration succeeded. Any failure (missing file, missing
+    audio/transcript on disk, JSON corruption, audio/transcript mismatch) is
+    silently swallowed and the server stays in empty state.
+    """
+    last_active_path = state.work_dir / "last_active.json"
+    try:
+        data = json.loads(last_active_path.read_text())
+        audio_path = Path(data["audio_path"])
+        transcript_path = Path(data["transcript_path"])
+        if not audio_path.exists() or not transcript_path.exists():
+            return False
+        state.load_active(audio_path, transcript_path)
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        FileNotFoundError,
+        AudioTranscriptMismatch,
+    ):
+        return False
+    print(f"restored last active audio: {state.audio_path}")
+    try:
+        _append_jsonl(state.kpi_log_path, {
+            "server_ts": time.time(),
+            "type": "server.library.restored",
+            "audio_path": str(state.audio_path),
+            "transcript_path": str(state.transcript_path),
+        })
+    except OSError:
+        # KPI logging is best-effort during startup; never let a write
+        # failure here block a successful restore.
+        pass
+    return True
+
+
 def create_app(config: ServeConfig) -> FastAPI:
     state = ServeState(config)
     if config.audio_path is not None and config.transcript_path is not None:
         state.load_active(config.audio_path, config.transcript_path)
+    elif config.audio_path is None:
+        _try_load_last_active(state)
     transcription_jobs = TranscriptionJobManager(work_dir=state.work_dir)
     # Opportunistic startup cleanup of W8 transient hardlinks. BackgroundTask
     # usually deletes these on response end, but if the process died mid-
@@ -354,7 +426,13 @@ def create_app(config: ServeConfig) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True}
+        codespace_name = os.environ.get("CODESPACE_NAME") or None
+        return {
+            "ok": True,
+            "is_codespaces": bool(os.environ.get("CODESPACES")),
+            "codespace_name": codespace_name,
+            "chunked_upload_chunk_size": 512 * 1024,
+        }
 
     @app.get("/api/transcript")
     def transcript() -> JSONResponse:
@@ -1002,6 +1080,270 @@ def create_app(config: ServeConfig) -> FastAPI:
             "bytes": total,
         }, headers={"Cache-Control": "no-store"})
 
+    CHUNK_SIZE = 512 * 1024
+    MAX_FILE_BYTES = 500 * 1024 * 1024
+    UPLOAD_SESSION_TTL_SECONDS = 3600
+    UPLOAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{16,64}$")
+    upload_locks: dict[str, asyncio.Lock] = {}
+
+    def _chunk_upload_dir() -> Path:
+        chunks_dir = state.work_dir / "uploads" / ".chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        return chunks_dir
+
+    def _chunk_session_path(upload_id: str) -> Path:
+        return _chunk_upload_dir() / f"{upload_id}.json"
+
+    def _chunk_tmp_path(upload_id: str) -> Path:
+        return _chunk_upload_dir() / f"{upload_id}.part"
+
+    def _validate_upload_id(upload_id: str) -> str:
+        if not UPLOAD_ID_PATTERN.match(upload_id or ""):
+            raise HTTPException(status_code=400, detail="invalid upload_id")
+        return upload_id
+
+    def _chunk_upload_lock(upload_id: str) -> asyncio.Lock:
+        lock = upload_locks.get(upload_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            upload_locks[upload_id] = lock
+        return lock
+
+    def _safe_unlink_chunk_tmp(upload_id: str, tmp_path_value: str | None) -> None:
+        """Unlink tmp file only if it resolves to .chunks/<upload_id>.part."""
+        if not tmp_path_value:
+            return
+        try:
+            expected = _chunk_tmp_path(upload_id).resolve()
+            actual = Path(tmp_path_value).resolve()
+        except OSError:
+            return
+        if actual != expected:
+            return
+        try:
+            actual.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _cleanup_expired_chunk_uploads() -> None:
+        chunks_dir = _chunk_upload_dir()
+        now = time.time()
+        for session_path in chunks_dir.glob("*.json"):
+            try:
+                with session_path.open("r", encoding="utf-8") as f:
+                    session = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if now - float(session.get("created_ts", 0)) <= UPLOAD_SESSION_TTL_SECONDS:
+                continue
+            upload_id = session_path.stem
+            try:
+                session_path.unlink()
+            except FileNotFoundError:
+                pass
+            _safe_unlink_chunk_tmp(upload_id, session.get("tmp_path"))
+            upload_locks.pop(upload_id, None)
+
+    def _load_chunk_session(upload_id: str) -> dict:
+        upload_id = _validate_upload_id(upload_id)
+        session_path = _chunk_session_path(upload_id)
+        try:
+            with session_path.open("r", encoding="utf-8") as f:
+                session = json.load(f)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail="upload session not found") from e
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail="upload session is corrupt") from e
+        if time.time() - float(session.get("created_ts", 0)) > UPLOAD_SESSION_TTL_SECONDS:
+            try:
+                session_path.unlink()
+            except FileNotFoundError:
+                pass
+            _safe_unlink_chunk_tmp(upload_id, session.get("tmp_path"))
+            upload_locks.pop(upload_id, None)
+            raise HTTPException(status_code=404, detail="upload session expired")
+        return session
+
+    def _safe_chunk_tmp_path(upload_id: str, tmp_path_value: str) -> Path:
+        """Return the expected .chunks/<upload_id>.part path, rejecting anything else."""
+        expected = _chunk_tmp_path(upload_id).resolve()
+        try:
+            actual = Path(tmp_path_value).resolve()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail="upload temp path is invalid") from e
+        if actual != expected:
+            raise HTTPException(status_code=500, detail="upload temp path is invalid")
+        return actual
+
+    def _save_chunk_session(upload_id: str, session: dict) -> None:
+        session_path = _chunk_session_path(upload_id)
+        tmp_session_path = session_path.with_suffix(".json.tmp")
+        with tmp_session_path.open("w", encoding="utf-8") as f:
+            json.dump(session, f, separators=(",", ":"))
+        os.replace(tmp_session_path, session_path)
+
+    @app.post("/api/library/upload/init")
+    async def library_upload_init(request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from e
+        basename = _validate_upload_basename(str(payload.get("basename") or ""))
+        try:
+            size = int(payload.get("size"))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="size must be an integer") from e
+        if size < 0:
+            raise HTTPException(status_code=400, detail="size must be non-negative")
+        if size > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="upload exceeds 500 MB limit")
+
+        overwrite = bool(payload.get("overwrite"))
+        uploads_dir = state.work_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        final_path = uploads_dir / basename
+        # Use lstat to inspect the target without following symlinks. exists()
+        # would follow the link and let us silently delete the wrong file.
+        try:
+            entry_stat = os.lstat(final_path)
+        except FileNotFoundError:
+            entry_stat = None
+        if entry_stat is not None:
+            if not overwrite:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"already_exists:{basename}",
+                )
+            # Refuse anything that isn't a regular file owned by the server
+            # process. This blocks symlinks (which we never create), dirs,
+            # special files, and any leftover from another user that happens
+            # to live in the uploads dir.
+            import stat as _stat
+            if not _stat.S_ISREG(entry_stat.st_mode):
+                raise HTTPException(status_code=400, detail="cannot overwrite non-file")
+            if entry_stat.st_uid != os.getuid():
+                raise HTTPException(status_code=400, detail="cannot overwrite file owned by another user")
+            # Belt-and-braces containment check: resolve must stay inside
+            # uploads_dir (final_path is built from validated basename, so
+            # this is mostly redundant, but cheap).
+            try:
+                resolved = final_path.resolve(strict=True)
+                resolved.relative_to(uploads_dir.resolve())
+            except (OSError, ValueError) as e:
+                raise HTTPException(status_code=400, detail="cannot overwrite this path") from e
+            # Atomic-ish: unlink uses the un-resolved path so we're operating
+            # on the same dirent we just lstat'd. A concurrent rename between
+            # lstat and unlink could in principle target a different dirent;
+            # this is acceptable under the trusted-uploads-dir assumption
+            # (single server process owns this directory).
+            try:
+                final_path.unlink()
+            except FileNotFoundError:
+                pass  # someone else cleaned up; proceed to fresh upload
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"failed to remove existing file: {e}") from e
+
+        upload_id = secrets.token_urlsafe(32)
+        tmp_path = _chunk_tmp_path(upload_id)
+        tmp_path.touch(mode=0o600, exist_ok=False)
+        _save_chunk_session(upload_id, {
+            "basename": basename,
+            "size": size,
+            "received": 0,
+            "last_index": -1,
+            "tmp_path": str(tmp_path),
+            "created_ts": time.time(),
+        })
+        return JSONResponse({
+            "upload_id": upload_id,
+            "chunk_size": CHUNK_SIZE,
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/library/upload/{upload_id}/chunk")
+    async def library_upload_chunk(upload_id: str, request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        upload_id = _validate_upload_id(upload_id)
+        async with _chunk_upload_lock(upload_id):
+            session = _load_chunk_session(upload_id)
+            try:
+                chunk_index = int(request.headers.get("x-chunk-index", ""))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail="X-Chunk-Index must be an integer") from e
+            expected_index = int(session["last_index"]) + 1
+            if chunk_index != expected_index:
+                raise HTTPException(status_code=409, detail=f"expected chunk index {expected_index}")
+
+            chunk = await request.body()
+            if len(chunk) > CHUNK_SIZE:
+                raise HTTPException(status_code=413, detail="chunk exceeds 512 KB limit")
+            received = int(session["received"]) + len(chunk)
+            size = int(session["size"])
+            if received > size or received > MAX_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="upload exceeds declared size")
+
+            tmp_path = _safe_chunk_tmp_path(upload_id, str(session["tmp_path"]))
+            with tmp_path.open("ab") as f:
+                f.write(chunk)
+            session["received"] = received
+            session["last_index"] = chunk_index
+            _save_chunk_session(upload_id, session)
+            return JSONResponse({
+                "next_index": chunk_index + 1,
+                "bytes_received": received,
+            }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/library/upload/{upload_id}/finalize")
+    async def library_upload_finalize(upload_id: str, request: Request) -> JSONResponse:
+        _cleanup_expired_chunk_uploads()
+        upload_id = _validate_upload_id(upload_id)
+        async with _chunk_upload_lock(upload_id):
+            session = _load_chunk_session(upload_id)
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail="invalid JSON body") from e
+            try:
+                chunks = int(payload.get("chunks"))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(status_code=400, detail="chunks must be an integer") from e
+            if chunks != int(session["last_index"]) + 1:
+                raise HTTPException(status_code=409, detail="chunks does not match received chunk count")
+            total = int(session["received"])
+            if total != int(session["size"]):
+                raise HTTPException(status_code=409, detail="upload is incomplete")
+
+            basename = _validate_upload_basename(session["basename"])
+            uploads_dir = state.work_dir / "uploads"
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            final_path = uploads_dir / basename
+            if final_path.exists():
+                raise HTTPException(status_code=409, detail=f"{basename!r} already exists in uploads")
+
+            tmp_path = _safe_chunk_tmp_path(upload_id, str(session["tmp_path"]))
+            if not tmp_path.exists():
+                raise HTTPException(status_code=404, detail="upload temp file not found")
+            os.replace(tmp_path, final_path)
+            try:
+                _chunk_session_path(upload_id).unlink()
+            except FileNotFoundError:
+                pass
+
+            _append_jsonl(state.kpi_log_path, {
+                "server_ts": time.time(),
+                "type": "server.library.uploaded",
+                "basename": basename,
+                "bytes": total,
+                "via": "chunked",
+            })
+        upload_locks.pop(upload_id, None)
+        return JSONResponse({
+            "ok": True,
+            "path": str(final_path),
+            "basename": basename,
+            "bytes": total,
+        }, headers={"Cache-Control": "no-store"})
+
     def _audio_from_library_request(body: dict, *, require_string_name: bool = False) -> tuple[Path, str]:
         body = body or {}
         raw_path = body.get("path")
@@ -1046,6 +1388,7 @@ def create_app(config: ServeConfig) -> FastAPI:
             state.load_active(candidate_audio, candidate_transcript)
         except (FileNotFoundError, AudioTranscriptMismatch) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        _save_last_active(state)
         _append_jsonl(state.kpi_log_path, {
             "server_ts": time.time(), "type": "server.library.selected",
             "name": candidate_audio.name, "audio_path": str(state.audio_path),

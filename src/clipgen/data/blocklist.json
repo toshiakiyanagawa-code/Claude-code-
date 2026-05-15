@@ -1,0 +1,178 @@
+{
+  "_comment": "切り抜きNGとみなすチャンネルのブラックリスト。TV局・新聞社・切り抜き禁止明言チャンネルを列挙する。allowlist より優先で評価する。",
+  "channels": [
+    {
+      "channel_id": "UC_tbs",
+      "handle": "@tbsnewsdig",
+      "name": "TBS NEWS DIG",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@tbsnewsdig",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_ann",
+      "handle": "@ANNnewsCH",
+      "name": "ANNnewsCH (テレビ朝日)",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@ANNnewsCH",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_fnn",
+      "handle": "@FNNnewsCH",
+      "name": "FNNプライムオンライン",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@FNNnewsCH",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_nittele",
+      "handle": "@nittele_news",
+      "name": "日テレNEWS",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@nittele_news",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_tv_tokyo",
+      "handle": "@TV-TOKYO_NEWS",
+      "name": "テレ東BIZ",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@TV-TOKYO_NEWS",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_nhk",
+      "handle": "@NHK",
+      "name": "NHK",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@NHK",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_mbs",
+      "handle": "@mbsnews",
+      "name": "MBS NEWS",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@mbsnews",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_ktv",
+      "handle": "@ktv_news",
+      "name": "カンテレNEWS",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@ktv_news",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_ytv",
+      "handle": "@ytv_news",
+      "name": "読売テレビニュース",
+      "category": "tv_broadcaster",
+      "source_url": "https://www.youtube.com/@ytv_news",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "放送局・ニュース映像。二次利用は原則個別許諾。",
+      "permission_scope": "tv_broadcast",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_asahi",
+      "handle": "@asahi",
+      "name": "朝日新聞デジタル",
+      "category": "newspaper",
+      "source_url": "https://www.youtube.com/@asahi",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "新聞社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_yomiuri",
+      "handle": "@yomiuri",
+      "name": "読売新聞オンライン",
+      "category": "newspaper",
+      "source_url": "https://www.youtube.com/@yomiuri",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "新聞社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_mainichi",
+      "handle": "@mainichi",
+      "name": "毎日新聞",
+      "category": "newspaper",
+      "source_url": "https://www.youtube.com/@mainichi",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "新聞社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_nikkei",
+      "handle": "@nikkei",
+      "name": "日本経済新聞",
+      "category": "newspaper",
+      "source_url": "https://www.youtube.com/@nikkei",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "新聞社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_sankei",
+      "handle": "@sankei",
+      "name": "産経新聞",
+      "category": "newspaper",
+      "source_url": "https://www.youtube.com/@sankei",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "新聞社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    },
+    {
+      "channel_id": "UC_kyodo",
+      "handle": "@kyodonews",
+      "name": "共同通信",
+      "category": "newsagency",
+      "source_url": "https://www.youtube.com/@kyodonews",
+      "permission_checked_at": "2026-05-13",
+      "permission_evidence": "通信社配信映像。二次利用は原則個別許諾。",
+      "permission_scope": "news_agency_clip",
+      "notes": ""
+    }
+  ],
+  "keywords_in_description": [
+    "切り抜き禁止",
+    "無断転載禁止",
+    "二次利用禁止",
+    "切り抜きNG",
+    "No clipping",
+    "All rights reserved"
+  ]
+}

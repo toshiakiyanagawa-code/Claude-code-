@@ -38,6 +38,7 @@
   const $libraryFileInput = $('library-file-input');
   const $libraryUploadHint = $('library-upload-hint');
   const $libraryBreadcrumbs = $('library-breadcrumbs');
+  const $libraryEnvBanner = $('library-env-banner');
   const $btnLibraryClose = $('btn-library-close');
   const $modePill = $('mode-pill');
   const $waveform = $('waveform');
@@ -727,7 +728,15 @@
   }
 
   function wordFromPoint(x, y) {
-    let el = document.elementFromPoint(x, y);
+    // Clamp to viewport interior so a pointer dragged just past the
+    // bottom (or top) edge still hit-tests the boundary-most visible
+    // word. Without this, document.elementFromPoint returns null
+    // whenever y exceeds window.innerHeight, freezing the selection at
+    // whatever was on screen when the cursor crossed the edge — this
+    // teamed up with the mouseleave bug to produce the "30 sec wall".
+    const cx = Math.max(1, Math.min(window.innerWidth - 1, x));
+    const cy = Math.max(1, Math.min(window.innerHeight - 1, y));
+    let el = document.elementFromPoint(cx, cy);
     while (el && !el.classList?.contains('word')) el = el.parentElement;
     if (el && el.classList.contains('word')) {
       const i = parseInt(el.dataset.idx, 10);
@@ -872,6 +881,9 @@
     }
     if (dragAnchor === null) return;
     pendingDragMove = { x: e.clientX, y: e.clientY };
+    // Stamp the last real pointer motion so the rAF auto-scroll tick can
+    // tell "moving" from "held still at edge" — Word/Docs style.
+    _lastSelectionPointerMoveAt = performance.now();
   });
 
   document.addEventListener('pointerup', (e) => {
@@ -889,21 +901,107 @@
     if (dragAnchor !== null) finishSelectionDrag();
   });
 
-  // Drag can be aborted by leaving the window mid-drag; treat it as cancel for
-  // move-drag and as release for selection-drag so dragAnchor never sticks.
+  // Selection drag does NOT end on mouseleave: the user routinely drags
+  // past the viewport edge to keep extending the selection while the
+  // transcript auto-scrolls. Pointer capture + pointerup/pointercancel
+  // already cover legitimate drag-end. Killing the drag here was the
+  // real "30 sec wall" — the moment pointer y crossed the document edge,
+  // dragAnchor went null and every subsequent rAF tick did nothing.
+  // Move-drag still cancels here because dropping into another window
+  // can't produce a meaningful target word.
   document.addEventListener('mouseleave', () => {
     if (moveDrag) cancelMoveDrag();
-    if (dragAnchor !== null) finishSelectionDrag();
   });
 
   // Backstop for sensitivity: track pointer position during selection drag and
   // resolve the word directly under the cursor each rAF. mouseenter alone
   // misses words when dragging fast across line breaks or inter-word gaps.
+  // Selection-drag uses a centre-based auto-scroll (Word / Google Docs
+  // style) rather than the move-drag's 80px edge zone. Real-user KPI on
+  // 2026-05-14 showed users keep their pointer near the vertical middle
+  // (y ~= innerHeight * 0.6) while dragging — they never get within
+  // 80px of the bottom edge, so the transcript never scrolled and
+  // selection stalled at ~30 sec of already-painted words. Dead zone
+  // ±60px in the centre, then velocity ramps linearly toward each edge.
+  // Auto-scroll only fires while the pointer is actually moving (last
+  // pointermove within 500ms) so a held-still pointer can't slowly
+  // drift the page in a direction the user no longer wants.
+  // Dead zone covers only the very centre; outside it, we want even a
+  // small drift past the edge to start scrolling immediately (3px/frame
+  // ≈ 180px/sec at 60Hz) and ramp up to MAX at the viewport edge.
+  // Avoid the previous MIN_VELOCITY trap that zeroed out the just-past-
+  // dead-zone region right where the user was actually holding pointer
+  // (y=538 on a 911px viewport).
+  const SELECTION_AUTOSCROLL_DEAD_ZONE_PX = 60;
+  const SELECTION_AUTOSCROLL_MAX_VELOCITY = 24;
+  const SELECTION_AUTOSCROLL_BASE_VELOCITY = 3;
+  const SELECTION_AUTOSCROLL_ACTIVITY_MS = 500;
+  let _lastSelectionPointerMoveAt = 0;
+  let _dragDebugLastEmitAt = 0;
+
+  function scrollViewportBy(dy) {
+    // Most layouts have <main id="transcript"> as the scrolling
+    // container (overflow-y: auto). On narrow viewports / large fonts
+    // the document itself becomes the scroller instead, leaving
+    // $tx.scrollTop pinned at 0 — fall back to window.scrollBy in that
+    // case so the user always gets some movement.
+    if (dy === 0) return;
+    const before = $tx.scrollTop;
+    $tx.scrollTop += dy;
+    if ($tx.scrollTop === before) window.scrollBy(0, dy);
+  }
+
   function dragMoveTick() {
-    if (pendingDragMove && dragAnchor !== null) {
-      const w = wordFromPoint(pendingDragMove.x, pendingDragMove.y);
+    if (pendingDragMove && dragAnchor !== null && !moveDrag) {
+      const x = pendingDragMove.x;
+      const y = pendingDragMove.y;
+      const now = performance.now();
+      const recentlyMoved = (now - _lastSelectionPointerMoveAt) < SELECTION_AUTOSCROLL_ACTIVITY_MS;
+      const centerY = window.innerHeight / 2;
+      const distFromCenter = Math.abs(y - centerY);
+      let velocity = 0;
+      if (recentlyMoved && distFromCenter > SELECTION_AUTOSCROLL_DEAD_ZONE_PX) {
+        const effectiveDist = distFromCenter - SELECTION_AUTOSCROLL_DEAD_ZONE_PX;
+        const maxDist = Math.max(1, centerY - SELECTION_AUTOSCROLL_DEAD_ZONE_PX);
+        const sign = y < centerY ? -1 : 1;
+        const fraction = Math.min(1, effectiveDist / maxDist);
+        // Start at BASE the instant we leave the dead zone, ramp up to
+        // MAX at the viewport edge. Never drops to zero again until the
+        // pointer comes back into the centre band.
+        velocity = sign * (SELECTION_AUTOSCROLL_BASE_VELOCITY
+          + fraction * (SELECTION_AUTOSCROLL_MAX_VELOCITY - SELECTION_AUTOSCROLL_BASE_VELOCITY));
+      }
+      const beforeTxTop = $tx.scrollTop;
+      const beforeWinY = window.scrollY;
+      if (velocity !== 0) scrollViewportBy(velocity);
+      const w = wordFromPoint(x, y);
       if (w) extendSelectionDrag(w.idx);
-      pendingDragMove = null;
+      // Throttled diagnostic KPI so we can confirm from server-side
+      // logs that auto-scroll is firing and the extent is advancing.
+      if (now - _dragDebugLastEmitAt > 250) {
+        _dragDebugLastEmitAt = now;
+        logKPI('ui.drag.tick_debug', {
+          x, y,
+          innerH: window.innerHeight,
+          recentlyMoved,
+          dist: distFromCenter,
+          dead_zone: SELECTION_AUTOSCROLL_DEAD_ZONE_PX,
+          velocity,
+          tx_top_before: beforeTxTop,
+          tx_top_after: $tx.scrollTop,
+          tx_scroll_height: $tx.scrollHeight,
+          tx_client_height: $tx.clientHeight,
+          win_y_before: beforeWinY,
+          win_y_after: window.scrollY,
+          hit_word_idx: w ? w.idx : null,
+          extent: state.selection ? state.selection.extent : null,
+        });
+      }
+      // Intentionally NOT nulling pendingDragMove: a stationary pointer
+      // must keep the rAF tick running so when the user resumes
+      // moving (within ACTIVITY_MS) scroll picks back up. The "no-op
+      // for same extent" guard in extendSelectionDrag keeps per-frame
+      // work tiny.
     }
     requestAnimationFrame(dragMoveTick);
   }
@@ -1994,6 +2092,25 @@
     }
   }
 
+  let cachedHealth = null;
+  async function ensureEnvBanner() {
+    if (!$libraryEnvBanner) return;
+    if (!cachedHealth) {
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store' });
+        if (r.ok) cachedHealth = await r.json();
+      } catch (_) { /* non-fatal */ }
+    }
+    if (cachedHealth && cachedHealth.is_codespaces) {
+      const kb = Math.round((cachedHealth.chunked_upload_chunk_size || 524288) / 1024);
+      $libraryEnvBanner.innerHTML =
+        `<strong>Codespaces で動作中</strong> · ` +
+        `アップロードは ${kb}KB ずつの分割転送で、最大 500MB まで対応します。` +
+        `転送中はボタンに進捗 % が表示されます。`;
+      $libraryEnvBanner.hidden = false;
+    }
+  }
+
   function showLibraryModal() {
     try {
       if (libraryOpen) return;
@@ -2002,6 +2119,7 @@
       const startedAt = performance.now();
       libraryReturnFocus = document.activeElement;
       $libraryModal.hidden = false;
+      ensureEnvBanner();
       $libraryList.innerHTML = '';
       $libraryDirHint.textContent = '確認中…';
       if ($libraryCurrentPath) $libraryCurrentPath.textContent = '確認中…';
@@ -2456,30 +2574,124 @@
       librarySwitching = false;
     }
   }
-  async function uploadFileToLibrary(file) {
+  function showOverwritePrompt(file) {
+    $libraryStatus.hidden = false;
+    $libraryStatus.textContent = `同名ファイルが既にあります: ${file.name}　`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '上書きしてアップロード';
+    btn.className = 'library-action';
+    btn.style.marginLeft = '6px';
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      uploadFileToLibrary(file, { overwrite: true });
+    });
+    $libraryStatus.appendChild(btn);
+  }
+
+  async function uploadFileToLibrary(file, opts) {
+    opts = opts || {};
+    const overwrite = !!opts.overwrite;
     const maxBytes = 500 * 1024 * 1024;
     if (file.size > maxBytes) {
       setLibraryStatus(`ファイルが大きすぎます: ${(file.size / 1024 / 1024).toFixed(1)} MB (上限 500 MB)`);
       return;
     }
+
+    async function readUploadError(r) {
+      const text = await r.text();
+      try {
+        const reply = JSON.parse(text);
+        return { detail: reply && reply.detail ? String(reply.detail) : text.slice(0, 200), status: r.status };
+      } catch (_) {
+        return { detail: text.slice(0, 200), status: r.status };
+      }
+    }
+
     $btnLibraryUpload.disabled = true;
     const prev = $btnLibraryUpload.textContent;
     $btnLibraryUpload.textContent = `${file.name} をアップロード中…`;
     try {
-      const form = new FormData();
-      form.append('file', file, file.name);
-      const r = await fetch('/api/library/upload', { method: 'POST', body: form });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+      logKPI('ui.library.upload.fetch_started', { name: file.name, bytes: file.size, overwrite });
+
+      const init = await fetch('/api/library/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ basename: file.name, size: file.size, overwrite }),
+      });
+      if (!init.ok) {
+        const err = await readUploadError(init);
+        if (init.status === 409 && /^already_exists:/.test(err.detail)) {
+          // Surface a friendly status and let the user retry with overwrite.
+          showOverwritePrompt(file);
+          logKPI('ui.library.upload.fetch_failed', {
+            message: err.detail, name: file.name, status: 409, reason: 'already_exists',
+          });
+          return;
+        }
+        throw new Error(err.detail);
       }
-      const reply = await r.json();
+      const started = await init.json();
+      logKPI('ui.library.upload.init_ok', {
+        upload_id: started.upload_id,
+        chunk_size: started.chunk_size,
+        name: file.name,
+        bytes: file.size,
+      });
+
+      const uploadId = encodeURIComponent(started.upload_id);
+      const chunkSize = started.chunk_size;
+      if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+        throw new Error('invalid chunk_size from server');
+      }
+      const chunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkSize);
+      let bytesReceived = 0;
+
+      for (let index = 0; index < chunks; index += 1) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const chunk = await fetch(`/api/library/upload/${uploadId}/chunk`, {
+          method: 'PUT',
+          headers: { 'X-Chunk-Index': String(index) },
+          body: file.slice(start, end),
+        });
+        if (!chunk.ok) {
+          throw new Error((await readUploadError(chunk)).detail);
+        }
+        const progress = await chunk.json();
+        bytesReceived = progress.bytes_received;
+        const pct = file.size ? Math.floor((bytesReceived / file.size) * 100) : 100;
+        $btnLibraryUpload.textContent = `${file.name} を ${pct}%...`;
+        logKPI('ui.library.upload.chunk_progress', {
+          chunk_index: index,
+          bytes_received: bytesReceived,
+          total_bytes: file.size,
+        });
+      }
+
+      const finalize = await fetch(`/api/library/upload/${uploadId}/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunks }),
+      });
+      if (!finalize.ok) {
+        throw new Error((await readUploadError(finalize)).detail);
+      }
+      const reply = await finalize.json();
+      logKPI('ui.library.upload.fetch_ok', { basename: reply.basename, bytes: reply.bytes });
       logKPI('ui.library.uploaded', { basename: reply.basename, bytes: reply.bytes });
+      logKPI('ui.library.upload.auto_transcribe_started', { basename: reply.basename, path: reply.path });
       const uploadsDir = reply.path.replace(/\/[^/]+$/, '');
       await navigateLibraryTo(uploadsDir);
-      setLibraryStatus(`${reply.basename} をアップロードしました。「文字起こし」をクリックして処理してください。`);
+      startTranscribe({ name: reply.basename, path: reply.path }).catch((err) => {
+        logKPI('ui.library.upload.auto_transcribe_failed', { message: String(err && err.message ? err.message : err) });
+        console.log('auto_transcribe_failed', err);
+      });
+      setLibraryStatus(`${reply.basename} をアップロードしました。文字起こしを開始しています…`);
     } catch (e) {
-      setLibraryStatus(`アップロードに失敗しました: ${e.message}`);
+      logKPI('ui.library.upload.fetch_failed', { message: e.message, name: e.name });
+      console.log('ui.library.upload.fetch_failed', { message: e.message, name: e.name, stack: e.stack }, e);
+      setLibraryStatus(`アップロードに失敗しました: ${String(e && e.message ? e.message : e)}`);
     } finally {
       $btnLibraryUpload.disabled = false;
       $btnLibraryUpload.textContent = prev;
@@ -2488,9 +2700,13 @@
   $btnOpen.addEventListener('click', showLibraryModal);
   $btnLibraryClose.addEventListener('click', hideLibraryModal);
   if ($btnLibraryUpload && $libraryFileInput) {
-    $btnLibraryUpload.addEventListener('click', () => $libraryFileInput.click());
+    $btnLibraryUpload.addEventListener('click', () => {
+      logKPI('ui.library.upload.button_clicked');
+      $libraryFileInput.click();
+    });
     $libraryFileInput.addEventListener('change', async () => {
       const f = $libraryFileInput.files && $libraryFileInput.files[0];
+      logKPI('ui.library.upload.change_fired', { has_file: !!f, name: f ? f.name : null, bytes: f ? f.size : null });
       if (!f) return;
       await uploadFileToLibrary(f);
       $libraryFileInput.value = '';

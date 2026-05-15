@@ -1,0 +1,239 @@
+{
+  "_comment": "YouTube auto-subs の固有名詞誤認識を補正する辞書。canonical/aliases/asr_confusions/protect_suffixes/context_terms の構造で、SRT 後処理で参照する。codex 2026-05-15 推奨方針。",
+  "_updated_at": "2026-05-15",
+  "_usage": "src/clipgen/transcript_correction.py から読み込み、各 cue テキストを正規化 + 改行保護スパンを計算。",
+  "terms": [
+    {
+      "canonical": "今野忍",
+      "category": "person",
+      "aliases": ["今野", "今野記者"],
+      "asr_confusions": ["今野藤のしぶ", "今野しのぶ", "今野藤"],
+      "context_terms": ["選挙ドットコム", "山本期日前", "政治記者", "朝日"],
+      "protect_suffixes": ["記者", "氏", "さん"]
+    },
+    {
+      "canonical": "山本期日前",
+      "category": "person",
+      "aliases": ["山本", "山本さん"],
+      "asr_confusions": ["山本期日全", "山本気日前"],
+      "context_terms": ["選挙ドットコム", "MC", "今野"],
+      "protect_suffixes": ["さん"]
+    },
+    {
+      "canonical": "高市早苗",
+      "category": "person",
+      "aliases": ["高市", "高市総理", "高市政権"],
+      "asr_confusions": ["高一", "高一さん", "高一総理", "鷹一", "鷹市"],
+      "context_terms": ["自民", "総理", "首相", "内閣", "政権", "国力研究会"],
+      "protect_suffixes": ["総理", "首相", "氏", "さん", "政権"]
+    },
+    {
+      "canonical": "玉木雄一郎",
+      "category": "person",
+      "aliases": ["玉木", "玉木代表"],
+      "asr_confusions": ["玉気", "玉木雄一朗"],
+      "context_terms": ["国民民主", "代表"],
+      "protect_suffixes": ["代表", "氏", "さん"]
+    },
+    {
+      "canonical": "小沢一郎",
+      "category": "person",
+      "aliases": ["小沢", "小沢さん"],
+      "asr_confusions": ["小澤一郎", "尾沢"],
+      "context_terms": ["新党", "立憲", "民主"],
+      "protect_suffixes": ["氏", "さん"]
+    },
+    {
+      "canonical": "麻生太郎",
+      "category": "person",
+      "aliases": ["麻生"],
+      "asr_confusions": ["浅生", "あそう"],
+      "context_terms": ["自民", "副総理", "財務"],
+      "protect_suffixes": ["氏", "副総理", "さん"]
+    },
+    {
+      "canonical": "茂木敏充",
+      "category": "person",
+      "aliases": ["茂木", "茂木大臣"],
+      "asr_confusions": ["茂気", "茂木としみつ"],
+      "context_terms": ["自民", "幹事長"],
+      "protect_suffixes": ["大臣", "幹事長", "氏"]
+    },
+    {
+      "canonical": "武田良太",
+      "category": "person",
+      "aliases": ["武田", "武田グループ"],
+      "asr_confusions": ["竹田良太"],
+      "context_terms": ["自民", "派閥"],
+      "protect_suffixes": ["氏"]
+    },
+    {
+      "canonical": "枝野幸男",
+      "category": "person",
+      "aliases": ["枝野"],
+      "asr_confusions": ["江田野", "枝の", "枝野ゆきお"],
+      "context_terms": ["立憲", "新党", "民主"],
+      "protect_suffixes": ["氏", "さん"]
+    },
+    {
+      "canonical": "江田憲司",
+      "category": "person",
+      "aliases": ["江田"],
+      "asr_confusions": ["江田野", "江田けんじ"],
+      "context_terms": ["立憲", "中道", "新党"],
+      "protect_suffixes": ["氏", "さん"]
+    },
+    {
+      "canonical": "立花孝志",
+      "category": "person",
+      "aliases": ["立花"],
+      "asr_confusions": ["橘", "立鼻"],
+      "context_terms": ["NHK党", "勾留", "逮捕"],
+      "protect_suffixes": ["氏"]
+    },
+    {
+      "canonical": "百田尚樹",
+      "category": "person",
+      "aliases": ["百田"],
+      "asr_confusions": ["百田なおき", "ひゃくだ"],
+      "context_terms": ["日本保守党", "代表"],
+      "protect_suffixes": ["氏", "代表"]
+    },
+    {
+      "canonical": "竹田恒泰",
+      "category": "person",
+      "aliases": ["竹田"],
+      "asr_confusions": ["竹田つねやす"],
+      "context_terms": ["皇室", "明治天皇", "作家"],
+      "protect_suffixes": ["氏"]
+    },
+    {
+      "canonical": "山田吉彦",
+      "category": "person",
+      "aliases": ["山田"],
+      "asr_confusions": ["山田よしひこ"],
+      "context_terms": ["海洋", "尖閣", "辺野古"],
+      "protect_suffixes": ["氏", "教授"]
+    },
+    {
+      "canonical": "デニー玉城",
+      "category": "person",
+      "aliases": ["玉城デニー", "デニー"],
+      "asr_confusions": ["田二玉城"],
+      "context_terms": ["沖縄", "知事"],
+      "protect_suffixes": ["知事", "氏"]
+    },
+    {
+      "canonical": "選挙ドットコム",
+      "category": "channel",
+      "aliases": ["選挙ドットコムちゃんねる", "選挙ドットコムch"],
+      "asr_confusions": ["選挙.com", "選挙コム", "選挙ドット.com"],
+      "context_terms": ["MC", "山本", "今野"],
+      "protect_suffixes": ["ちゃんねる", "ch"]
+    },
+    {
+      "canonical": "禁断の日本政治",
+      "category": "channel",
+      "aliases": ["禁断の政治"],
+      "asr_confusions": ["禁談", "禁段"],
+      "context_terms": [],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "国力研究会",
+      "category": "organization",
+      "aliases": ["国力研", "国力"],
+      "asr_confusions": ["国力研九会"],
+      "context_terms": ["高市", "麻生", "茂木", "議連"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "自民党",
+      "category": "party",
+      "aliases": ["自民", "自由民主党"],
+      "asr_confusions": ["事務", "次身"],
+      "context_terms": ["総裁", "政権", "総理"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "立憲民主党",
+      "category": "party",
+      "aliases": ["立憲", "立憲民主"],
+      "asr_confusions": ["立件民主", "リッケン"],
+      "context_terms": ["枝野", "野田"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "国民民主党",
+      "category": "party",
+      "aliases": ["国民民主"],
+      "asr_confusions": ["国民民"],
+      "context_terms": ["玉木"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "日本維新の会",
+      "category": "party",
+      "aliases": ["維新"],
+      "asr_confusions": ["維新の会"],
+      "context_terms": ["馬場", "音喜多"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "日本共産党",
+      "category": "party",
+      "aliases": ["共産党", "共産"],
+      "asr_confusions": ["強産", "胸産"],
+      "context_terms": [],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "参政党",
+      "category": "party",
+      "aliases": ["参政"],
+      "asr_confusions": ["山政", "賛成党"],
+      "context_terms": ["神谷"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "辺野古",
+      "category": "place",
+      "aliases": ["辺野古移設"],
+      "asr_confusions": ["辺の古", "ヘンノコ", "へのこ"],
+      "context_terms": ["沖縄", "基地", "米軍"],
+      "protect_suffixes": ["移設", "沖", "事件", "問題"]
+    },
+    {
+      "canonical": "尖閣諸島",
+      "category": "place",
+      "aliases": ["尖閣"],
+      "asr_confusions": ["先閣", "尖角"],
+      "context_terms": ["中国", "海洋"],
+      "protect_suffixes": ["諸島"]
+    },
+    {
+      "canonical": "派閥事務所",
+      "category": "term",
+      "aliases": ["事務所"],
+      "asr_confusions": ["事務jo"],
+      "context_terms": ["新党", "結成"],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "中道改革連合",
+      "category": "organization",
+      "aliases": ["中道改革", "中道連合"],
+      "asr_confusions": ["中道会革"],
+      "context_terms": [],
+      "protect_suffixes": []
+    },
+    {
+      "canonical": "高額療養費",
+      "category": "term",
+      "aliases": [],
+      "asr_confusions": ["高額良養費"],
+      "context_terms": ["保険", "医療"],
+      "protect_suffixes": []
+    }
+  ]
+}

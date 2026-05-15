@@ -192,6 +192,15 @@ audio { display: none; }  /* hidden — we drive the player via custom controls 
   white-space: nowrap;
 }
 .library-breadcrumb-sep { color: var(--muted); }
+.library-env-banner {
+  font-size: 12px; color: var(--text);
+  background: rgba(120, 180, 255, 0.10);
+  border: 1px solid rgba(120, 180, 255, 0.35);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.library-env-banner strong { color: var(--accent); }
 .library-hint { font-size: 11px; color: var(--muted); margin-top: 12px; }
 .library-hint code {
   background: #1a1d28; padding: 1px 4px; border-radius: 3px;
@@ -245,6 +254,14 @@ main {
 }
 .word {
   cursor: pointer;
+  /* Drag-to-select is app-owned. user-select: none stops the browser
+     from blue-highlighting / starting a drag-image while the user is
+     extending an edit selection — a real source of stuck drags on
+     Safari / Codespaces forwarded viewers. Applied per-.word (not on
+     <main>) so that ordinary text copy elsewhere in the pane still
+     works. */
+  user-select: none;
+  -webkit-user-select: none;
   /* Vertical pad stays at 2px so the selection background reads as a
      contiguous pill across a run of words; horizontal pad cut to 1px
      for tight Japanese (no inter-word spaces in source). */
