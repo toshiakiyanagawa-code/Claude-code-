@@ -1,0 +1,18 @@
+{
+  "name": "cms-assist-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local development workspace for the CMS assist tool.",
+  "type": "commonjs",
+  "bin": {
+    "cms-assist": "./bin/cms-assist.js"
+  },
+  "scripts": {
+    "cms": "node ./bin/cms-assist.js",
+    "cms:doctor": "node ./bin/cms-assist.js doctor",
+    "test": "node --test tests/cms-assist.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

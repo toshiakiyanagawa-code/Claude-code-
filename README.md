@@ -299,3 +299,60 @@ prosody-aware cuts). Voice cloning is staged for v1.0.
 | ca97ecd | W2 | EditSession schema + ffmpeg atrim+concat renderer + `podedit cut` |
 | c9f616e | W1 | Ensure transcript_bytes/total_wall_sec land in bench JSONL |
 | ea4c87c | W1 | Foundation + one-way ASR PoC + bench harness |
+
+# CMS入稿アシストツール 開発環境
+
+このリポジトリには、CMS入稿アシストツールの開発を再開しやすいように、ローカル版 `cms-assist` CLI と起動スクリプトを入れています。社内配布の `cms-assist` が PATH にある場合でも、開発中はこのリポジトリ内の `bin/cms-assist.js` を優先して使います。
+
+## 前提
+
+- Git for Windows または Bash
+- Node.js 20+
+- npm
+
+社内配布の `cms-assist` が未インストールでも、モックモードで開発を開始できます。
+
+## 初期設定
+
+```powershell
+Copy-Item .env.example .env
+npm install
+```
+
+`.env` に接続先とトークンを設定します。
+
+- `CMS_BASE_URL`: 接続先CMS URL
+- `CMS_API_TOKEN`: APIトークン
+- `CMS_SPACE_ID`: 対象スペースID
+- `CMS_TIMEOUT_MS`: APIタイムアウト
+- `CMS_LOG_LEVEL`: ログレベル
+- `CMS_MOCK`: `true` の場合は実CMSへ接続せずローカルモックで起動
+
+## 起動
+
+Windows PowerShell:
+
+```powershell
+.\scripts\start-cms-assist.ps1 dev
+```
+
+Bash:
+
+```bash
+./scripts/start-cms-assist.sh dev
+```
+
+本番相当モードで起動する場合は `dev` の代わりに `prod` を指定します。
+
+環境チェック:
+
+```powershell
+npm run cms:doctor
+npm test
+```
+
+## 開発メモ
+
+- まず `CMS_MOCK=true` のまま `npm run cms:doctor` と `.\scripts\start-cms-assist.ps1 prod` を確認する
+- 実CMSへ接続する場合は `.env` の `CMS_MOCK=false` にして、URL、トークン、スペースIDを実値に差し替える
+- CLI本体の開発は `bin/cms-assist.js`、テストは `tests/cms-assist.test.js` に追加する
