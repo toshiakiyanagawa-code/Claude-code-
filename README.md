@@ -299,3 +299,36 @@ prosody-aware cuts). Voice cloning is staged for v1.0.
 | ca97ecd | W2 | EditSession schema + ffmpeg atrim+concat renderer + `podedit cut` |
 | c9f616e | W1 | Ensure transcript_bytes/total_wall_sec land in bench JSONL |
 | ea4c87c | W1 | Foundation + one-way ASR PoC + bench harness |
+
+## CMS Assist Local Setup
+
+This repository also includes a small local launcher for a CMS submission
+assistant workflow.
+
+### Prerequisites
+
+- Bash
+- Node.js 20+ for future UI/CLI expansion
+- `cms-assist` command installed and available on `PATH`
+
+If `cms-assist` is not installed, follow your internal installation guide first.
+
+### Run
+
+```bash
+./scripts/start-cms-assist.sh dev
+./scripts/start-cms-assist.sh prod
+```
+
+### Environment
+
+Copy `.env.example` to `.env` and fill in local values:
+
+```bash
+cp .env.example .env
+```
+
+- `CMS_BASE_URL`: CMS endpoint URL
+- `CMS_API_TOKEN`: API token
+- `CMS_SPACE_ID`: target space ID
+- `CMS_TIMEOUT_MS`: API timeout in milliseconds
