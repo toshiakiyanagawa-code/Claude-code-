@@ -16,9 +16,18 @@ def test_run_daily_job_writes_outputs(tmp_path, monkeypatch):
 
     result = jobs.run_daily_job("2026-05-13", tmp_path, source="fixture.json")
 
-    assert result == {"date": "2026-05-13", "candidates": 1, "plans": 1, "extracts": 1, "errors": []}
+    assert result["date"] == "2026-05-13"
+    assert result["candidates"] == 1
+    assert result["plans"] == 1
+    assert result["extracts"] == 1
+    assert result["errors"] == []
+    assert result["review_required"] == 0
     assert (tmp_path / "2026-05-13" / "candidates.json").exists()
+    assert (tmp_path / "2026-05-13" / "candidates_short.json").exists()
     assert (tmp_path / "2026-05-13" / "plan.json").exists()
+    assert (tmp_path / "2026-05-13" / "review.json").exists()
+    assert (tmp_path / "2026-05-13" / "review.tsv").exists()
+    assert (tmp_path / "2026-05-13" / "digest.txt").exists()
     assert (tmp_path / "2026-05-13" / "extract").is_dir()
 
 
@@ -88,4 +97,4 @@ def test_run_daily_job_serializes_candidates_and_plan(tmp_path, monkeypatch):
     candidates = json.loads((tmp_path / "2026-05-13" / "candidates.json").read_text(encoding="utf-8"))
     plans = json.loads((tmp_path / "2026-05-13" / "plan.json").read_text(encoding="utf-8"))
     assert candidates[0]["video_id"] == "v1"
-    assert plans[0]["title"] == "One"
+    assert plans["plans"][0]["title"] == "One"

@@ -60,7 +60,10 @@ def _score(candidate: dict[str, Any], now: datetime) -> tuple[float, dict[str, A
 
     value = candidate.get("score", 0)
     try:
-        return float(value), {"score": float(value)}
+        score = float(value)
+        if 0.0 <= score <= 1.0:
+            score *= 100.0
+        return score, {"score": score}
     except (TypeError, ValueError):
         return 0.0, {"score": 0.0}
 

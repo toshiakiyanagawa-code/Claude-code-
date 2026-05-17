@@ -645,6 +645,21 @@ def cmd_run_job(args: argparse.Namespace) -> int:
         include_blocked=args.include_blocked,
         polish_provider=provider,
         aggressiveness=args.aggressiveness,
+        target_format=args.target_format,
+        top=args.top,
+        srt_path=args.srt,
+        from_youtube=args.from_youtube,
+        min_score=args.min_score,
+        selection_mode=args.selection_mode,
+        llm_model=args.llm_model,
+        llm_top_k=args.llm_top_k,
+        min_composite_score=args.min_composite_score,
+        review_threshold=args.review_threshold,
+        takedown_list=args.takedown_list,
+        lookback_days=args.lookback_days,
+        min_views=args.min_views,
+        digest_top_n=args.digest_top_n,
+        webhook_url=args.webhook_url,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result.get("errors") else 0
@@ -675,43 +690,56 @@ def _score_as_percent(value: Any) -> float:
 
 
 def _review_items(items: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
-    reviewed = []
-    for item in items:
-        score = _score_as_percent(item.get("score"))
-        reviewed.append(
-            {
-                "video_id": item.get("video_id"),
-                "title": item.get("title"),
-                "channel_title": item.get("channel_title"),
-                "score": score,
-                "usage_status": item.get("usage_status"),
-                "target_format": item.get("target_format"),
-                "passed": score >= threshold,
-                "risk_flags": item.get("risk_flags", []),
-            }
-        )
+    from .review import review_candidates
+
+    reviewed = review_candidates(items, score_threshold=threshold)
+    for item in reviewed:
+        score = _score_as_percent(item.get("review_score", item.get("score")))
+        item["score"] = score
+        item["passed"] = score >= threshold and not item.get("review_required")
     passed = [item for item in reviewed if item["passed"]]
     return {
         "score_threshold": threshold,
         "total": len(reviewed),
         "passed": len(passed),
+        "review_required": sum(1 for item in reviewed if item.get("review_required")),
         "items": reviewed,
     }
 
 
 def _write_review_tsv(path: Path, items: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["video_id", "title", "channel_title", "score", "usage_status", "target_format", "passed"]
+    fields = [
+        "video_id",
+        "title",
+        "channel_title",
+        "score",
+        "usage_status",
+        "target_format",
+        "passed",
+        "review_required",
+        "reason",
+    ]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(items)
+        for item in items:
+            row = dict(item)
+            row["reason"] = ",".join(str(v) for v in item.get("reason", []))
+            writer.writerow(row)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     _, items = _load_items_payload(input_path)
     threshold = args.score_threshold * 100.0 if 0.0 <= args.score_threshold <= 1.0 else args.score_threshold
+
+    if args.takedown_list:
+        from .compliance import apply_takedown, load_takedown_list
+
+        passed, blocked = apply_takedown(items, load_takedown_list(Path(args.takedown_list)))
+        items = [*passed, *blocked]
+
     result = _review_items(items, threshold)
 
     wrote = False
@@ -725,6 +753,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         wrote = True
     if not wrote:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.fail_on_review_required and result["review_required"]:
+        return 1
     return 0
 
 
@@ -888,8 +918,39 @@ def build_parser() -> argparse.ArgumentParser:
     rj.add_argument("--date", required=True, help="対象日 YYYY-MM-DD")
     rj.add_argument("--out-root", default="output", help="出力ルート")
     rj.add_argument("--source", default="mock", help='"mock" または mock JSON の path')
+    rj.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    rj.add_argument("--min-views", type=int, default=DEFAULT_MIN_VIEWS)
     rj.add_argument("--include-blocked", action="store_true")
+    rj.add_argument(
+        "--format",
+        dest="target_format",
+        choices=["short", "long", "both"],
+        default="both",
+        help="出力フォーマット (short / long / both)",
+    )
+    rj.add_argument("--top", type=int, default=5, help="各フォーマットで plan 化する候補数")
+    transcript_group_job = rj.add_mutually_exclusive_group()
+    transcript_group_job.add_argument("--srt", help="全候補のハイライト検出に使う SRT/VTT ファイル")
+    transcript_group_job.add_argument("--from-youtube", help="YouTube video ID から字幕を取得して使う")
     rj.add_argument("--aggressiveness", type=int, choices=[0, 1, 2, 3], default=None)
+    rj.add_argument("--min-score", type=float, default=0.3)
+    rj.add_argument(
+        "--selection-mode",
+        choices=["legacy", "political", "political_llm"],
+        default="legacy",
+    )
+    rj.add_argument("--llm-model", default="claude-haiku-4-5")
+    rj.add_argument("--llm-top-k", type=int, default=12)
+    rj.add_argument("--min-composite-score", type=float, default=0.0)
+    rj.add_argument(
+        "--review-threshold",
+        type=float,
+        default=0.0,
+        help="run-job 内 review の最低スコア。clipgen 内部スコア向けに default 0.0",
+    )
+    rj.add_argument("--takedown-list", help="JSON/TSV の takedown list を review 前に適用")
+    rj.add_argument("--digest-top-n", type=int, default=5)
+    rj.add_argument("--webhook-url", help="Slack incoming webhook URL")
     rj.add_argument("--polish", action="store_true")
     rj.add_argument("--polish-model", default="claude-opus-4-7")
     rj.add_argument("--dry-run", action="store_true")
@@ -900,6 +961,12 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("--out-json", help="JSON 出力先")
     rv.add_argument("--out-tsv", help="TSV 出力先")
     rv.add_argument("--score-threshold", type=float, default=60.0)
+    rv.add_argument("--takedown-list", help="JSON/TSV の takedown list を review 前に適用")
+    rv.add_argument(
+        "--fail-on-review-required",
+        action="store_true",
+        help="review_required が 1 件以上あれば終了コード 1 にする",
+    )
     rv.set_defaults(func=cmd_review)
 
     dg = sub.add_parser("digest", help="plans JSON から日次 digest を生成/投稿する")

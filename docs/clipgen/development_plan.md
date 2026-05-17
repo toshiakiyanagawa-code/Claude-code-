@@ -82,11 +82,12 @@
 - `clipgen compliance-check`: takedown list による再フィルタ。
 - `clipgen review`: candidates/plans を JSON/TSV に変換し、review_required を明示。
 - `clipgen digest`: plans から日次 digest を生成し、Slack webhook 投稿に対応。
-- `clipgen run-job`: 日次ジョブの枠組みは実装済み。ただし現状は mock/short 寄りで、live/両format/字幕取得/レビュー/digest を束ねる本番ジョブ化が次の主タスク。
+- `clipgen run-job`: candidates、plans、extract manifests、review reports、digest を short/long 両方で生成する日次ジョブへ拡張済み。live 本番実行には `YOUTUBE_API_KEY` が必要。
 
 ### 実動画ワークフロー試験
 - `output/test_a1/RUNBOOK.md`: ローカルで動画+字幕を取得し、Codespace で切り出し・連結する方式。
 - `output/test_b1/RUNBOOK.md`: `cookies.txt` を Codespace に渡して、ロング/ショート両方の `combined.mp4` を生成する方式。
+- `docs/clipgen/b1_validation_2026-05-17.md`: B1 preflight 結果。現 workspace では `cookies.txt` / `source.mp4` / `source.ja.srt` が未配置のため mp4 生成は未実行。
 
 ---
 
