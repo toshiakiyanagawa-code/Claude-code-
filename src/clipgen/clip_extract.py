@@ -26,6 +26,8 @@ class ExtractPlan:
 
 
 def _quote(value: object) -> str:
+    if isinstance(value, Path):
+        return shlex.quote(value.as_posix())
     return shlex.quote(str(value))
 
 
@@ -61,7 +63,7 @@ def build_yt_dlp_command(video_id, output_path, *, with_subs=True) -> str:
     ]
     if with_subs:
         parts.extend(["--write-auto-sub", "--sub-lang", "ja"])
-    parts.extend([url, "-o", str(output_path)])
+    parts.extend([url, "-o", output_path])
     return " ".join(_quote(part) for part in parts)
 
 
