@@ -1,6 +1,6 @@
 # clipgen 開発計画書
 
-最終更新: 2026-05-13
+最終更新: 2026-05-17
 オーナー: プレジデントオンライン編集部 / 柳川 利明
 レビュー方針: 各マイルストーン完了ごとに codex レビューを実施し、○ になるまで反復（[[feedback-codex-review]]）
 
@@ -41,54 +41,52 @@
 
 ---
 
-## 3. マイルストーン
+## 3. 現在の到達点
+
+2026-05-17 時点で、clipgen は「素材発見 → 企画案 → 切り出しコマンド → レビュー補助」までの半自動 MVP として動作する。
+ローカル開発環境では `uv run clipgen ...` で CLI を起動でき、`uv run pytest tests/clipgen` は 130 件 PASS。
 
 ### M0（完了）— トレンド分析 + 候補抽出 MVP
-- [`docs/clipgen/trend_analysis.md`](trend_analysis.md)
-- 許諾チェック（allow/blocklist、channel_id 優先）、スコアリング、CLI、mock データで E2E、tests 15 件 PASS、codex 6/7 ○
+- [`docs/clipgen/trend_analysis.md`](trend_analysis.md) に政治系切り抜き市場・許諾リスク・候補ソースを整理済み。
+- `src/clipgen/pipeline.py` / `scoring.py` / `sources.py` で YouTube 候補の許諾チェック、allow/blocklist、スコアリング、mock E2E を実装済み。
 
-### M1（着手） — Live モードのドライラン
-**ゴール:** YouTube Data API キーがない開発環境でも `--source live` 経路を fixture で疑似実行できる。
-- `--dry-run` フラグで HTTP 呼び出しをスタブ化（fixture JSON を返す）
-- `tests/clipgen/test_live_dryrun.py`: live 経路の主要関数が fixture で動くことを保証
-- 既存 `run_pipeline_live` を分割し、HTTP 層を差し替え可能にする
+### M1（完了）— Live モードのドライラン
+- `--source live --dry-run` で YouTube API キーなしでも fixture 経由の疑似 live 経路を実行可能。
+- `tests/clipgen/test_live_dryrun.py` で回帰テスト済み。
 
-### M2 — allowlist/blocklist の channel_id 自動解決
-**ゴール:** `scripts/refresh_channel_ids.py` を実行すると、handles → 実 channel_id が API 経由で resolve され、JSON が in-place で更新される。
-- `YOUTUBE_API_KEY` 必須
-- 差分は `--diff` で確認、`--write` で書き戻し
-- 既存の channel_id が plausible に見えない（`UC_` で始まらない or 24 文字でない）行を検出してログ
+### M2（実装済み・live再検証待ち）— allowlist/blocklist の channel_id 自動解決
+- `scripts/refresh_channel_ids.py` で handles → channel_id の解決、`--diff` / `--write` 運用を想定。
+- 本番 API キーを使った最新 allow/blocklist の再解決は、次回 live E2E の一部として確認する。
 
-### M3 — ハイライト検出 + フォーマット振り分け（ショート/ロング両対応）
-**ゴール:** 動画 URL（または字幕 SRT）から「切り抜きに使うべき区間」を出す。さらに **ショート / ロング** の 2 フォーマットそれぞれに合わせた window 提案を返す。
+### M3（完了）— ハイライト検出 + ショート/ロング振り分け
+- `src/clipgen/highlights.py` で SRT/VTT を解析し、感嘆符、否定語、笑い表現、話題語、語彙変化などから `Highlight` を生成。
+- `src/clipgen/political_scoring.py` で日本政治語彙ベースの多軸スコアリングを追加。
+- `src/clipgen/llm_rerank.py` で `ANTHROPIC_API_KEY` がある場合の LLM rerank を実装。失敗時は deterministic score に fallback。
 
-実装:
-- `src/clipgen/highlights.py`
-  - 入力: SRT テキスト or `WebVTT`
-  - スコア: 感嘆符密度、否定語、笑い表現、「絶句/論破/失言」等のホットワード、話者交代、語彙変化
-  - 出力: `Highlight(start_sec, end_sec, score, rationale, keywords)` のリスト
-- **ショートフォーマット**: 単一 60 秒以下、最高スコアの 1 窓を取り、両側に 5 秒ずつパディング、最大 60 秒
-- **ロングフォーマット**: 上位 N 窓を結合し、合計 8〜12 分。窓間のつなぎ説明文（解説テロップ）スロットを空欄で出力
-- `--format short|long|both` を CLI と pipeline で受け取り、各 Candidate に推奨ハイライトを乗せる
+### M4（完了）— タイトル / サムネ文言の自動生成
+- `src/clipgen/titles.py` で short/long 別のタイトル案とサムネ文言案を生成。
+- `CLIPGEN_AGGRESSIVENESS=0..3` と `--aggressiveness` で煽り強度を制御。
+- `defamation_review_required` や `manual_review` の候補には `[REVIEW]` を付与し、公開前チェックを促す。
 
-### M4 — タイトル / サムネ文言の自動生成
-**ゴール:** 各 Candidate × フォーマット × ハイライトに対して、**タイトル案 3〜5 / サムネ文言案 3〜5** を返す。
+### M5（完了）— 動画切り出しコマンド出力
+- `src/clipgen/clip_extract.py` で `yt-dlp` / `ffmpeg` の download / cut / concat コマンドを生成。
+- `clipgen extract --plan ...` で `download.sh`、`cut.sh`、`combine.sh`、`manifest.json` を出力できる。
+- Windows でも生成コマンドの shell quoting が安定するよう、Path は POSIX 形式で quote する。
 
-実装:
-- `src/clipgen/titles.py`
-  - テンプレ集（ショート / ロング 別、フォーマット種別 別: laugh / shock / debate / reveal）
-  - 変数: 人物名、ハイライトのキーワード、対象（誰に向かって）
-  - 例（ショート / shock）: `【{state}】{person}、{action}の瞬間` → `【絶句】高市早苗、記者の質問に一瞬黙る瞬間`
-  - 例（ロング / debate）: `{person}の{topic}論破まとめ｜なぜ{opponent}は反論できなかったのか` 等
-- 出力 JSON に `title_candidates: [{text, format, risk}]`、`thumbnail_candidates: [{line1, line2, style}]` を追加
-- `defamation_review_required` フラグがある候補は **タイトル全部に `[REVIEW] ` プレフィックス**を付ける
+### M6（完了）— LLM 連携によるタイトル品質改善
+- `src/clipgen/llm.py` で Claude API によるタイトル polish を実装。
+- `--polish` 指定時に `ANTHROPIC_API_KEY` がない場合は警告を出して deterministic タイトルで継続する。
 
-### M5（将来） — 動画切り出しコマンド出力
-- `yt-dlp` + `ffmpeg` のコマンド文字列を出力
-- ライセンス再チェック CLI
+### M7-M12（初期実装済み）— 運用補助
+- `clipgen config-check`: 環境変数、allow/blocklist、seed、出力先、job dir を検証。
+- `clipgen compliance-check`: takedown list による再フィルタ。
+- `clipgen review`: candidates/plans を JSON/TSV に変換し、review_required を明示。
+- `clipgen digest`: plans から日次 digest を生成し、Slack webhook 投稿に対応。
+- `clipgen run-job`: 日次ジョブの枠組みは実装済み。ただし現状は mock/short 寄りで、live/両format/字幕取得/レビュー/digest を束ねる本番ジョブ化が次の主タスク。
 
-### M6（将来） — LLM 連携によるタイトル品質改善
-- Claude API or OpenAI で煽り強度をユーザー指定の上限で制御
+### 実動画ワークフロー試験
+- `output/test_a1/RUNBOOK.md`: ローカルで動画+字幕を取得し、Codespace で切り出し・連結する方式。
+- `output/test_b1/RUNBOOK.md`: `cookies.txt` を Codespace に渡して、ロング/ショート両方の `combined.mp4` を生成する方式。
 
 ---
 
