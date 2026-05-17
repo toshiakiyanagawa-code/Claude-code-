@@ -105,6 +105,8 @@ def _discover_candidates(
     target_format: str,
     live_dry_run: bool,
     lookback_days: int,
+    max_per_query: int,
+    query_limit: int | None,
     min_views: int,
 ) -> list[Any]:
     if source == "live":
@@ -121,6 +123,8 @@ def _discover_candidates(
         return list(
             run_pipeline_live(
                 lookback_days=lookback_days,
+                max_per_query=max_per_query,
+                query_limit=query_limit,
                 min_views=min_views,
                 now=now,
                 include_blocked=include_blocked,
@@ -303,6 +307,8 @@ def run_daily_job(
     review_threshold: float = 0.0,
     takedown_list: str | None = None,
     lookback_days: int = 14,
+    max_per_query: int = 10,
+    query_limit: int | None = None,
     min_views: int = 30_000,
     digest_top_n: int = 5,
     webhook_url: str | None = None,
@@ -335,6 +341,8 @@ def run_daily_job(
                 target_format=fmt,
                 live_dry_run=dry_run,
                 lookback_days=lookback_days,
+                max_per_query=max_per_query,
+                query_limit=query_limit,
                 min_views=min_views,
             )
             candidates_by_format[fmt] = cands

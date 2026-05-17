@@ -3,7 +3,6 @@
 __pycache__/
 *.pyc
 *.pyo
-.python-version
 
 # Local secrets
 .env
@@ -35,3 +34,7 @@ benchmarks.jsonl
 
 # clipgen test_b1 - YouTube cookies (do NOT commit)
 output/test_b1/cookies.txt
+
+# Local clipgen smoke/dev outputs
+output/live_smoke_*/
+output/dev_run_job/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -12,6 +13,25 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from clipgen import cli  # noqa: E402
+
+
+def test_load_local_env_reads_dotenv_and_local_override(monkeypatch, tmp_path):
+    monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("YOUTUBE_API_KEY=from-env\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("YOUTUBE_API_KEY=from-local\n", encoding="utf-8")
+
+    cli._load_local_env(tmp_path)
+
+    assert os.environ["YOUTUBE_API_KEY"] == "from-local"
+
+
+def test_load_local_env_preserves_existing_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "from-shell")
+    (tmp_path / ".env").write_text("YOUTUBE_API_KEY=from-file\n", encoding="utf-8")
+
+    cli._load_local_env(tmp_path)
+
+    assert os.environ["YOUTUBE_API_KEY"] == "from-shell"
 
 
 def test_run_job_outputs_result_json(monkeypatch, capsys, tmp_path):

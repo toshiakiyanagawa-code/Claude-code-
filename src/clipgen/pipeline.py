@@ -143,6 +143,7 @@ def run_pipeline_live(
     *,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     max_per_query: int = 10,
+    query_limit: int | None = None,
     min_views: int = DEFAULT_MIN_VIEWS,
     now: datetime | None = None,
     include_blocked: bool = False,
@@ -164,6 +165,8 @@ def run_pipeline_live(
 
     seeds = load_seed_queries()
     queries = build_queries(seeds)
+    if query_limit is not None:
+        queries = queries[: max(0, query_limit)]
     published_after = (now or datetime.now(timezone.utc)) - timedelta(days=lookback_days)
 
     seen_ids: set[str] = set()

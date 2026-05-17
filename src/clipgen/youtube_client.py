@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,7 +54,64 @@ def _summarize_body(body: bytes | str, limit: int = 500) -> str:
     return text[:limit]
 
 
-def _http_get_json(url: str) -> dict[str, Any]:
+def _curl_get_json(url: str) -> dict[str, Any]:
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise YouTubeAPIError(None, "curl executable not found")
+
+    last_error: YouTubeAPIError | None = None
+    config = f'url = "{url}"\n'
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        cmd = [
+            curl,
+            "--config",
+            "-",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(DEFAULT_TIMEOUT),
+            "--write-out",
+            "\n%{http_code}",
+        ]
+        if os.name == "nt":
+            cmd.append("--ssl-no-revoke")
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=config,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=DEFAULT_TIMEOUT + 5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            err = YouTubeAPIError(None, _summarize_body(str(exc)))
+        else:
+            body, _, status_text = proc.stdout.rpartition("\n")
+            status = int(status_text) if status_text.isdigit() else None
+            if proc.returncode == 0 and status is not None and 200 <= status < 300:
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise YouTubeAPIError(None, f"invalid JSON response: {exc.msg}") from exc
+            summary = _summarize_body(body or proc.stderr)
+            err = YouTubeAPIError(status, summary)
+
+        if err.status not in _RETRYABLE_STATUSES and err.status is not None:
+            raise err
+        if attempt == len(_RETRY_DELAYS):
+            raise err
+        last_error = err
+        time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise YouTubeAPIError(None, "request failed")
+
+
+def _urllib_get_json(url: str) -> dict[str, Any]:
     last_error: YouTubeAPIError | None = None
     for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
         req = Request(url, headers={"User-Agent": "clipgen/0.1 (+politics-clip)"})
@@ -80,6 +139,13 @@ def _http_get_json(url: str) -> dict[str, Any]:
     if last_error is not None:
         raise last_error
     raise YouTubeAPIError(None, "request failed")
+
+
+def _http_get_json(url: str) -> dict[str, Any]:
+    backend = os.environ.get("CLIPGEN_HTTP_BACKEND", "auto").lower()
+    if backend == "curl" or (backend == "auto" and os.name == "nt"):
+        return _curl_get_json(url)
+    return _urllib_get_json(url)
 
 
 def _parse_duration_iso8601(s: str | None) -> int | None:

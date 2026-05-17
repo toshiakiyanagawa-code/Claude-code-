@@ -9,7 +9,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from clipgen.pipeline import candidates_to_dict, filter_and_score, run_pipeline_mock  # noqa: E402
+from clipgen.pipeline import candidates_to_dict, filter_and_score, run_pipeline_live, run_pipeline_mock  # noqa: E402
+from clipgen.youtube_client import SearchParams  # noqa: E402
 from clipgen.scoring import Candidate, score_candidate  # noqa: E402
 from clipgen.sources import (  # noqa: E402
     check_channel_permission,
@@ -221,3 +222,47 @@ def test_pipeline_excludes_blocked_by_default():
     mock_path = ROOT / "src" / "clipgen" / "data" / "mock_search.json"
     cands = run_pipeline_mock(mock_path, now=NOW)
     assert all(c.usage_status != "blocked" for c in cands)
+
+
+def test_run_pipeline_live_respects_query_limit_and_max_per_query():
+    class FakeClient:
+        def __init__(self):
+            self.searches = []
+
+        def handles_to_channel_ids(self, handles):
+            return {}
+
+        def search(self, params: SearchParams):
+            self.searches.append(params)
+            return [{"id": {"videoId": f"v{len(self.searches)}"}}]
+
+        def videos(self, video_ids):
+            return [
+                {
+                    "id": video_id,
+                    "snippet": {
+                        "title": "高市早苗 国会 ハイライト",
+                        "channelId": "UC_unknown",
+                        "channelTitle": "Unknown",
+                        "publishedAt": "2026-05-13T00:00:00Z",
+                        "description": "",
+                    },
+                    "statistics": {"viewCount": "1000"},
+                    "contentDetails": {"duration": "PT1M"},
+                }
+                for video_id in video_ids
+            ]
+
+    client = FakeClient()
+
+    run_pipeline_live(
+        client=client,
+        now=NOW,
+        max_per_query=1,
+        query_limit=2,
+        min_views=0,
+        include_blocked=True,
+    )
+
+    assert len(client.searches) == 2
+    assert all(params.max_results == 1 for params in client.searches)

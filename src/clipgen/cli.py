@@ -33,6 +33,27 @@ from .scoring import Candidate
 from .titles import generate_thumbnails, generate_titles
 
 
+def _load_local_env(root: Path | None = None) -> None:
+    root = root or Path.cwd()
+    protected = set(os.environ)
+    for name in (".env", ".env.local"):
+        path = root / name
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key.startswith("#") or key in protected:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ[key] = value
+
+
 def _rights_label(status: str) -> str:
     if status == "cleared":
         return "RIGHTS=CLEARED"
@@ -124,6 +145,8 @@ def _discover_once(
         )
     return run_pipeline_live(
         lookback_days=args.lookback_days,
+        max_per_query=args.max_per_query,
+        query_limit=args.query_limit,
         min_views=args.min_views,
         now=now,
         include_blocked=args.include_blocked,
@@ -657,6 +680,8 @@ def cmd_run_job(args: argparse.Namespace) -> int:
         review_threshold=args.review_threshold,
         takedown_list=args.takedown_list,
         lookback_days=args.lookback_days,
+        max_per_query=args.max_per_query,
+        query_limit=args.query_limit,
         min_views=args.min_views,
         digest_top_n=args.digest_top_n,
         webhook_url=args.webhook_url,
@@ -891,6 +916,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.add_argument("--out", help="候補リストの JSON 出力先")
     d.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    d.add_argument("--max-per-query", type=int, default=10, help="live 検索1クエリあたりの取得件数")
+    d.add_argument("--query-limit", type=int, help="live 検索で使う seed クエリ数の上限")
     d.add_argument("--min-views", type=int, default=DEFAULT_MIN_VIEWS)
     d.add_argument("--include-blocked", action="store_true", help="RIGHTS=BLOCKED の候補も出力する")
     d.add_argument(
@@ -919,6 +946,8 @@ def build_parser() -> argparse.ArgumentParser:
     rj.add_argument("--out-root", default="output", help="出力ルート")
     rj.add_argument("--source", default="mock", help='"mock" または mock JSON の path')
     rj.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    rj.add_argument("--max-per-query", type=int, default=10, help="live 検索1クエリあたりの取得件数")
+    rj.add_argument("--query-limit", type=int, help="live 検索で使う seed クエリ数の上限")
     rj.add_argument("--min-views", type=int, default=DEFAULT_MIN_VIEWS)
     rj.add_argument("--include-blocked", action="store_true")
     rj.add_argument(
@@ -981,6 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_local_env()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
